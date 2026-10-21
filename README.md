@@ -136,3 +136,7 @@ make sdk-test     # from the repo root: unit tests, then end to end against a re
 ```
 
 The end-to-end test (`test/e2e.test.ts`, run by `scripts/e2e.sh`) starts a core with Go's `TestSDKHarness`, which registers a self-serve app and writes the core's URL and a test key to a file.
+
+## Contributing
+
+This repository is generated from Wakeshift's main repository. Pull requests are welcome: we apply them there and publish the result. See [CONTRIBUTING](CONTRIBUTING.md).
