@@ -29,6 +29,11 @@ declare global {
   const me: { id: string };
   const user: { id: string };
   function canSeeRepo(extra: unknown, repo: string): Promise<boolean>;
+  function canRead(user: string | undefined, channel: string): boolean;
+  // Events defined elsewhere in the app (site/docs/events.md, quickstart.md).
+  const ciFinished: SDK.WakeEvent<any, any>;
+  const turn: SDK.WakeEvent<any, any>;
+  const message: SDK.WakeEvent<any, any>;
 
   // A webhook handler (GitHub's workflow_run).
   const req: IncomingMessage;

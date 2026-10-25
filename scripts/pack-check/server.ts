@@ -47,10 +47,19 @@ const build = ev.defineEvent("ci.build", {
   payload: z.object({ conclusion: z.string(), branch: z.string() }),
   text: (p, a) => `CI ${p.conclusion} on ${a.repo}`,
 });
-assert.equal(build.manifest.topic, "ev/ci.build/{repo}");
-assert.deepEqual(build.manifest.filter, { branch: "{branch}" });
-assert.deepEqual(build.manifest.arguments.required, ["repo"]);
-assert.equal((build.manifest.payload.properties as any).conclusion.type, "string");
+// The manifest is internal, so the published types leave it out: read it at run time.
+const manifest = (build as unknown as { manifest: { topic: string; filter?: Record<string, string>; arguments: { required?: string[] }; payload: { properties?: Record<string, { type?: string }> } } }).manifest;
+assert.equal(manifest.topic, "ev/ci.build/{repo}");
+assert.deepEqual(manifest.filter, { branch: "{branch}" });
+assert.deepEqual(manifest.arguments.required, ["repo"]);
+assert.equal(manifest.payload.properties?.conclusion?.type, "string");
+// Internal members are stripped from the published types.
+// @ts-expect-error secretSeed is internal
+void ev.secretSeed;
+// @ts-expect-error requestApp is internal
+void ev.requestApp;
+// @ts-expect-error emitEvent is internal
+void ev.emitEvent;
 const evServer = new McpServer({ name: "ci-bot-events", version: "1.0.0" });
 ev.serveEvents(evServer, { user: () => "u1" });
 

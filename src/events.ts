@@ -15,6 +15,7 @@ import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-sc
 import { objectFromShape, safeParse, type AnySchema, type SchemaInput, type SchemaOutput, type ZodRawShapeCompat } from "@modelcontextprotocol/sdk/server/zod-compat.js";
 import { WakeshiftError } from "./errors.js";
 import { guestOf } from "./guest.js";
+import type { Agent } from "./agent.js";
 import {
   EXTENSION_KEY,
   HEADER_MISMATCH,
@@ -29,7 +30,7 @@ import {
   type Codes,
   type Dialect,
 } from "./spec.js";
-import { applyAddition, type Addition, type Published, type Recognised, type ToolExtra, type Wakeshift } from "./wakeshift.js";
+import { applyAddition, type Addition, type Published, type PublishUrl, type Recognised, type ToolExtra, type Wakeshift } from "./wakeshift.js";
 
 /** Who is subscribing: what authorize decides on. */
 export interface Subscriber {
@@ -66,6 +67,13 @@ export interface EventOptions<A extends AnySchema, P extends AnySchema> {
    * Wakeshift takes it from the subscriber's own sign-in.
    */
   personal?: boolean;
+  /**
+   * Wakeshift deletes an occurrence's content (its text and payload) once
+   * it's delivered to the agent, keeping only what shows it happened (IDs,
+   * times, where it went): for messages people wouldn't expect a third party
+   * to keep. One that isn't delivered expires as any other does.
+   */
+  deleteOnDelivery?: boolean;
   /** Advanced: the topic template and payload filter, if the defaults don't fit. */
   topic?: string;
   filter?: Record<string, string>;
@@ -87,6 +95,7 @@ export interface EventTypeManifest {
   topic: string;
   filter?: Record<string, string>;
   personal?: boolean;
+  delete_on_delivery?: boolean;
 }
 
 const nameRE = /^[a-z][a-z0-9_-]*(\.[a-z][a-z0-9_-]*){0,4}$/;
@@ -121,12 +130,13 @@ export class WakeEvent<A extends AnySchema = AnySchema, P extends AnySchema = An
   readonly description: string;
   readonly title?: string;
   readonly personal: boolean;
+  readonly deleteOnDelivery: boolean;
   /** @internal */ readonly argsSchema: AnySchema;
   /** @internal */ readonly payloadSchema: AnySchema;
   /** @internal */ readonly manifest: EventTypeManifest;
   private readonly opts: EventOptions<A, P>;
 
-  /** @internal Use wake.defineEvent. */
+  /** Use wake.defineEvent rather than this constructor. */
   constructor(
     private readonly wake: Wakeshift,
     name: string,
@@ -140,6 +150,7 @@ export class WakeEvent<A extends AnySchema = AnySchema, P extends AnySchema = An
     this.description = opts.description;
     this.title = opts.title;
     this.personal = !!opts.personal;
+    this.deleteOnDelivery = !!opts.deleteOnDelivery;
     this.opts = opts;
     this.argsSchema = isSchema(opts.args) ? opts.args : (objectFromShape((opts.args ?? {}) as ZodRawShapeCompat) as AnySchema);
     this.payloadSchema = opts.payload;
@@ -173,7 +184,7 @@ export class WakeEvent<A extends AnySchema = AnySchema, P extends AnySchema = An
       topic = segs.join("/");
       if (Object.keys(filter).length === 0) filter = undefined;
     }
-    this.manifest = { name, description: opts.description, arguments: args, payload, topic, ...(filter ? { filter } : {}), ...(this.personal ? { personal: true } : {}) };
+    this.manifest = { name, description: opts.description, arguments: args, payload, topic, ...(filter ? { filter } : {}), ...(this.personal ? { personal: true } : {}), ...(this.deleteOnDelivery ? { delete_on_delivery: true } : {}) };
   }
 
   /** @internal Checks a subscriber's arguments, returning them parsed. */
@@ -196,7 +207,7 @@ export class WakeEvent<A extends AnySchema = AnySchema, P extends AnySchema = An
     }
   }
 
-  /** The events/list entry. */
+  /** @internal The events/list entry. */
   definition(): Record<string, unknown> {
     const d: Record<string, unknown> = {
       name: this.name,
@@ -226,6 +237,24 @@ export class WakeEvent<A extends AnySchema = AnySchema, P extends AnySchema = An
   }
 
   /**
+   * A capability URL that emits this event with these arguments (a personal
+   * event: to the one subscriber `to` names), for services that can only
+   * send webhooks. A POST's body, a JSON object, is the payload, checked
+   * against the event's schema; the agent reads the event's name and the
+   * start of the payload, since `text` doesn't run. Anyone with the URL can
+   * emit until `wake.revokePublishUrl(id)`.
+   */
+  async publishUrl(args: SchemaInput<A>, opts: { to?: string } = {}): Promise<PublishUrl> {
+    const a = this.parseArgs(args);
+    const to = opts.to?.trim();
+    if (this.personal && !to) throw new WakeshiftError(400, "bad_arguments", `${this.name} is personal: pass { to }, the one subscriber it's for`);
+    if (!this.personal && to) throw new WakeshiftError(400, "bad_arguments", `${this.name} isn't personal: it goes to everyone subscribed with these arguments, so it takes no to`);
+    const body: Record<string, unknown> = { name: this.name, arguments: a };
+    if (to) body.to = to;
+    return this.wake.requestApp<PublishUrl>("POST", "/events/publish-urls", body);
+  }
+
+  /**
    * Subscribes the conversation calling your tool, the way subscribe_events
    * would, so a tool like "join" can set up its own wakes in one step. For
    * clients that subscribe through Wakeshift's wake paths; native MCP Events
@@ -237,12 +266,14 @@ export class WakeEvent<A extends AnySchema = AnySchema, P extends AnySchema = An
   async subscribe(
     extra: ToolExtra,
     args: SchemaInput<A>,
-    opts: { server?: McpServer; client?: string; user?: string; wakeArgs?: Record<string, unknown> },
+    opts: { server?: McpServer; client?: string; user?: string; agent?: Agent; wakeArgs?: Record<string, unknown> },
   ): Promise<CallerSubscription> {
     const a = this.parseArgs(args);
-    if (this.personal && !opts.user) throw new WakeshiftError(400, "bad_arguments", `${this.name} is personal: pass user, who the subscription belongs to`);
+    if (this.personal && !opts.user && !opts.agent) {
+      throw new WakeshiftError(400, "bad_arguments", `${this.name} is personal: pass user (or agent), who the subscription belongs to`);
+    }
     const out = await this.wake.requestApp<{ event_subscription: { id: string; created: boolean }; session: string; addition?: Addition; agent?: Recognised }>("POST", "/event-subscriptions", {
-      call: this.wake.call(extra, { server: opts.server, client: opts.client, user: opts.user, args: opts.wakeArgs ?? {} }),
+      call: this.wake.call(extra, { server: opts.server, client: opts.client, user: opts.user, agent: opts.agent, args: opts.wakeArgs ?? {} }),
       name: this.name,
       arguments: a,
     });
@@ -264,11 +295,11 @@ export class WakeEvent<A extends AnySchema = AnySchema, P extends AnySchema = An
   async unsubscribe(
     extra: ToolExtra,
     args: SchemaInput<A>,
-    opts: { server?: McpServer; client?: string; user?: string; wakeArgs?: Record<string, unknown> },
+    opts: { server?: McpServer; client?: string; user?: string; agent?: Agent; wakeArgs?: Record<string, unknown> },
   ): Promise<boolean> {
     const a = this.parseArgs(args);
     const out = await this.wake.requestApp<{ ended: boolean }>("POST", "/event-subscriptions/unsubscribe", {
-      call: this.wake.call(extra, { server: opts.server, client: opts.client, user: opts.user, args: opts.wakeArgs ?? {} }),
+      call: this.wake.call(extra, { server: opts.server, client: opts.client, user: opts.user, agent: opts.agent, args: opts.wakeArgs ?? {} }),
       name: this.name,
       arguments: a,
     });
@@ -305,6 +336,15 @@ export interface ServeEventsOptions {
    * the guest GuestAuth signed in (guestOf(extra).user).
    */
   user?: (extra: ToolExtra & { authInfo?: AuthInfo }) => string | undefined;
+  /**
+   * For an app whose users sign in with Wakeshift (accounts: "wakeshift"):
+   * the signed-in agent behind a request (wake.exchange of the token it
+   * sent). Its subscriptions are made with its token, in its person's
+   * workspace, under the consent they gave, and the subscriber (what a
+   * personal event's to names) is agent.user(). Leave it unset for a
+   * headless app. A throw or undefined means not signed in.
+   */
+  agent?: (extra: ToolExtra & { authInfo?: AuthInfo }) => Promise<Agent | undefined> | Agent | undefined;
 }
 
 // What a client says about itself on initialize, or a request's _meta.
@@ -383,6 +423,18 @@ const MAX_LISTED_EVENTS = 20;
 export function serveEvents(wake: Wakeshift, server: McpServer, events: WakeEvent[], opts: ServeEventsOptions = {}): void {
   if (events.length === 0) throw new Error("wakeshift: serveEvents needs at least one event (wake.defineEvent) defined first");
   const userOf = opts.user ?? ((extra) => guestOf(extra)?.user);
+  // who is the caller: the signed-in agent and its user for an app whose
+  // users sign in with Wakeshift (opts.agent), else the app's user.
+  const who = async (extra: any): Promise<{ user: string | undefined; agent: Agent | undefined }> => {
+    if (!opts.agent) return { user: userOf(extra), agent: undefined };
+    let agent: Agent | undefined;
+    try {
+      agent = await opts.agent(extra);
+    } catch {
+      agent = undefined;
+    }
+    return { user: agent?.user(), agent };
+  };
   const byName = new Map(events.map((e) => [e.name, e]));
   const low = server.server;
   try {
@@ -422,9 +474,9 @@ export function serveEvents(wake: Wakeshift, server: McpServer, events: WakeEven
     } catch (err) {
       throw new McpError(INVALID_PARAMS, (err as Error).message);
     }
-    const user = userOf(extra);
+    const { user, agent } = await who(extra);
     if (!user) throw new McpError(codes.forbidden, fill("native_no_user"));
-    const call = { user, client, meta, ...(ua ? { user_agent: ua } : {}) };
+    const call = { user, client, meta, ...(ua ? { user_agent: ua } : {}), ...(agent ? { agent_token: agent.token } : {}) };
     if (!unsubscribe && !(await ev.allows({ user, client, native: true }, args))) {
       throw new McpError(codes.forbidden, fill("native_refused", { event: ev.name }));
     }
@@ -490,14 +542,14 @@ export function serveEvents(wake: Wakeshift, server: McpServer, events: WakeEven
       } catch (err) {
         return fail((err as Error).message);
       }
-      const user = userOf(extra);
+      const { user, agent } = await who(extra);
       if (ev.personal && !user) return fail(fill("personal_no_user", { event: ev.name }));
       if (!(await ev.allows({ user, client: clientInfoName(server, extra?._meta), native: false }, args))) {
         return fail(fill("refused", { event: ev.name }));
       }
       try {
         const out = await wake.requestApp<{ event_subscription: { id: string; created: boolean }; addition: Addition; agent?: unknown }>("POST", "/event-subscriptions", {
-          call: wake.call(extra, { server, user, args: rest }),
+          call: wake.call(extra, { server, user, agent, args: rest }),
           name: ev.name,
           arguments: args,
         });
@@ -522,7 +574,7 @@ export function serveEvents(wake: Wakeshift, server: McpServer, events: WakeEven
     },
     async (input: any, extra: any) => {
       const { event, arguments: raw, id, ...rest } = input as { event?: string; arguments?: Record<string, unknown>; id?: string };
-      const user = userOf(extra);
+      const { user, agent } = await who(extra);
       try {
         if (id) {
           if (!user) return fail(fill("end_no_user"));
@@ -533,7 +585,7 @@ export function serveEvents(wake: Wakeshift, server: McpServer, events: WakeEven
         if (!ev) return fail(fill("need"));
         const args = ev.parseArgs(raw ?? {});
         const out = await wake.requestApp<{ ended: boolean }>("POST", "/event-subscriptions/unsubscribe", {
-          call: wake.call(extra, { server, user, args: rest }),
+          call: wake.call(extra, { server, user, agent, args: rest }),
           name: ev.name,
           arguments: args,
         });
@@ -544,7 +596,7 @@ export function serveEvents(wake: Wakeshift, server: McpServer, events: WakeEven
     },
   );
   server.registerTool("list_subscriptions", { description: EVENT_TOOL_TEXT.list_description, inputSchema: { ...wake.args } }, async (_input: any, extra: any) => {
-    const user = userOf(extra);
+    const { user } = await who(extra);
     if (!user) return fail(fill("list_no_user"));
     try {
       const out = await wake.requestApp<{

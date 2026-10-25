@@ -12,7 +12,7 @@ log="$dir/harness.log"
 : "${WAKESHIFT_TEST_DATABASE_URL:=postgres://postgres:postgres@localhost:5439/postgres?sslmode=disable}"
 export WAKESHIFT_TEST_DATABASE_URL
 
-(cd "$repo" && WAKESHIFT_SDK_HARNESS="$out" go test -count=1 -run '^TestSDKHarness$' -timeout 15m -v ./internal/coretest/) >"$log" 2>&1 &
+(cd "$repo" && WAKESHIFT_SDK_HARNESS="$out" WAKESHIFT_SDK_HARNESS_ACCOUNTS_MCP=http://127.0.0.1:9/lounge/mcp go test -count=1 -run '^TestSDKHarness$' -timeout 15m -v ./internal/coretest/) >"$log" 2>&1 &
 pid=$!
 trap 'rm -f "$out"; wait $pid 2>/dev/null || true; rm -rf "$dir"' EXIT
 
@@ -33,7 +33,7 @@ done
 
 cd "$sdk"
 npx tsc -p tsconfig.test.json
-WAKESHIFT_SDK_HARNESS="$out" node --test build-test/test/e2e.test.js || {
+WAKESHIFT_SDK_HARNESS="$out" node --test build-test/test/e2e.test.js build-test/test/e2e-accounts.test.js || {
   status=$?
   echo "core log: $log" >&2
   tail -50 "$log" >&2

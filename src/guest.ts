@@ -19,6 +19,7 @@
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { isIP } from "node:net";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { WakeshiftError } from "./errors.js";
 import { harnessAgent } from "./harness.js";
@@ -337,7 +338,7 @@ export class GuestAuth {
       throw new OAuthFailure(400, "invalid_client_metadata", "redirect_uris is required");
     }
     for (const u of uris as string[]) {
-      if (u.length > 500 || !hasScheme(u)) throw new OAuthFailure(400, "invalid_redirect_uri", "bad redirect URI");
+      if (u.length > 500 || !validRedirect(u)) throw new OAuthFailure(400, "invalid_redirect_uri", BAD_REDIRECT);
     }
     let name = typeof inp.client_name === "string" ? inp.client_name.trim() : "";
     if (!name || Buffer.byteLength(name) > 80) name = "MCP client";
@@ -372,7 +373,10 @@ export class GuestAuth {
     }
     const state = q.get("state") ?? "";
     if (q.get("response_type") !== "code" || !PKCE_RE.test(q.get("code_challenge") ?? "") || q.get("code_challenge_method") !== "S256") {
-      redirectErr(res, redirect, state, "invalid_request", "PKCE (S256) is required");
+      // Said here, not by redirecting: anyone can register a client with
+      // any https redirect, and there's no step for the person first, so
+      // redirecting a bad request would make this an open redirect.
+      textErr(res, 400, "This sign-in request is incomplete: PKCE (S256) and response_type=code are required.");
       return;
     }
     const code: GuestCode = { c: q.get("client_id")!, r: redirect, s: state, p: q.get("code_challenge")!, e: this.seconds() + CODE_TTL, k: true };
@@ -515,12 +519,34 @@ function formUnescape(s: string): string | null {
   }
 }
 
-function hasScheme(u: string): boolean {
+const BAD_REDIRECT = "redirect URIs are https, http on loopback (localhost, 127.0.0.1, [::1]) or a private-use scheme (cursor://…), without a fragment";
+
+// validRedirect accepts https URLs, http on loopback (native apps, RFC
+// 8252) and private-use schemes (cursor://…), never ones a browser would
+// run or that carry a fragment, as the core's OAuth does.
+function validRedirect(raw: string): boolean {
+  const m = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(raw);
+  if (!m || m[1] !== m[1].toLowerCase() || raw.includes("#")) return false;
+  let u: URL;
   try {
-    return new URL(u).protocol.length > 1;
+    u = new URL(raw);
   } catch {
     return false;
   }
+  switch (m[1]) {
+    case "https":
+      return u.hostname !== "";
+    case "http":
+      return u.hostname === "localhost" || (isIP(u.hostname) === 4 && u.hostname.startsWith("127.")) || u.hostname === "[::1]";
+    case "javascript":
+    case "data":
+    case "file":
+    case "blob":
+    case "about":
+    case "vbscript":
+      return false;
+  }
+  return true;
 }
 
 async function readBody(req: IncomingMessage, limit: number): Promise<string> {
@@ -567,17 +593,3 @@ function textErr(res: ServerResponse, status: number, msg: string): void {
   res.end(msg + "\n");
 }
 
-function redirectErr(res: ServerResponse, redirect: string, state: string, code: string, desc: string): void {
-  let u: URL;
-  try {
-    u = new URL(redirect);
-  } catch {
-    textErr(res, 400, desc);
-    return;
-  }
-  u.searchParams.set("error", code);
-  u.searchParams.set("error_description", desc);
-  if (state) u.searchParams.set("state", state);
-  res.writeHead(302, { Location: u.toString() });
-  res.end();
-}

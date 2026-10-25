@@ -6,6 +6,7 @@ export {
   CONVERSATION_ARG,
   UNKNOWN_CLIENT_WARNING,
   type WakeshiftOptions,
+  type AppInfo,
   type Call,
   type CallOptions,
   type ClientInfoSource,
@@ -32,6 +33,7 @@ export {
 export { GuestAuth, guestOf, type Guest, type GuestAuthOptions, type GuestAuthInfo } from "./guest.js";
 export { WakeshiftSignIn, SignInError, type WakeshiftSignInOptions, type StartOptions } from "./signin.js";
 export { harnessAgent } from "./harness.js";
+export { Agent, type Claims } from "./agent.js";
 export { WakeshiftError, isCode } from "./errors.js";
 export { parseKey, signAssertion, type AppKey } from "./key.js";
 export {

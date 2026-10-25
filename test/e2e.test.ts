@@ -324,6 +324,28 @@ test("the SDK against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNE
 // with no user step, its tool calls carry the guest, topics keep the
 // guest's conversation in its workspace, and forgetting the guest's user
 // ends its refreshes.
+// The same app's key in the current format (wst_ and 50 characters): it
+// names no app, so app() asks the core, and calls work as with the old one.
+test("a current-format key against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async () => {
+  const { core, key, new_key } = JSON.parse(readFileSync(harness!, "utf8")) as { core: string; key: string; new_key: string };
+  assert.ok(new_key, "the harness has no new_key");
+  const wake = new Wakeshift({ key: new_key, core, onWarning: () => {} });
+  assert.equal(wake.mode, null);
+  assert.throws(() => wake.appId, /call await wake\.app\(\) first/);
+  const app = await wake.app();
+  assert.equal(app.id, "ci-bot");
+  assert.equal(typeof app.name, "string");
+  assert.equal(wake.appId, "ci-bot");
+
+  const sub = await wake.subscribe(wake.callOf({ clientName: "claude-code", user: "newkey" }), "ci/newkey");
+  assert.match(sub.id, /^ts_/);
+  assert.equal((await wake.publish("ci/newkey", { text: "from a current key" })).matched, 1);
+  // The old key is the same app: it sees the subscription.
+  const old = new Wakeshift({ key, core, onWarning: () => {} });
+  assert.equal((await old.topicStatus("ci/newkey")).subscriptions, 1);
+  assert.equal((await old.app()).id, "ci-bot");
+});
+
 test("guest sign-in against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async (t) => {
   const { core, key } = JSON.parse(readFileSync(harness!, "utf8")) as { core: string; key: string };
   const wake = new Wakeshift({ key, core });
@@ -513,6 +535,30 @@ test("events against a real core: defined, served, emitted, bridged and native",
   await turn.emit({ table: "t1" }, { hole: ["7c", "7d"], toCall: 4 }, { to: "p2" });
   await p2Lines.expect("Your move: 7c 7d, 4 to call");
   await p1Lines.expectNothing();
+
+  // An event's publish URL: a POST's body is the payload, checked against
+  // the schema; a personal event's goes to the one subscriber it's for.
+  const post = (url: string, body: unknown) =>
+    fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: typeof body === "string" ? body : JSON.stringify(body) });
+  const buildUrl = await build.publishUrl({ repo: "acme" });
+  assert.equal(buildUrl.event, "ci.build");
+  assert.ok(buildUrl.url.startsWith(core + "/v1/publish/"), buildUrl.url);
+  const posted = await post(buildUrl.url, { conclusion: "success", url: "https://ci.example/2" });
+  assert.equal(posted.status, 202);
+  assert.equal(((await posted.json()) as any).matched, 1);
+  const viaUrl = await bobLines.expect(`ci.build: {"conclusion":"success","url":"https://ci.example/2"}`);
+  assert.equal(viaUrl.event?.data?.url, "https://ci.example/2");
+  const bad = await post(buildUrl.url, { conclusion: 1 });
+  assert.equal(bad.status, 400);
+  assert.equal(((await bad.json()) as any).error.code, "bad_payload");
+  await wake.revokePublishUrl(buildUrl.id);
+  assert.equal((await post(buildUrl.url, { conclusion: "success", url: "x" })).status, 410);
+  await assert.rejects(turn.publishUrl({ table: "t1" }), /personal/);
+  const p2Url = await turn.publishUrl({ table: "t1" }, { to: "p2" });
+  assert.equal(((await (await post(p2Url.url, { hole: ["8c", "8d"], toCall: 1 })).json()) as any).matched, 1);
+  await p2Lines.expect(`game.turn: {"hole":["8c","8d"],"toCall":1}`);
+  await p1Lines.expectNothing();
+  await wake.revokePublishUrl(p2Url.id);
 
   // Native (a client that speaks MCP Events): events/subscribe, a webhook.
   const hook = await receiver();

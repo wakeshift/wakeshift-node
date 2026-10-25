@@ -52,7 +52,7 @@ test("signAssertion signs a short-lived EdDSA assertion for the core", () => {
   const now = Date.UTC(2026, 9, 18, 12, 0, 0);
   const tok = signAssertion(k, "https://app.wakeshift.ai", now);
   const [h, c, s] = tok.split(".");
-  assert.deepEqual(JSON.parse(Buffer.from(h, "base64url").toString()), { alg: "EdDSA", typ: "app+jwt" });
+  assert.deepEqual(JSON.parse(Buffer.from(h, "base64url").toString()), { alg: "EdDSA", typ: "app+jwt", kid: k.kid });
   const claims = JSON.parse(Buffer.from(c, "base64url").toString());
   assert.equal(claims.iss, "ci-bot");
   assert.equal(claims.sub, "ci-bot");
@@ -92,7 +92,7 @@ const subscribeReply = {
   addition: { text: "You're claude-code#1. Start the Monitor tool now.", meta: { "wakeshift/x": "y" } },
 };
 
-test("the core URL: given, else WAKESHIFT_CORE; only a live key falls back to production", () => {
+test("the core URL: given, else WAKESHIFT_CORE; a test key has no default", () => {
   assert.equal(new Wakeshift({ key: KEY, core: "http://127.0.0.1:9/" }).core, "http://127.0.0.1:9");
   const was = process.env.WAKESHIFT_CORE;
   process.env.WAKESHIFT_CORE = "https://app.staging.wakeshift.ai";
@@ -202,7 +202,7 @@ test("the other calls: paths, bodies and results", async () => {
     "/api/apps/v1/topics/publish": { matched: 3, duplicate: false },
     "/api/apps/v1/subscriptions/ts_a%2Fb/send": { status: "queued" },
     "/api/apps/v1/topics/publish-urls": { id: "u1", topic: "hooks/x", url: "http://core.test/v1/publish/wsp_x" },
-    "/api/apps/v1/topics/publish-urls/u1": { revoked: true },
+    "/api/apps/v1/events/publish-urls/u1": { revoked: true },
     "/api/apps/v1/topics/annotate": { text: "waiting: 1", meta: { "wakeshift/connector": "beacon" } },
     "/api/apps/v1/topics/close": { closed: 4 },
     "/api/apps/v1/users/forget": { forgotten: true },

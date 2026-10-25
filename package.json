@@ -1,6 +1,6 @@
 {
   "name": "@wakeshift/sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Let agents subscribe to things in your app: Wakeshift wakes them when you publish.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/wakeshift/wakeshift-node#readme",

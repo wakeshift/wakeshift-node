@@ -1,9 +1,9 @@
 // WakeshiftSignIn is the browser side of Sign in with Wakeshift for an app
-// whose MCP clients sign in some other way (GuestAuth, or the app's own
-// accounts): it sends the person to Wakeshift to sign in and pick the agent,
-// and on the way back gives the app who signed in, a Wakeshift user ID
-// that's the same across sign-ins, devices and agents. An app uses it to
-// link a guest to a person, for example to rank players.
+// whose users have Wakeshift accounts (manifest accounts: "wakeshift"): it
+// sends the person to Wakeshift to sign in and pick the agent, and on the
+// way back gives the app who signed in, a Wakeshift user ID that's the same
+// across sign-ins, devices and agents. Wakeshift refuses it for an app that
+// keeps its own users (GuestAuth's guests included).
 //
 // It keeps no state: the PKCE verifier, the state and what the app wants
 // carried through (link) go in a signed, HttpOnly cookie for the redirect's
@@ -77,9 +77,21 @@ export class WakeshiftSignIn {
     this.key = createHmac("sha256", o.wake.secretSeed()).update("wakeshift-signin:state").digest();
   }
 
-  /** Sends the person to Wakeshift's sign-in (a 302 and the cookie). */
-  start(res: ServerResponse, o: StartOptions = {}): void {
+  /**
+   * Sends the person to Wakeshift's sign-in (a 302 and the cookie). With a
+   * key that doesn't name its app, it first asks Wakeshift which app it is
+   * (wake.app(), once): await it, so a failure there reaches you.
+   */
+  start(res: ServerResponse, o: StartOptions = {}): Promise<void> {
     if ((o.link ?? "").length > 1000) throw new Error("wakeshift: link is at most 1000 characters");
+    if (this.wake.knownApp()) {
+      this.redirect(res, o);
+      return Promise.resolve();
+    }
+    return this.wake.app().then(() => this.redirect(res, o));
+  }
+
+  private redirect(res: ServerResponse, o: StartOptions): void {
     const { verifier, challenge } = this.wake.pkce();
     const state = randomBytes(16).toString("base64url");
     const p: Pending = { s: state, v: verifier, l: o.link ?? "", e: Math.floor(this.now() / 1000) + TTL };

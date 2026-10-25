@@ -169,7 +169,9 @@ test("knowing a client_id isn't enough: codes and refresh tokens need the secret
   assert.equal((await code(a.base, "not-a-client")).status, 400, "an unknown client");
   const short = await code(a.base, reg.clientId, REDIRECT, "short");
   assert.equal(short.code, "", "a malformed PKCE challenge got a code");
-  assert.equal(new URL(short.location).searchParams.get("error"), "invalid_request");
+  // Answered here, never by redirecting (an open redirect otherwise).
+  assert.equal(short.status, 400);
+  assert.equal(short.location, "");
 
   const c = (await code(a.base, reg.clientId)).code;
   let r = await token(a.base, exchange(reg.clientId, c));
@@ -309,9 +311,16 @@ test("registration refuses bad metadata", async (t) => {
     JSON.stringify({ redirect_uris: [42] }),
     JSON.stringify({ redirect_uris: ["relative/path"] }),
     JSON.stringify({ redirect_uris: ["http://h/" + "x".repeat(500)] }),
+    JSON.stringify({ redirect_uris: ["javascript:alert(1)"] }),
+    JSON.stringify({ redirect_uris: ["data:text/html,x"] }),
+    JSON.stringify({ redirect_uris: ["http://evil.example/cb"] }),
+    JSON.stringify({ redirect_uris: ["https://ok.example/cb#frag"] }),
     "x".repeat(17 << 10),
   ]) {
     assert.equal((await post(body)).status, 400, body.slice(0, 40));
+  }
+  for (const good of ["https://app.example/cb", "http://localhost:3000/cb", "http://127.0.0.1:9/cb", "http://[::1]:9/cb"]) {
+    assert.equal((await post(JSON.stringify({ redirect_uris: [good] }))).status, 201, good);
   }
   const ok = (await (await post(JSON.stringify({ client_name: " ".repeat(3), redirect_uris: ["cursor://cb"] }))).json()) as any;
   assert.equal(ok.client_name, "MCP client");

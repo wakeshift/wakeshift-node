@@ -6,8 +6,10 @@ import type { AnySchema } from "@modelcontextprotocol/sdk/server/zod-compat.js";
 import { WakeshiftError } from "./errors.js";
 import { WakeEvent, serveEvents as serveEventsOn, type EventOptions, type EventTypeManifest, type ServeEventsOptions } from "./events.js";
 import { parseKey, signAssertion, type AppKey } from "./key.js";
+import { Agent, Keys, verifyAccessToken, type Claims } from "./agent.js";
+import { retryRefused } from "./retry.js";
 
-/** Wakeshift's production core, the default for live keys. Override with `core` or WAKESHIFT_CORE. */
+/** Wakeshift's production core, the default for every key but an older wst_test_ one. Override with `core` or WAKESHIFT_CORE. */
 export const DEFAULT_CORE = "https://app.wakeshift.ai";
 
 /** The tool argument an agent passes its session key in (a result gives it one). */
@@ -31,14 +33,20 @@ const CONVERSATION_DESCRIPTION =
   "Your own ID for this conversation, if your program gives you one. Cursor and Grok Bot: the output of `printenv CURSOR_CONVERSATION_ID`. Codex and Antigravity send it automatically; others leave it empty";
 
 export interface WakeshiftOptions {
-  /** The app key from the console: wst_test_<app>_<seed>. */
+  /** The app key from the console: wst_ and 50 characters (or an older wst_test_… or wst_live_… key). */
   key: string;
   /**
    * Wakeshift's base URL: the console you got the key from. Default:
-   * WAKESHIFT_CORE from the environment. A test key needs one of the two;
-   * a live key falls back to https://app.wakeshift.ai.
+   * WAKESHIFT_CORE from the environment, else https://app.wakeshift.ai.
+   * An older wst_test_… key has no default: it needs one of the two.
    */
   core?: string;
+  /**
+   * The app's MCP endpoint (the resource its access tokens are issued for),
+   * for an app whose users sign in with Wakeshift (accounts: "wakeshift"):
+   * what verifyAccessToken checks a token's audience against.
+   */
+  mcpUrl?: string;
   /** Default: the global fetch. */
   fetch?: typeof fetch;
   /** Per-request timeout in milliseconds. Default 20000. */
@@ -49,6 +57,12 @@ export interface WakeshiftOptions {
    * reported once. Default: console.warn.
    */
   onWarning?: (message: string) => void;
+}
+
+/** Which app a key is, as Wakeshift says (wake.app()). */
+export interface AppInfo {
+  id: string;
+  name: string;
 }
 
 /** What the SDK says, once, when Wakeshift recognised no harness in a tool call. */
@@ -84,6 +98,12 @@ export interface Call {
   conversation?: string;
   /** The program the agent says it runs in (harness): a hint, never a credential. */
   harness?: string;
+  /**
+   * For an app whose users sign in with Wakeshift: the signed-in agent's
+   * exchanged token (an Agent's), which makes the subscription that
+   * agent's, under its person's consent. Set it with { agent }.
+   */
+  agent_token?: string;
 }
 
 /**
@@ -195,9 +215,11 @@ export interface SubscriptionStatus {
   expiresAt?: Date;
 }
 
+/** A publish URL: `topic` for a topic's (`wake.publishUrl`), `event` for an event's (`event.publishUrl`). */
 export interface PublishUrl {
   id: string;
-  topic: string;
+  topic?: string;
+  event?: string;
   url: string;
 }
 
@@ -303,6 +325,12 @@ export interface CallOptions {
   client?: string;
   /** The app's own ID for the person. */
   user?: string;
+  /**
+   * For an app whose users sign in with Wakeshift: the signed-in agent
+   * (wake.exchange). The call becomes that agent's: user is agent.user()
+   * and its exchanged token goes with it.
+   */
+  agent?: Agent;
   /** The tool's arguments: session_key, harness and conversation_id (wake.args) are read from them. */
   args?: { [SESSION_ARG]?: string; [HARNESS_ARG]?: string; [CONVERSATION_ARG]?: string } | Record<string, unknown>;
   /** The session key, if you read it yourself. */
@@ -348,10 +376,16 @@ function str(args: Record<string, unknown> | undefined, name: string): string | 
  * your tools to topics, and publish to them.
  */
 export class Wakeshift {
-  readonly appId: string;
-  readonly mode: "test" | "live";
+  /**
+   * An older key's mode (wst_test_…, wst_live_…); null for a current key.
+   * @deprecated Modes mean nothing now, and current keys have none.
+   */
+  readonly mode: "test" | "live" | null;
   readonly core: string;
   private readonly key: AppKey;
+  // The app's ID: from the key, if it names the app, or else from app().
+  private knownAppId: string | null;
+  private appInfo?: Promise<AppInfo>;
   private readonly fetchFn: typeof fetch;
   private readonly timeoutMs: number;
   private readonly warnFn: (message: string) => void;
@@ -360,28 +394,165 @@ export class Wakeshift {
   constructor(opts: WakeshiftOptions) {
     if (!opts?.key) throw new Error("wakeshift: no app key (WAKESHIFT_KEY?)");
     this.key = parseKey(opts.key);
-    this.appId = this.key.appId;
+    this.knownAppId = this.key.appId;
     this.mode = this.key.mode;
     // Test keys come from staging and local consoles, and one sent to
     // production fails in a way that's hard to read: ask for the core.
-    const core = opts.core || process.env.WAKESHIFT_CORE || (this.mode === "live" ? DEFAULT_CORE : "");
+    const core = opts.core || process.env.WAKESHIFT_CORE || (this.mode === "test" ? "" : DEFAULT_CORE);
     if (!core) {
       throw new Error(
         "wakeshift: no core URL for this test key: set WAKESHIFT_CORE, or pass { core }, to the address of the console the key came from (for example https://app.staging.wakeshift.ai)",
       );
     }
     this.core = core.replace(/\/+$/, "");
-    this.fetchFn = opts.fetch ?? globalThis.fetch;
+    // A request the load balancer refused during a rollout is sent again (retry.ts).
+    this.fetchFn = retryRefused(opts.fetch ?? globalThis.fetch);
     this.timeoutMs = opts.timeoutMs ?? 20_000;
     this.warnFn = opts.onWarning ?? ((m) => console.warn(m));
+    this.mcpUrl = opts.mcpUrl;
+    this.signingKeys = new Keys(this.core, this.fetchFn, this.timeoutMs);
   }
 
-  /** Reports a warning, once per kind. */
+  /**
+   * The app's ID. An older key (wst_test_…, wst_live_…) names it; for a
+   * current key, which doesn't, this throws until `await wake.app()` has
+   * asked Wakeshift.
+   */
+  get appId(): string {
+    if (!this.knownAppId) throw new Error("wakeshift: call await wake.app() first: this key doesn't name its app");
+    return this.knownAppId;
+  }
+
+  /**
+   * Which app the key is, as Wakeshift says: its ID and name. Asks once
+   * (GET /api/apps/v1/app) and remembers the answer; afterwards
+   * `wake.appId` works for any key.
+   */
+  app(): Promise<AppInfo> {
+    this.appInfo ??= this.request<{ id?: unknown; name?: unknown }>("GET", "/app")
+      .then((r) => {
+        if (typeof r.id !== "string" || !r.id) {
+          throw new WakeshiftError(200, "bad_response", `Wakeshift at ${this.core} didn't say which app this key is`);
+        }
+        const id = this.knownAppId ?? r.id;
+        this.knownAppId = id;
+        return { id, name: typeof r.name === "string" ? r.name : "" };
+      })
+      .catch((err: unknown) => {
+        this.appInfo = undefined; // a later call asks again
+        throw err;
+      });
+    return this.appInfo;
+  }
+
+  /** @internal The app's ID if it's known yet (the key names it, or app() has answered), else null. */
+  knownApp(): string | null {
+    return this.knownAppId;
+  }
+
+  /** @internal The app's ID, asking Wakeshift (app()) only if it isn't known yet. */
+  async resolveAppId(): Promise<string> {
+    return this.knownAppId ?? (await this.app()).id;
+  }
+
+  // A fresh assertion of the app's identity, naming the app once it's known.
+  private assertion(): string {
+    return signAssertion(this.key, this.core, Date.now(), this.knownAppId);
+  }
+
+  /** The app's MCP endpoint, for an app whose users sign in with Wakeshift (the mcpUrl option). */
+  readonly mcpUrl?: string;
+  private readonly signingKeys: Keys;
+  private readonly exchanged = new Map<string, Agent>();
+
+  // ── Sign in with Wakeshift, for the app's MCP server ─────────────────
+
+  /**
+   * The app's OAuth protected-resource metadata (RFC 9728), which tells
+   * MCP clients to sign in with Wakeshift: serve it as JSON at
+   * /.well-known/oauth-protected-resource (and the same path followed by
+   * the MCP endpoint's path). Needs the mcpUrl option.
+   */
+  protectedResource(): { resource: string; authorization_servers: string[]; bearer_methods_supported: string[] } {
+    return { resource: this.needMcpUrl(), authorization_servers: [this.core], bearer_methods_supported: ["header"] };
+  }
+
+  /**
+   * The WWW-Authenticate value for an MCP request without a valid token
+   * (answer 401 with it): it points the client at the resource metadata.
+   */
+  challenge(): string {
+    const u = new URL(this.needMcpUrl());
+    return `Bearer resource_metadata="${u.origin}/.well-known/oauth-protected-resource"`;
+  }
+
+  /**
+   * Checks an access token an MCP client sent: signed by Wakeshift (keys
+   * from its JWKS), issued for this app's MCP URL (the mcpUrl option), not
+   * expired. Throws an Error otherwise ("invalid token", "token for another
+   * app", …): answer 401 with challenge().
+   */
+  async verifyAccessToken(token: string): Promise<Claims> {
+    return verifyAccessToken(this.signingKeys, token, this.core, this.needMcpUrl());
+  }
+
+  /**
+   * Turns the access token an agent sent the app into an Agent the app can
+   * act for (RFC 8693 token exchange). Results are cached until shortly
+   * before they expire (up to 15 minutes), so a revoked consent shows as
+   * the Agent's calls failing (WakeshiftError no_grant or bad_agent_token),
+   * not as exchange refusing: treat both as signed out.
+   */
+  async exchange(accessToken: string): Promise<Agent> {
+    const hit = this.exchanged.get(accessToken);
+    if (hit && hit.expiresAt.getTime() - Date.now() > 30_000) return hit;
+    const claims = await this.verifyAccessToken(accessToken);
+    const body = new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+      subject_token: accessToken,
+      subject_token_type: "urn:ietf:params:oauth:token-type:access_token",
+      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+      client_assertion: this.assertion(),
+    });
+    let resp: Response;
+    let text: string;
+    try {
+      resp = await this.fetchFn(this.core + "/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString(),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+      text = await resp.text();
+    } catch (err) {
+      throw this.unreachable(err);
+    }
+    let out: any;
+    try {
+      out = text ? JSON.parse(text) : {};
+    } catch {
+      out = {};
+    }
+    if (!resp.ok || typeof out?.access_token !== "string") {
+      throw new WakeshiftError(resp.status, out?.error ?? "bad_response", out?.error_description ?? "Wakeshift didn't exchange the token");
+    }
+    const ag = new Agent(claims.wakeshift_tenant, claims.wakeshift_agent, out.access_token, new Date(Date.now() + (Number(out.expires_in) || 0) * 1000));
+    for (const [k, v] of this.exchanged) if (v.expiresAt.getTime() <= Date.now()) this.exchanged.delete(k);
+    this.exchanged.set(accessToken, ag);
+    return ag;
+  }
+
+  private needMcpUrl(): string {
+    if (!this.mcpUrl) throw new Error("wakeshift: pass { mcpUrl } (the app's MCP endpoint) to sign agents in with Wakeshift");
+    return this.mcpUrl;
+  }
+
   /** @internal Reports a problem through onWarning, every time. */
   warn(message: string): void {
     this.warnFn(message);
   }
 
+  /** Reports a warning, once per kind. */
   private warnOnce(kind: string, message: string): void {
     if (this.warned.has(kind)) return;
     this.warned.add(kind);
@@ -413,15 +584,17 @@ export class Wakeshift {
       client = clientNameOf(opts.server);
     }
     const args = opts.args as Record<string, unknown> | undefined;
-    return this.callOf({
+    const call = this.callOf({
       meta: extra?._meta,
       clientName: client,
-      user: opts.user,
+      user: opts.agent ? opts.agent.user() : opts.user,
       session: opts.session ?? str(args, SESSION_ARG),
       userAgent: userAgentOf(extra),
       harness: opts.harness ?? str(args, HARNESS_ARG),
       conversation: opts.conversation ?? str(args, CONVERSATION_ARG),
     });
+    if (opts.agent) call.agent_token = opts.agent.token;
+    return call;
   }
 
   /** Packs a tool call without an MCP framework. */
@@ -528,9 +701,9 @@ export class Wakeshift {
     return this.request<PublishUrl>("POST", "/topics/publish-urls", { topic });
   }
 
-  /** Stops a publish URL working (410 from then on). */
+  /** Stops a publish URL working, a topic's or an event's (410 from then on). */
   async revokePublishUrl(id: string): Promise<void> {
-    await this.request("DELETE", `/topics/publish-urls/${encodeURIComponent(id)}`);
+    await this.request("DELETE", `/events/publish-urls/${encodeURIComponent(id)}`);
   }
 
   /** What Wakeshift would add to any other tool result for this conversation (creates nothing). */
@@ -702,6 +875,7 @@ export class Wakeshift {
    * person signs in, picks the agent and consents. Wakeshift then redirects
    * to redirectUri with code, state and iss; check state, and that iss is
    * wake.core, then call signIn. WakeshiftSignIn does all of that for you.
+   * With a key that doesn't name its app, `await wake.app()` first.
    */
   authorizeUrl(o: AuthorizeOptions): string {
     const q = new URLSearchParams({
@@ -732,9 +906,9 @@ export class Wakeshift {
   private async tokens(form: Record<string, string>): Promise<SignedIn> {
     const body = new URLSearchParams({
       ...form,
-      client_id: "app:" + this.appId,
+      client_id: "app:" + (await this.resolveAppId()),
       client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-      client_assertion: signAssertion(this.key, this.core),
+      client_assertion: this.assertion(),
     });
     let resp: Response;
     let text: string;
@@ -786,7 +960,7 @@ export class Wakeshift {
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const headers: Record<string, string> = { Authorization: "Bearer " + signAssertion(this.key, this.core) };
+    const headers: Record<string, string> = { Authorization: "Bearer " + this.assertion() };
     if (body !== undefined) headers["Content-Type"] = "application/json";
     let resp: Response;
     let text: string;
