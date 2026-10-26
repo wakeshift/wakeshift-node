@@ -12,10 +12,10 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { createHash, createHmac, randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { GuestAuth, UNKNOWN_CLIENT_WARNING, Wakeshift, guestOf, isCode, type AgentScope, type Manifest, type Subscription } from "../src/index.js";
+import { UNKNOWN_CLIENT_WARNING, Wakeshift, isCode, type AgentScope, type Manifest, type Subscription } from "../src/index.js";
 
 const harness = process.env.WAKESHIFT_SDK_HARNESS;
 
@@ -319,10 +319,6 @@ test("the SDK against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNE
   assert.equal(await wake.send(claudeSub.id, { text: "x" }), "closed");
 });
 
-// Guest sign-in against a real core: an MCP client registers and signs in
-// with no user step, its tool calls carry the guest, topics keep the
-// guest's conversation in its workspace, and forgetting the guest's user
-// ends its refreshes.
 // The same app's key in the current format (wst_ and 50 characters): it
 // names no app, so app() asks the core, and calls work as with the old one.
 test("a current-format key against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async () => {
@@ -345,20 +341,26 @@ test("a current-format key against a real core", { skip: !harness && "set WAKESH
   assert.equal((await old.app()).id, "ci-bot");
 });
 
-test("guest sign-in against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async (t) => {
+// Users' workspaces against a real core: the app signs its own users in
+// (here, a bearer token per user), its tool calls carry the user, topics
+// keep the user's conversation in the workspace Wakeshift keeps for them,
+// and an agent added there has a grant until the user is forgotten.
+test("users' workspaces against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async (t) => {
   const { core, key } = JSON.parse(readFileSync(harness!, "utf8")) as { core: string; key: string };
   const wake = new Wakeshift({ key, core });
-  let guest!: GuestAuth;
+  const users: Record<string, string> = { "Bearer ada-token": "ada" };
   const http = createServer(async (req, res) => {
-    if (await guest.handle(req, res)) return;
-    const g = guest.authenticate(req, res);
-    if (!g) return;
-    // Stateless: a server per request, so the client's name comes from the guest.
+    // The app's own sign-in.
+    const user = users[req.headers.authorization ?? ""];
+    if (!user) {
+      res.writeHead(401).end();
+      return;
+    }
+    // Stateless: a server per request, so the client's name is passed.
     const server = new McpServer({ name: "ci-bot", version: "1.0" });
     server.registerTool("watch", { inputSchema: { repo: z.string(), ...wake.args } }, async ({ repo, ...args }, extra) => {
-      const who = guestOf(extra)!;
-      const sub = await wake.subscribe(wake.call(extra, { client: who.client, user: who.user, args }), `guests/${repo}`);
-      return sub.result(`Watching ${repo} for ${who.agent}.`);
+      const sub = await wake.subscribe(wake.call(extra, { client: "claude-code", user, args }), `users/${repo}`);
+      return sub.result(`Watching ${repo} for ${user}.`);
     });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     await server.connect(transport);
@@ -367,66 +369,33 @@ test("guest sign-in against a real core", { skip: !harness && "set WAKESHIFT_SDK
   await new Promise<void>((r) => http.listen(0, "127.0.0.1", r));
   t.after(() => http.close());
   const base = `http://127.0.0.1:${(http.address() as AddressInfo).port}`;
-  guest = new GuestAuth({ wake, mcpUrl: base + "/mcp" });
 
-  const redirect = "http://127.0.0.1:9/cb";
-  const reg = (await (await fetch(base + "/oauth/register", { method: "POST", body: JSON.stringify({ client_name: "Claude Code", redirect_uris: [redirect] }) })).json()) as any;
-  const verifier = randomBytes(32).toString("base64url");
-  const challenge = createHash("sha256").update(verifier).digest("base64url");
-  const auth = await fetch(
-    base + "/oauth/authorize?" + new URLSearchParams({ response_type: "code", client_id: reg.client_id, redirect_uri: redirect, code_challenge: challenge, code_challenge_method: "S256" }),
-    { redirect: "manual" },
-  );
-  const code = new URL(auth.headers.get("location")!).searchParams.get("code")!;
-  const tok = async (form: Record<string, string>) => {
-    const r = await fetch(base + "/oauth/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(form).toString() });
-    return { status: r.status, out: (await r.json()) as any };
-  };
-  const { status, out } = await tok({ grant_type: "authorization_code", code, code_verifier: verifier, redirect_uri: redirect, client_id: reg.client_id, client_secret: reg.client_secret });
-  assert.equal(status, 200, JSON.stringify(out));
-  const g = guest.verify(out.access_token)!;
-  assert.equal(g.agent, "claude-code");
-
-  // The guest's tool call subscribes in the guest's own workspace.
+  // The user's tool call subscribes in the user's workspace.
+  const workspace = await wake.workspace("ada", "Ada");
   const client = new Client({ name: "claude-code", version: "1.0" });
-  await client.connect(new StreamableHTTPClientTransport(new URL(base + "/mcp"), { requestInit: { headers: { Authorization: "Bearer " + out.access_token } } }));
+  await client.connect(new StreamableHTTPClientTransport(new URL(base + "/mcp"), { requestInit: { headers: { Authorization: "Bearer ada-token" } } }));
   t.after(() => client.close());
   const res = (await client.callTool({ name: "watch", arguments: { repo: "acme" } })) as CallToolResult;
-  assert.match(text(res), /Watching acme for claude-code\./);
-  assert.equal(await wake.workspace(g.user, "x"), g.workspace, "topics used another workspace");
-  assert.equal((await wake.topicStatus("guests/acme")).subscriptions, 1);
+  assert.match(text(res), /Watching acme for ada\./);
+  assert.equal(await wake.workspace("ada", "x"), workspace, "topics used another workspace");
+  assert.equal((await wake.topicStatus("users/acme")).subscriptions, 1);
 
-  // A refresh works, and rotates; after forgetUser it's refused, and
-  // leaves no workspace behind.
-  const refresh = (rt: string) => tok({ grant_type: "refresh_token", refresh_token: rt, client_id: reg.client_id, client_secret: reg.client_secret });
-  const again = await refresh(out.refresh_token);
-  assert.equal(again.status, 200, JSON.stringify(again.out));
-  assert.notEqual(again.out.refresh_token, out.refresh_token);
-  assert.equal(await wake.forgetUser(g.user), true);
-  const gone = await refresh(again.out.refresh_token);
-  assert.equal(gone.status, 400);
-  assert.equal(gone.out.error, "invalid_grant");
-  assert.equal(await wake.forgetUser(g.user), false, "the refused refresh left a workspace");
-
-  // With an agent scope in the manifest, grants: a grant per guest, checked at each refresh.
+  // With an agent scope in the manifest, an agent in the user's workspace
+  // has a grant, live until the user is forgotten.
   const scope = [{ pattern: "app.ci-bot.ci.*", description: "CI runs it watches" }];
   // Wakeshift refuses a manifest that asks for Wakeshift accounts or redirect_uris: apps sign their own users in.
   await assert.rejects(wake.publishManifest({ accounts: "wakeshift" } as Manifest), (e: any) => isCode(e, "bad_manifest"));
   await assert.rejects(wake.publishManifest({ agent: { wake: scope, post: scope, ttl_days: 30, redirect_uris: [base + "/cb"] } as AgentScope }), (e: any) => isCode(e, "bad_manifest"));
   const m = await wake.publishManifest({ agent: { wake: scope, post: scope, ttl_days: 30 } });
   assert.equal(m.agent?.ttl_days, 30);
-  guest = new GuestAuth({ wake, mcpUrl: base + "/mcp", grants: true });
-  const reg2 = (await (await fetch(base + "/oauth/register", { method: "POST", body: JSON.stringify({ client_name: "codex-mcp-client", redirect_uris: [redirect] }) })).json()) as any;
-  const auth2 = await fetch(
-    base + "/oauth/authorize?" + new URLSearchParams({ response_type: "code", client_id: reg2.client_id, redirect_uri: redirect, code_challenge: challenge, code_challenge_method: "S256" }),
-    { redirect: "manual" },
-  );
-  const first = await tok({ grant_type: "authorization_code", code: new URL(auth2.headers.get("location")!).searchParams.get("code")!, code_verifier: verifier, redirect_uri: redirect, client_id: reg2.client_id, client_secret: reg2.client_secret });
-  assert.equal(first.status, 200, JSON.stringify(first.out));
-  const g2 = guest.verify(first.out.access_token)!;
-  assert.equal(g2.agent, "codex");
-  await wake.checkAgent(g2.workspace, g2.agent); // the grant is live
-  assert.equal((await tok({ grant_type: "refresh_token", refresh_token: first.out.refresh_token, client_id: reg2.client_id, client_secret: reg2.client_secret })).status, 200);
+  assert.ok(await wake.addAgent(workspace, "codex", "Codex"));
+  await wake.checkAgent(workspace, "codex"); // the grant is live
+
+  // Forgetting the user ends their subscriptions and leaves no workspace behind.
+  assert.equal(await wake.forgetUser("ada"), true);
+  assert.equal((await wake.topicStatus("users/acme")).subscriptions, 0);
+  await assert.rejects(wake.checkAgent(workspace, "codex"), (e: any) => isCode(e, "unknown_workspace"));
+  assert.equal(await wake.forgetUser("ada"), false);
 });
 
 // receiver is a callback that speaks MCP Events webhooks as a client would:

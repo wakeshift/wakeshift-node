@@ -30,12 +30,12 @@ server.registerTool(
   "watch_ci",
   { description: "Wake me when CI finishes", inputSchema: { repo: z.string(), branch: z.string().optional(), ...wake.args } },
   async ({ repo, branch, ...args }, extra) => {
-    const sub = await wake.subscribe(wake.call(extra, { server, args }), `ci/${repo.toLowerCase()}`, { filter: branch ? { branch } : undefined });
+    const sub = await wake.subscribe(wake.call(extra, { server, tool: "watch_ci", args }), `ci/${repo.toLowerCase()}`, { filter: branch ? { branch } : undefined });
     return sub.result(`Watching CI on ${repo}.`);
   },
 );
 server.registerTool("list_prs", { inputSchema: { repo: z.string(), ...wake.args } }, async ({ repo, ...args }, extra) =>
-  wake.annotate(wake.call(extra, { server, args }), { content: [{ type: "text", text: `No PRs on ${repo}.` }] }),
+  wake.annotate(wake.call(extra, { server, tool: "list_prs", args }), { content: [{ type: "text", text: `No PRs on ${repo}.` }] }),
 );
 server.registerTool("ping", { inputSchema: { repo: z.string() } }, async () => ({ content: [{ type: "text", text: "pong" }] }));
 
@@ -54,8 +54,6 @@ assert.deepEqual(manifest.filter, { branch: "{branch}" });
 assert.deepEqual(manifest.arguments.required, ["repo"]);
 assert.equal(manifest.payload.properties?.conclusion?.type, "string");
 // Internal members are stripped from the published types.
-// @ts-expect-error secretSeed is internal
-void ev.secretSeed;
 // @ts-expect-error requestApp is internal
 void ev.requestApp;
 // @ts-expect-error emitEvent is internal
@@ -76,7 +74,7 @@ assert.equal(listed.content.length, 2);
 const pinged = (await client.callTool({ name: "ping", arguments: { repo: "acme" } })) as CallToolResult;
 assert.equal(pinged.content.length, 1);
 assert.deepEqual(calls, [
-  { client: "Cursor", session: "h1", harness: "grok-bot", conversation: "c1" },
-  { client: "Cursor", session: "h1" },
+  { client: "Cursor", session: "h1", harness: "grok-bot", conversation: "c1", tool: "watch_ci" },
+  { client: "Cursor", session: "h1", tool: "list_prs" },
 ]);
 await client.close();

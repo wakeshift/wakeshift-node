@@ -26,7 +26,7 @@ export interface AppKey {
   /** The app's ID, for an older key that names it; null for a current key (ask Wakeshift: `wake.app()`). */
   appId: string | null;
   privateKey: KeyObject;
-  /** The 32-byte seed: what the SDK's own signed values (guest sign-in) are keyed from. */
+  /** The 32-byte seed the private key is made from. Never send or log it. */
   seed: Buffer;
   /** The key's ID in assertions' headers: base64url of the first 16 bytes of the public key's SHA-256. */
   kid: string;

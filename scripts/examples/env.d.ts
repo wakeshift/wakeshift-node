@@ -30,6 +30,8 @@ declare global {
   const user: { id: string };
   function canSeeRepo(extra: unknown, repo: string): Promise<boolean>;
   function canRead(user: string | undefined, channel: string): boolean;
+  // The app's own sign-in: its ID for the person behind a request.
+  function myUser(extra: unknown): string | undefined;
   // Events defined elsewhere in the app (as in the docs' events and quickstart pages).
   const ciFinished: SDK.WakeEvent<any, any>;
   const turn: SDK.WakeEvent<any, any>;

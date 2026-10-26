@@ -90,6 +90,12 @@ export interface Call {
   conversation?: string;
   /** The program the agent says it runs in (harness): a hint, never a credential. */
   harness?: string;
+  /**
+   * The name of the tool being called. A connector beacon in its result
+   * names it, and Wakeshift's hooks act on the beacon only from that
+   * tool's result: put the addition in the result of the tool you name.
+   */
+  tool?: string;
 }
 
 /**
@@ -271,6 +277,12 @@ export interface CallOptions {
   harness?: string;
   /** The conversation's ID the agent passed (conversation_id), if you read it yourself. */
   conversation?: string;
+  /**
+   * The name of the tool being called (the MCP SDK doesn't hand callbacks
+   * it, so pass it): Wakeshift's hooks act on a connector beacon only from
+   * the result of the tool it names.
+   */
+  tool?: string;
 }
 
 export function clientNameOf(s: ClientInfoSource): string {
@@ -430,6 +442,7 @@ export class Wakeshift {
       userAgent: userAgentOf(extra),
       harness: opts.harness ?? str(args, HARNESS_ARG),
       conversation: opts.conversation ?? str(args, CONVERSATION_ARG),
+      tool: opts.tool,
     });
   }
 
@@ -442,6 +455,7 @@ export class Wakeshift {
     userAgent?: string;
     harness?: string;
     conversation?: string;
+    tool?: string;
   }): Call {
     const out: Call = { client: c.clientName ?? "" };
     if (c.user) out.user = c.user;
@@ -450,6 +464,7 @@ export class Wakeshift {
     if (c.userAgent) out.user_agent = c.userAgent;
     if (c.harness?.trim()) out.harness = c.harness.trim();
     if (c.conversation?.trim()) out.conversation = c.conversation.trim();
+    if (c.tool?.trim()) out.tool = c.tool.trim();
     return out;
   }
 
@@ -641,7 +656,7 @@ export class Wakeshift {
    * unsubscribe_events and list_subscriptions for every client, so a person
    * can always see and stop what they're subscribed to.
    *
-   *   wake.attach(server, { identify: (extra) => ({ user: guestOf(extra)?.user }) })
+   *   wake.attach(server, { identify: (extra) => ({ user: myUser(extra) }) })
    */
   attach(server: McpServer, opts: AttachOptions = {}): void {
     attachEvents(this, server, [...this.events.values()], opts);
@@ -675,13 +690,12 @@ export class Wakeshift {
     return this.request<T>(method, path, body);
   }
 
-  // ── Guests' workspaces (GuestAuth) ─────────────────────────────────────
+  // ── Users' workspaces ──────────────────────────────────────────────────
 
   /**
    * The workspace Wakeshift keeps for one of the app's users (user: the
-   * app's own ID for them, as in wake.call's user), creating it on first use.
-   * Topics keep that user's conversations there too. GuestAuth calls this;
-   * most apps never need to.
+   * app's own ID for them, as in wake.call's user), created on first use.
+   * Topics keep that user's conversations there.
    */
   async workspace(user: string, name: string): Promise<string> {
     return (await this.request<{ workspace: string }>("POST", "/workspaces", { external_id: user, name })).workspace;
@@ -699,11 +713,6 @@ export class Wakeshift {
    */
   async checkAgent(workspace: string, agent: string): Promise<void> {
     await this.request("POST", `/workspaces/${encodeURIComponent(workspace)}/agents/${encodeURIComponent(agent)}/token`);
-  }
-
-  /** @internal The app key's seed: what GuestAuth keys its signed values from. Never send or log it. */
-  secretSeed(): Buffer {
-    return this.key.seed;
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {

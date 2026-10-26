@@ -1,6 +1,6 @@
 {
   "name": "@wakeshift/sdk",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Let agents subscribe to things in your app: Wakeshift wakes them when you publish.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/wakeshift/wakeshift-node#readme",
@@ -44,7 +44,7 @@
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
     "@types/node": "^22.20.5",
-    "typescript": "^5.9.3",
+    "typescript": "^7.0.2",
     "zod": "^4.6.7"
   }
 }

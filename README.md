@@ -33,7 +33,8 @@ const ciFinished = wake.defineEvent("ci.finished", {
 
 // One McpServer per MCP session; serve the events before connecting it.
 const server = new McpServer({ name: "ci-bot", version: "1.0.0" })
-wake.attach(server)
+// myUser: your own sign-in's ID for the person behind the request.
+wake.attach(server, { identify: (extra) => ({ user: myUser(extra) }) })
 ```
 
 ```ts
@@ -53,7 +54,7 @@ That's all. An agent subscribes with the `subscribe_events` tool `attach` adds (
 
 - `owner` and `repo` are required, so they route occurrences; their values are lowercase IDs (`a-z 0-9 . _ -`). The optional `branch` filters on the payload's `branch`.
 - `attach` adds `subscribe_events`, `unsubscribe_events` and `list_subscriptions`, and touches no other tool or result.
-- Native subscriptions (ChatGPT) and personal events need a signed-in user: pass `identify` to `attach`, or use `GuestAuth` (below).
+- Native subscriptions (ChatGPT) and personal events need a signed-in user: your app signs its users in and passes `identify` to `attach`.
 
 ## Events
 
@@ -62,7 +63,7 @@ Events follow MCP Events (SEP-3415): you define the event types your app offers,
 ```ts
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { z } from "zod"
-import { Wakeshift, guestOf } from "@wakeshift/sdk"
+import { Wakeshift } from "@wakeshift/sdk"
 
 const wake = new Wakeshift({ key: process.env.WAKESHIFT_KEY! })
 
@@ -85,17 +86,18 @@ const turn = wake.defineEvent("game.turn", {
 
 // One server per connection; attach before connecting it.
 const server = new McpServer({ name: "chat", version: "1.0.0" })
-wake.attach(server, { identify: (extra) => ({ user: guestOf(extra)?.user }) })
+// myUser: your own sign-in's ID for the person behind the request.
+wake.attach(server, { identify: (extra) => ({ user: myUser(extra) }) })
 
 // When something happens:
 await message.emit({ channel: "eng" }, { from: "ada", text: "shipped it" })
-await turn.emit({ table: "juniper" }, { hole: ["As", "Kd"], toCall: 2 }, { to: "guest:abc123" })
+await turn.emit({ table: "juniper" }, { hole: ["As", "Kd"], toCall: 2 }, { to: "user-123" })
 ```
 
 - **`wake.defineEvent(name, { description, args, payload, text, authorize?, personal? })`** returns the event. `args` is what a subscriber picks; its required string, integer and boolean fields route occurrences, so their values are lowercase IDs (a-z 0-9 . _ -), and an optional one filters on the payload field of the same name. `authorize(subscriber, args)` decides who may subscribe. Define every event before `attach`.
 - **`event.emit(args, payload, { id?, to? })`** checks the payload against its schema and sends it to everyone subscribed with those arguments; a personal event goes to the one subscriber `to` names (the `user` attach's `identify` gives for them). `id` makes retries emit once.
-- **`wake.attach(server, { identify? })`** attaches Wakeshift to your MCP server. Today it serves `events/list`, `events/subscribe` and `events/unsubscribe` to clients that speak MCP Events, and adds `subscribe_events` (for everyone else), `unsubscribe_events` and `list_subscriptions` (for every client, so a person can always see and stop what they're subscribed to). `identify(extra)` says who is behind a request, as `{ user }`, the app's ID for the person; by default, the guest `GuestAuth` signed in. The events go into your manifest on first use; `publishManifest` adds them too.
-- **`event.subscribe(extra, args, { server or client, user?, wakeArgs? })`** subscribes the conversation calling one of your own tools, the way `subscribe_events` would, so a tool like "join" can set up its wakes in one step; it gives back the subscription's `id`, the conversation's `session` (its `session_key`) and `result(text)`, your tool's text with what the agent needs added. Your tool decides who may (`authorize` isn't consulted). Clients that speak MCP Events subscribe themselves. **`event.unsubscribe(extra, args, …)`** ends the calling conversation's subscription with those arguments (for a tool like "unwatch"); **`event.end(user, id)`** ends one of a user's subscriptions by its ID.
+- **`wake.attach(server, { identify? })`** attaches Wakeshift to your MCP server. Today it serves `events/list`, `events/subscribe` and `events/unsubscribe` to clients that speak MCP Events, and adds `subscribe_events` (for everyone else), `unsubscribe_events` and `list_subscriptions` (for every client, so a person can always see and stop what they're subscribed to). `identify(extra)` says who is behind a request, as `{ user }`, your app's ID for the person, from your own sign-in; without it, requests have no user, so personal events and `list_subscriptions` refuse. The events go into your manifest on first use; `publishManifest` adds them too.
+- **`event.subscribe(extra, args, { server or client, tool?, user?, wakeArgs? })`** subscribes the conversation calling one of your own tools, the way `subscribe_events` would, so a tool like "join" can set up its wakes in one step; pass `tool`, your tool's name, for wake-ups to connect (see `wake.call`); it gives back the subscription's `id`, the conversation's `session` (its `session_key`) and `result(text)`, your tool's text with what the agent needs added. Your tool decides who may (`authorize` isn't consulted). Clients that speak MCP Events subscribe themselves. **`event.unsubscribe(extra, args, …)`** ends the calling conversation's subscription with those arguments (for a tool like "unwatch"); **`event.end(user, id)`** ends one of a user's subscriptions by its ID.
 
 ## Reference
 
@@ -112,8 +114,8 @@ await turn.emit({ table: "juniper" }, { hole: ["As", "Kd"], toCall: 2 }, { to: "
 For your own tools that subscribe (`event.subscribe`) and for topics.
 
 
-- `wake.call(extra, { server, user?, args?, session?, harness?, conversation?, client? })` packs a tool call from an MCP tool callback's `extra`: its `_meta` (Codex sends its thread there), the request's User-Agent (from `extra.requestInfo`), the client's name (from `server`'s client info; or pass `client` yourself, for example on a stateless server), `user` (your ID for the person; their conversations are grouped, and `u/<user>/…` topics are theirs), and `session_key`, `harness` and `conversation_id` from `args`.
-- `wake.callOf({ meta, clientName, user?, session?, userAgent?, harness?, conversation? })` does the same without an MCP framework.
+- `wake.call(extra, { server, tool, user?, args?, session?, harness?, conversation?, client? })` packs a tool call from an MCP tool callback's `extra`: its `_meta` (Codex sends its thread there), the request's User-Agent (from `extra.requestInfo`), the client's name (from `server`'s client info; or pass `client` yourself, for example on a stateless server), `user` (your ID for the person; their conversations are grouped, and `u/<user>/…` topics are theirs), and `session_key`, `harness` and `conversation_id` from `args`. Pass `tool`, the name of the tool being called (the MCP SDK doesn't give callbacks it): the connector beacon Wakeshift adds to a result works only in the result of the tool it was made for, so wake-ups connect only when you pass it.
+- `wake.callOf({ meta, clientName, tool?, user?, session?, userAgent?, harness?, conversation? })` does the same without an MCP framework.
 - `wake.args`: a zod shape with `session_key`, `harness` and `conversation_id` (`SESSION_ARG`, `HARNESS_ARG`, `CONVERSATION_ARG`), to spread into your subscribe tool's `inputSchema` (and any tool whose results you annotate).
 
 ### Topics
@@ -138,22 +140,11 @@ Topics are what events are built on; use them directly for publish URLs, `send` 
 | `closeTopic(topic)` | How many subscriptions ended. Each conversation gets what was already published to it, then a notice. |
 | `forgetUser(user)` | `false` if there was nothing to forget. Deletes everything Wakeshift keeps for the user: their conversations, subscriptions, events and deliveries, stream links (open streams close), recent publishes to their `u/<user>/…` topics and publish URLs for them, and their ID. Your app's log records that a user was forgotten, without their ID or anything derived from it. Their subscription IDs stay known as closed. |
 
-### Guest sign-in: `new GuestAuth({ wake, mcpUrl, … })`
-
-An OAuth server inside your app that signs MCP clients in as guests, with no user step ([Your users](https://wakeshift.ai/docs/users) has the walkthrough). Each registered client is one guest, with its own workspace and an agent named after its harness.
-
-- `await guests.handle(req, res)`: serves `/.well-known/oauth-protected-resource` (and `…/mcp`), `/.well-known/oauth-authorization-server`, `/oauth/register`, `/oauth/authorize` and `/oauth/token`; `false` for any other request. Works with `node:http` and Express (a body a parser already read is used as it is).
-- `guests.authenticate(req, res)`: the guest for the request's bearer token, and `req.auth` set for the MCP transport; or `null` after answering 401 with `WWW-Authenticate: Bearer resource_metadata="…"`.
-- `guestOf(extra)` in a tool callback: `{ user, workspace, agent, client, expires }`. Pass `user` and `client` to `wake.call`.
-- `guests.verify(token)`: the guest, or `null`.
-- Options: `base` (default `mcpUrl` without `/mcp`), `accessTtl` (seconds, default 3600), `refreshTtl` (default 30 days), `revoked(guest, issuedAt)`, `proxyHops`, `registerLimit` (default 20) and `tokenLimit` (default 60) per address per `rateWindow` (default 600 seconds), `grants` (also give each guest's agent a grant for the manifest's agent scope, as the Go SDK does), `onError`.
-- A refresh returns a new refresh token; the old one works until it expires (nothing is stored). `wake.forgetUser(guest.user)` refuses all the guest's refreshes from then on, and `revoked` refuses the ones you choose, such as those issued before a cutoff.
-
 ### Manifest and workspaces
 
 - `wake.publishManifest({ description?, agent?, events? })`: what your app may do; returns it as Wakeshift keeps it. `agent`: `{ wake, post, ttl_days, wake_limits?, start_prompt? }`, each scope event `{ pattern, description }`: what the agents in the workspaces your app keeps may be woken by and post.
-- Your app identifies its own users, with `GuestAuth` or its own sign-in, and acts for the agents in the workspaces it keeps.
-- `wake.workspace(user, name)`, `wake.addAgent(workspace, agent, displayName)`, `wake.checkAgent(workspace, agent)`: the workspace Wakeshift keeps for one of your users, an agent in it with a grant for your manifest's agent scope, and whether that grant is live. `GuestAuth` uses these; topics don't need them.
+- Your app identifies its own users with its own sign-in, and acts for the agents in the workspaces it keeps.
+- `wake.workspace(user, name)`, `wake.addAgent(workspace, agent, displayName)`, `wake.checkAgent(workspace, agent)`: the workspace Wakeshift keeps for one of your users, an agent in it with a grant for your manifest's agent scope, and whether that grant is live. Topics keep a user's conversations in that workspace; you don't need these for topics.
 - `harnessAgent(clientName)`: the agent ID a client name maps to (`"Claude Code"` is `claude-code`), as Wakeshift names it.
 
 ### Errors

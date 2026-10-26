@@ -110,8 +110,8 @@ test("a personal event is emitted to one subscriber", async () => {
   const { wake, reqs } = fakeCore({ "/events/emit": () => ({ json: { matched: 1 } }) });
   const turn = turnEvent(wake);
   await assert.rejects(turn.emit({ table: "juniper" }, { hole: ["As", "Kd"], toCall: 2 }), /personal: pass \{ to \}/);
-  await turn.emit({ table: "juniper" }, { hole: ["As", "Kd"], toCall: 2 }, { to: "guest:abc" });
-  assert.equal(reqs.at(-1)!.body.to, "guest:abc");
+  await turn.emit({ table: "juniper" }, { hole: ["As", "Kd"], toCall: 2 }, { to: "user-abc" });
+  assert.equal(reqs.at(-1)!.body.to, "user-abc");
   assert.deepEqual(reqs.at(-1)!.body.payload, { hole: ["As", "Kd"], toCall: 2 });
 });
 
@@ -172,6 +172,7 @@ test("attach: bridged clients get subscribe_events; every client gets unsubscrib
   assert.equal(call.call.user, "u1");
   assert.equal(call.call.client, "claude-code");
   assert.equal(call.call.harness, "claude-code");
+  assert.equal(call.call.tool, "subscribe_events", "a connector beacon in the result names the tool");
 
   // authorize refuses, bad arguments are explained, nothing reaches the core.
   const before = reqs.length;
@@ -194,11 +195,47 @@ test("attach: bridged clients get subscribe_events; every client gets unsubscrib
   await client.close();
 });
 
+// The other SDKs echo arguments as Wakeshift keeps them (keys in name
+// order), whatever order the event defines them in.
+test("attach: the tools echo arguments in name order", async () => {
+  const { wake } = fakeCore({
+    "/event-subscriptions": () => ({ json: { event_subscription: { id: "es1", created: false }, addition: {} } }),
+    "/event-subscriptions/unsubscribe": () => ({ json: { ended: true } }),
+  });
+  wake.defineEvent("ci.run", {
+    description: "A CI run finished.",
+    args: z.object({ repo: z.string(), pr: z.number().int(), branch: z.string().optional() }),
+    payload: z.object({ status: z.string(), branch: z.string() }),
+    text: (r) => r.status,
+  });
+  const server = new McpServer({ name: "ci", version: "1.0.0" });
+  wake.attach(server, { identify: () => ({ user: "u1" }) });
+  const client = await connect(server, "claude-code");
+  const args = { pr: 5, repo: "web", branch: "main" };
+  assert.equal(text(await client.callTool({ name: "subscribe_events", arguments: { event: "ci.run", arguments: args } })), 'Already subscribed to ci.run {"branch":"main","pr":5,"repo":"web"}: renewed.');
+  assert.equal(text(await client.callTool({ name: "unsubscribe_events", arguments: { event: "ci.run", arguments: args } })), 'Stopped ci.run {"branch":"main","pr":5,"repo":"web"}.');
+  await client.close();
+});
+
 test("attach: a personal event needs a known subscriber", async () => {
   const { wake } = fakeCore();
   turnEvent(wake);
   const server = new McpServer({ name: "poker", version: "1.0.0" });
   wake.attach(server, { identify: () => ({}) });
+  const client = await connect(server, "claude-code");
+  const r = (await client.callTool({ name: "subscribe_events", arguments: { event: "game.turn", arguments: { table: "juniper" } } })) as CallToolResult;
+  assert.equal(r.isError, true);
+  assert.match(text(r), /personal/);
+  const l = (await client.callTool({ name: "list_subscriptions", arguments: {} })) as CallToolResult;
+  assert.equal(l.isError, true);
+  await client.close();
+});
+
+test("attach: without identify, requests have no user", async () => {
+  const { wake } = fakeCore();
+  turnEvent(wake);
+  const server = new McpServer({ name: "poker", version: "1.0.0" });
+  wake.attach(server);
   const client = await connect(server, "claude-code");
   const r = (await client.callTool({ name: "subscribe_events", arguments: { event: "game.turn", arguments: { table: "juniper" } } })) as CallToolResult;
   assert.equal(r.isError, true);
@@ -281,6 +318,28 @@ test("attach: draft clients get the draft's codes", async () => {
   assert.deepEqual(cb.data, { reason: "challenge" });
   assert.equal((await err("events/unsubscribe", { name: "chat.message", arguments: { channel: "eng" }, delivery })).code, -32023);
   assert.equal((await err("events/poll", {})).code, -32026);
+  await client.close();
+});
+
+test("attach: a user at the subscription limit gets ResourceExhausted", async () => {
+  const message = "this user already has 20 live webhook subscriptions to this app";
+  const { wake } = fakeCore({
+    "/events/subscribe": () => ({ status: 403, json: { error: { code: "subscription_limit", message } } }),
+  });
+  chatEvent(wake);
+  const server = new McpServer({ name: "chat", version: "1.0.0" });
+  wake.attach(server, { identify: () => ({ user: "u1" }) });
+  const client = await connect(server, "some-draft-client");
+  const delivery = { mode: "webhook", url: "https://x.example/cb", secret: "whsec_x" };
+  try {
+    await client.request({ method: "events/subscribe", params: { name: "chat.message", arguments: { channel: "eng" }, delivery } } as any, z.any() as any);
+    assert.fail("no error");
+  } catch (e) {
+    const err = e as McpError;
+    assert.equal(err.code, -32025);
+    assert.match(err.message, /20 live webhook subscriptions/);
+    assert.deepEqual(err.data, { kind: "subscriptions" });
+  }
   await client.close();
 });
 
@@ -461,6 +520,18 @@ test("events/list, tools/list and the manifest match the Go SDK's for the same e
     text: (_t, a) => `Your move at ${a.table}`,
     personal: true,
   });
+  // Defined out of alphabetical order: arguments and required fields are
+  // listed in name order, as the other SDKs list them.
+  const run = wake.defineEvent("ci.run", {
+    description: "A CI run on a pull request finished.",
+    args: z.object({
+      repo: z.string().describe("The repository"),
+      pr: z.number().int().describe("The pull request"),
+      branch: z.string().optional().describe("Only runs on this branch"),
+    }),
+    payload: z.object({ status: z.string().describe("How it ended"), branch: z.string().describe("The branch it ran on") }),
+    text: (r) => `CI ${r.status}`,
+  });
   const server = new McpServer({ name: "sample", version: "1" });
   wake.attach(server, {});
   const client = await connect(server, "claude-code");
@@ -468,7 +539,7 @@ test("events/list, tools/list and the manifest match the Go SDK's for the same e
   const { tools } = await client.listTools();
   const got = {
     events: list.events,
-    manifest: [chat.manifest, turn.manifest],
+    manifest: [chat.manifest, turn.manifest, run.manifest],
     tools: tools
       .map((t) => ({ name: t.name, description: t.description, inputSchema: inputShape(t.inputSchema) }))
       .sort((a, b) => (a.name < b.name ? -1 : 1)),

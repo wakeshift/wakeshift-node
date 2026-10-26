@@ -14,7 +14,6 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-schema-compat.js";
 import { objectFromShape, safeParse, type AnySchema, type SchemaInput, type SchemaOutput, type ZodRawShapeCompat } from "@modelcontextprotocol/sdk/server/zod-compat.js";
 import { WakeshiftError } from "./errors.js";
-import { guestOf } from "./guest.js";
 import {
   EXTENSION_KEY,
   HEADER_MISMATCH,
@@ -105,7 +104,35 @@ const argNameRE = /^[a-z][a-z0-9_]{0,63}$/;
 function jsonSchemaOf(s: AnySchema): Record<string, any> {
   const out = toJsonSchemaCompat(s as any) as Record<string, any>;
   delete out.$schema;
+  normalize(out);
   return out;
+}
+
+// normalize puts a schema in the form all three SDKs give for the same
+// definition (test/events-list.json): required in name order, whatever
+// order the fields were defined in, and an integer without the bounds zod
+// adds for .int() (JavaScript's safe integers), which the other SDKs don't.
+function normalize(s: Record<string, any>): void {
+  if (Array.isArray(s.required)) s.required = [...s.required].sort();
+  if (s.type === "integer") {
+    if (s.minimum === Number.MIN_SAFE_INTEGER) delete s.minimum;
+    if (s.maximum === Number.MAX_SAFE_INTEGER) delete s.maximum;
+  }
+  if (s.properties && typeof s.properties === "object") {
+    for (const p of Object.values(s.properties)) if (p && typeof p === "object") normalize(p as Record<string, any>);
+  }
+  if (s.items && typeof s.items === "object" && !Array.isArray(s.items)) normalize(s.items);
+  for (const k of ["anyOf", "oneOf", "allOf"]) {
+    if (Array.isArray(s[k])) for (const b of s[k]) if (b && typeof b === "object") normalize(b);
+  }
+}
+
+// canonical is JSON with every object's keys in name order, as Wakeshift
+// keeps a subscription's arguments: how the tools' results echo them.
+function canonical(v: unknown): string {
+  const sortKeys = (x: any): any =>
+    Array.isArray(x) ? x.map(sortKeys) : x && typeof x === "object" ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, sortKeys(x[k])])) : x;
+  return JSON.stringify(sortKeys(v) ?? {});
 }
 
 function isSchema(v: unknown): v is AnySchema {
@@ -260,19 +287,20 @@ export class WakeEvent<A extends AnySchema = AnySchema, P extends AnySchema = An
    * clients subscribe themselves. Your tool decides who may: authorize isn't
    * consulted here. user is the app's ID for the person (required for a
    * personal event); wakeArgs are your tool's wake.args (session_key,
-   * harness, conversation_id).
+   * harness, conversation_id); tool is your tool's name (Wakeshift's hooks
+   * act on a connector beacon only from the result of the tool it names).
    */
   async subscribe(
     extra: ToolExtra,
     args: SchemaInput<A>,
-    opts: { server?: McpServer; client?: string; user?: string; wakeArgs?: Record<string, unknown> },
+    opts: { server?: McpServer; client?: string; user?: string; wakeArgs?: Record<string, unknown>; tool?: string },
   ): Promise<CallerSubscription> {
     const a = this.parseArgs(args);
     if (this.personal && !opts.user) {
       throw new WakeshiftError(400, "bad_arguments", `${this.name} is personal: pass user, who the subscription belongs to`);
     }
     const out = await this.wake.requestApp<{ event_subscription: { id: string; created: boolean }; session: string; addition?: Addition; agent?: Recognised }>("POST", "/event-subscriptions", {
-      call: this.wake.call(extra, { server: opts.server, client: opts.client, user: opts.user, args: opts.wakeArgs ?? {} }),
+      call: this.wake.call(extra, { server: opts.server, client: opts.client, user: opts.user, args: opts.wakeArgs ?? {}, tool: opts.tool }),
       name: this.name,
       arguments: a,
     });
@@ -294,11 +322,11 @@ export class WakeEvent<A extends AnySchema = AnySchema, P extends AnySchema = An
   async unsubscribe(
     extra: ToolExtra,
     args: SchemaInput<A>,
-    opts: { server?: McpServer; client?: string; user?: string; wakeArgs?: Record<string, unknown> },
+    opts: { server?: McpServer; client?: string; user?: string; wakeArgs?: Record<string, unknown>; tool?: string },
   ): Promise<boolean> {
     const a = this.parseArgs(args);
     const out = await this.wake.requestApp<{ ended: boolean }>("POST", "/event-subscriptions/unsubscribe", {
-      call: this.wake.call(extra, { server: opts.server, client: opts.client, user: opts.user, args: opts.wakeArgs ?? {} }),
+      call: this.wake.call(extra, { server: opts.server, client: opts.client, user: opts.user, args: opts.wakeArgs ?? {}, tool: opts.tool }),
       name: this.name,
       arguments: a,
     });
@@ -336,8 +364,9 @@ export interface Identity {
 
 export interface AttachOptions {
   /**
-   * Who is behind a request, from the server's authentication. Default:
-   * the guest GuestAuth signed in ({ user: guestOf(extra)?.user }).
+   * Who is behind a request. The app passes identify, returning { user }:
+   * its own ID for the person, from its own sign-in. Without it, requests
+   * have no user, so personal events and list_subscriptions refuse.
    */
   identify?: (extra: ToolExtra & { authInfo?: AuthInfo }) => Identity | undefined;
 }
@@ -417,8 +446,7 @@ const MAX_LISTED_EVENTS = 20;
 /** @internal The events part of Wakeshift.attach. */
 export function attachEvents(wake: Wakeshift, server: McpServer, events: WakeEvent[], opts: AttachOptions = {}): void {
   if (events.length === 0) throw new Error("wakeshift: attach needs at least one event (wake.defineEvent) defined first");
-  const identify = opts.identify ?? ((extra): Identity => ({ user: guestOf(extra)?.user }));
-  const userOf = (extra: ToolExtra & { authInfo?: AuthInfo }): string | undefined => identify(extra)?.user;
+  const userOf = (extra: ToolExtra & { authInfo?: AuthInfo }): string | undefined => opts.identify?.(extra)?.user;
   const byName = new Map(events.map((e) => [e.name, e]));
   const low = server.server;
   try {
@@ -502,7 +530,7 @@ export function attachEvents(wake: Wakeshift, server: McpServer, events: WakeEve
   const listed = events
     .slice(0, MAX_LISTED_EVENTS)
     .map((e) => {
-      const props = Object.keys((e.manifest.arguments.properties as object) ?? {});
+      const props = Object.keys((e.manifest.arguments.properties as object) ?? {}).sort();
       return fill("event_line", { name: e.name, arguments: props.join(", "), description: e.description });
     })
     .join("\n");
@@ -533,11 +561,11 @@ export function attachEvents(wake: Wakeshift, server: McpServer, events: WakeEve
       }
       try {
         const out = await wake.requestApp<{ event_subscription: { id: string; created: boolean }; addition: Addition; agent?: unknown }>("POST", "/event-subscriptions", {
-          call: wake.call(extra, { server, user, args: rest }),
+          call: wake.call(extra, { server, user, args: rest, tool: "subscribe_events" }),
           name: ev.name,
           arguments: args,
         });
-        const what = { event: ev.name, arguments: JSON.stringify(args) };
+        const what = { event: ev.name, arguments: canonical(args) };
         const lead = fill(out.event_subscription.created ? "subscribed" : "renewed", what);
         return result(lead, out.addition);
       } catch (err) {
@@ -569,11 +597,11 @@ export function attachEvents(wake: Wakeshift, server: McpServer, events: WakeEve
         if (!ev) return fail(fill("need"));
         const args = ev.parseArgs(raw ?? {});
         const out = await wake.requestApp<{ ended: boolean }>("POST", "/event-subscriptions/unsubscribe", {
-          call: wake.call(extra, { server, user, args: rest }),
+          call: wake.call(extra, { server, user, args: rest, tool: "unsubscribe_events" }),
           name: ev.name,
           arguments: args,
         });
-        return result(fill(out.ended ? "unsubscribed" : "not_subscribed", { event: ev.name, arguments: JSON.stringify(args) }));
+        return result(fill(out.ended ? "unsubscribed" : "not_subscribed", { event: ev.name, arguments: canonical(args) }));
       } catch (err) {
         return fail(err instanceof ArgsError ? err.message : fill("unsubscribe_failed", { detail: detailOf(err) }));
       }
@@ -622,6 +650,8 @@ function rpcErrorOf(err: unknown, codes: Codes): McpError {
       return new McpError(codes.notFound, err.detail, { kind: "event" });
     case "unsupported":
       return new McpError(codes.unsupported, err.detail, { feature: "deliveryMode" });
+    case "subscription_limit":
+      return new McpError(codes.resourceExhausted, err.detail, { kind: "subscriptions" });
     case "bad_request":
     case "bad_arguments":
       return new McpError(INVALID_PARAMS, err.detail);

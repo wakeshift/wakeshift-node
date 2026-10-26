@@ -12,6 +12,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { z } from "zod";
 import { CONVERSATION_ARG, HARNESS_ARG, SESSION_ARG, UNKNOWN_CLIENT_WARNING, Wakeshift, WakeshiftError, isCode, parseKey, signAssertion } from "../src/index.js";
 import { publicKeyOf } from "../src/key.js";
+import * as sdk from "../src/index.js";
 
 // RFC 8032, test 1: this seed's public key.
 const seedHex = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
@@ -284,6 +285,10 @@ test("wake.call packs extra: _meta, the client's name, the user, and the argumen
   assert.deepEqual(wake.call(undefined, { client: "cursor-nightly", session: "wsc_x", harness: "cursor" }), { client: "cursor-nightly", session: "wsc_x", harness: "cursor" });
   assert.deepEqual(wake.call({}, { client: "x", args: { session_key: 7, harness: "", conversation_id: "  " } }), { client: "x" }, "only strings, and not empty ones");
   assert.throws(() => wake.call(extra), /pass \{ server \}/);
+  // The tool being called: a connector beacon in its result names it.
+  assert.deepEqual(wake.call({}, { client: "x", tool: "watch" }), { client: "x", tool: "watch" });
+  assert.deepEqual(wake.callOf({ clientName: "x", tool: " watch " }), { client: "x", tool: "watch" });
+  assert.deepEqual(wake.callOf({ clientName: "x", tool: "" }), { client: "x" });
 });
 
 test("wake.args: session_key, harness and conversation_id, optional strings the agent is told how to fill", () => {
@@ -444,4 +449,11 @@ test("an ignored claim shows: claimed differs from harness", async () => {
   const sub = await wake.subscribe(wake.callOf({ clientName: "Cursor", harness: "claude-code" }), "ci/x");
   assert.deepEqual(sub.agent, { harness: "cursor", via: "client", claimed: "claude-code" });
   assert.equal(core.sent[0].body.call.harness, "claude-code");
+});
+
+test("the package has no guest sign-in: apps sign their own users in", () => {
+  const exported = sdk as Record<string, unknown>;
+  assert.equal(exported.GuestAuth, undefined);
+  assert.equal(exported.guestOf, undefined);
+  assert.equal(typeof sdk.harnessAgent, "function");
 });

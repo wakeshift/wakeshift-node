@@ -27,7 +27,6 @@ export {
   type AgentScope,
   type ScopeEvent,
 } from "./wakeshift.js";
-export { GuestAuth, guestOf, type Guest, type GuestAuthOptions, type GuestAuthInfo } from "./guest.js";
 export { harnessAgent } from "./harness.js";
 export { WakeshiftError, isCode } from "./errors.js";
 export { parseKey, signAssertion, type AppKey } from "./key.js";
