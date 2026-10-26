@@ -1,6 +1,6 @@
 // harnessAgent names the agent a guest's MCP client signs in as: its
 // harness's ID ("copilot-cli" → copilot, "Claude Code" → claude-code), as
-// topics and Sign in with Wakeshift name it, else its name as an ID. A port
+// topics name it, else its name as an ID. A port
 // of the core's harnesses.AgentID: test/agent-ids.json is the Go
 // function's output, and both sides' tests check it.
 

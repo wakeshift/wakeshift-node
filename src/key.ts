@@ -1,7 +1,7 @@
 import { createHash, createPrivateKey, createPublicKey, randomBytes, sign, type KeyObject } from "node:crypto";
 
-// An app key from the Wakeshift console is the app's Ed25519 private key
-// (docs/api-keys.md). Current keys are
+// An app key from the Wakeshift console is the app's Ed25519 private key.
+// Current keys are
 //
 //   wst_<50 base58 characters>
 //

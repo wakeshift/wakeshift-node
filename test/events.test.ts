@@ -140,7 +140,7 @@ function text(r: unknown): string {
   return ((r as CallToolResult).content[0] as { text: string }).text;
 }
 
-test("serveEvents: bridged clients get subscribe_events; every client gets unsubscribe and list", async () => {
+test("attach: bridged clients get subscribe_events; every client gets unsubscribe and list", async () => {
   const { wake, reqs } = fakeCore({
     "/event-subscriptions": () => ({ json: { event_subscription: { id: "es1", created: true }, addition: { text: "Start the Monitor tool now." } } }),
     "/event-subscriptions/list": () => ({
@@ -152,7 +152,7 @@ test("serveEvents: bridged clients get subscribe_events; every client gets unsub
   chatEvent(wake);
   turnEvent(wake);
   const server = new McpServer({ name: "chat", version: "1.0.0" });
-  wake.serveEvents(server, { user: () => "u1" });
+  wake.attach(server, { identify: () => ({ user: "u1" }) });
   const client = await connect(server, "claude-code");
   const { tools } = await client.listTools();
   const byName = new Map(tools.map((t) => [t.name, t]));
@@ -194,11 +194,11 @@ test("serveEvents: bridged clients get subscribe_events; every client gets unsub
   await client.close();
 });
 
-test("serveEvents: a personal event needs a known subscriber", async () => {
+test("attach: a personal event needs a known subscriber", async () => {
   const { wake } = fakeCore();
   turnEvent(wake);
   const server = new McpServer({ name: "poker", version: "1.0.0" });
-  wake.serveEvents(server, { user: () => undefined });
+  wake.attach(server, { identify: () => ({}) });
   const client = await connect(server, "claude-code");
   const r = (await client.callTool({ name: "subscribe_events", arguments: { event: "game.turn", arguments: { table: "juniper" } } })) as CallToolResult;
   assert.equal(r.isError, true);
@@ -208,14 +208,14 @@ test("serveEvents: a personal event needs a known subscriber", async () => {
   await client.close();
 });
 
-test("serveEvents: a client that speaks MCP Events subscribes natively, and isn't offered subscribe_events", async () => {
+test("attach: a client that speaks MCP Events subscribes natively, and isn't offered subscribe_events", async () => {
   const { wake, reqs } = fakeCore({
     "/events/subscribe": () => ({ json: { id: "sub_1", refresh_before: "2026-10-22T10:00:00.000Z", cursor: "c1", truncated: false, created: true } }),
     "/events/unsubscribe": () => ({ json: { ended: false } }),
   });
   chatEvent(wake);
   const server = new McpServer({ name: "chat", version: "1.0.0" });
-  wake.serveEvents(server, { user: () => "u1" });
+  wake.attach(server, { identify: () => ({ user: "u1" }) });
   const client = await connect(server, "openai-mcp");
   const caps = sent.get(client)!.find((m) => m.result?.capabilities)!.result.capabilities;
   assert.deepEqual(caps.events, { listChanged: false });
@@ -258,14 +258,14 @@ test("serveEvents: a client that speaks MCP Events subscribes natively, and isn'
   await client.close();
 });
 
-test("serveEvents: draft clients get the draft's codes", async () => {
+test("attach: draft clients get the draft's codes", async () => {
   const { wake } = fakeCore({
     "/events/subscribe": () => ({ status: 400, json: { error: { code: "callback_failed", message: "the callback didn't echo the challenge", reason: "challenge" } } }),
     "/events/unsubscribe": () => ({ json: { ended: false } }),
   });
   chatEvent(wake);
   const server = new McpServer({ name: "chat", version: "1.0.0" });
-  wake.serveEvents(server, { user: () => "u1" });
+  wake.attach(server, { identify: () => ({ user: "u1" }) });
   const client = await connect(server, "some-draft-client");
   const delivery = { mode: "webhook", url: "https://x.example/cb", secret: "whsec_x" };
   const err = async (method: string, params: any): Promise<McpError> => {
@@ -326,7 +326,7 @@ test("an authorize that throws refuses, on both paths, and the app hears why", a
     },
   });
   const server = new McpServer({ name: "chat", version: "1.0.0" });
-  wake.serveEvents(server, { user: () => "u1" });
+  wake.attach(server, { identify: () => ({ user: "u1" }) });
   const bridged = await connect(server, "claude-code");
   const r = (await bridged.callTool({ name: "subscribe_events", arguments: { event: "chat.message", arguments: { channel: "eng" } } })) as CallToolResult;
   assert.equal(r.isError, true);
@@ -352,16 +352,16 @@ test("an authorize that throws refuses, on both paths, and the app hears why", a
   assert.equal(reqs.filter((u) => u.includes("subscribe")).length, 0, "nothing reached the core");
 });
 
-test("serveEvents needs events, and must come before connecting", async () => {
+test("attach needs events, and must come before connecting", async () => {
   const { wake } = fakeCore();
   const server = new McpServer({ name: "x", version: "1.0.0" });
-  assert.throws(() => wake.serveEvents(server), /at least one event/);
+  assert.throws(() => wake.attach(server), /at least one event/);
   chatEvent(wake);
   const late = new McpServer({ name: "y", version: "1.0.0" });
   late.registerTool("ping", { inputSchema: {} }, async () => ({ content: [] }));
   const [a] = InMemoryTransport.createLinkedPair();
   await late.connect(a);
-  assert.throws(() => wake.serveEvents(late), /before connecting/);
+  assert.throws(() => wake.attach(late), /before connecting/);
 });
 
 test("an event's subscribe and end: a tool subscribes its own caller, and ends a subscription by ID", async () => {
@@ -462,7 +462,7 @@ test("events/list, tools/list and the manifest match the Go SDK's for the same e
     personal: true,
   });
   const server = new McpServer({ name: "sample", version: "1" });
-  wake.serveEvents(server, {});
+  wake.attach(server, {});
   const client = await connect(server, "claude-code");
   const list = (await client.request({ method: "events/list", params: {} } as any, z.any() as any)) as any;
   const { tools } = await client.listTools();

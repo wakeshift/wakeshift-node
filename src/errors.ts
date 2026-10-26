@@ -1,7 +1,7 @@
 /**
  * An error response from Wakeshift: `code` is the API's error code (e.g.
- * "private_topic", "other_client", "unknown_subscription", "bad_request",
- * "not_headless"), `status` the HTTP status. A request that got no answer
+ * "private_topic", "other_client", "unknown_subscription", "bad_request"),
+ * `status` the HTTP status. A request that got no answer
  * has code "unreachable" and status 0.
  */
 export class WakeshiftError extends Error {

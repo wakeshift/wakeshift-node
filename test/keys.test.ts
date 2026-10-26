@@ -1,4 +1,4 @@
-// App keys, both formats (docs/api-keys.md), against the shared golden
+// App keys, both formats, against the shared golden
 // file Go writes (internal/appkey), and what a key that doesn't name its
 // app changes for the client: the default core, appId and app(), and Sign
 // in with Wakeshift.
@@ -7,8 +7,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ServerResponse } from "node:http";
-import { Wakeshift, WakeshiftSignIn, parseKey, signAssertion } from "../src/index.js";
+import { Wakeshift, parseKey, signAssertion } from "../src/index.js";
 import { publicKeyOf } from "../src/key.js";
 
 // build-test/test/keys.test.js reads test/app-keys.json in the source tree.
@@ -159,34 +158,4 @@ test("an older key: appId from the key, and app() adds the name", async () => {
   assert.equal(wake.appId, "ci-bot");
   assert.equal(wake.mode, "test");
   assert.deepEqual(await wake.app(), { id: "ci-bot", name: "CI" });
-});
-
-test("Sign in with Wakeshift with a current key asks which app it is, then signs in as app:<id>", async () => {
-  const core = fakeCore(() => [200, appReply]);
-  const wake = new Wakeshift({ key: NEW, core: "http://core.test", fetch: core.fetchFn });
-  const login = new WakeshiftSignIn({ wake, redirectUri: "https://app.example/callback" });
-  const headers: Record<string, string> = {};
-  const res = {
-    setHeader: (k: string, v: string) => (headers[k.toLowerCase()] = v),
-    writeHead: (_s: number, h: Record<string, string>) => Object.entries(h).forEach(([k, v]) => (headers[k.toLowerCase()] = v)),
-    end: () => {},
-  } as unknown as ServerResponse;
-  await login.start(res);
-  assert.equal(core.sent[0].url, "http://core.test/api/apps/v1/app");
-  assert.equal(new URL(headers.location).searchParams.get("client_id"), "app:ci-bot");
-
-  // The token calls, on a fresh client: they ask too.
-  const core2 = fakeCore(() => [200, appReply]);
-  const wake2 = new Wakeshift({ key: NEW, core: "http://core.test", fetch: core2.fetchFn });
-  const s = await wake2.signIn({ code: "c", verifier: "v", redirectUri: "https://app.example/callback" });
-  assert.equal(s.user, "u-1");
-  assert.deepEqual(
-    core2.sent.map((r) => new URL(r.url).pathname),
-    ["/api/apps/v1/app", "/oauth/token"],
-  );
-  const form = new URLSearchParams(core2.sent[1].body);
-  assert.equal(form.get("client_id"), "app:ci-bot");
-  const a = parts(form.get("client_assertion")!);
-  assert.equal(a.header.kid, NEW_KID);
-  assert.equal(a.claims.iss, "ci-bot");
 });

@@ -30,7 +30,7 @@ declare global {
   const user: { id: string };
   function canSeeRepo(extra: unknown, repo: string): Promise<boolean>;
   function canRead(user: string | undefined, channel: string): boolean;
-  // Events defined elsewhere in the app (site/docs/events.md, quickstart.md).
+  // Events defined elsewhere in the app (as in the docs' events and quickstart pages).
   const ciFinished: SDK.WakeEvent<any, any>;
   const turn: SDK.WakeEvent<any, any>;
   const message: SDK.WakeEvent<any, any>;

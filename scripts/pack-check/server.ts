@@ -61,7 +61,7 @@ void ev.requestApp;
 // @ts-expect-error emitEvent is internal
 void ev.emitEvent;
 const evServer = new McpServer({ name: "ci-bot-events", version: "1.0.0" });
-ev.serveEvents(evServer, { user: () => "u1" });
+ev.attach(evServer, { identify: () => ({ user: "u1" }) });
 
 const [a, b] = InMemoryTransport.createLinkedPair();
 const client = new Client({ name: "Cursor", version: "1.0.0" });

@@ -1,6 +1,5 @@
-// End to end against a real core: run with scripts/e2e.sh (make sdk-e2e),
-// which starts one (TestSDKHarness in internal/coretest) with a self-serve
-// app and points WAKESHIFT_SDK_HARNESS at its URL and test key. Skipped
+// End to end against a real core: run with scripts/e2e.sh in Wakeshift's
+// own repository, which starts one with a self-serve app and points WAKESHIFT_SDK_HARNESS at its URL and test key. Skipped
 // without it.
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -16,7 +15,7 @@ import type { AddressInfo } from "node:net";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { GuestAuth, UNKNOWN_CLIENT_WARNING, Wakeshift, guestOf, isCode, type Subscription } from "../src/index.js";
+import { GuestAuth, UNKNOWN_CLIENT_WARNING, Wakeshift, guestOf, isCode, type AgentScope, type Manifest, type Subscription } from "../src/index.js";
 
 const harness = process.env.WAKESHIFT_SDK_HARNESS;
 
@@ -411,8 +410,9 @@ test("guest sign-in against a real core", { skip: !harness && "set WAKESHIFT_SDK
 
   // With an agent scope in the manifest, grants: a grant per guest, checked at each refresh.
   const scope = [{ pattern: "app.ci-bot.ci.*", description: "CI runs it watches" }];
-  // A test app can't list redirect_uris (Sign in with Wakeshift needs a live key).
-  await assert.rejects(wake.publishManifest({ agent: { wake: scope, post: scope, ttl_days: 30, redirect_uris: [base + "/cb"] } }), (e: any) => isCode(e, "bad_manifest"));
+  // Wakeshift refuses a manifest that asks for Wakeshift accounts or redirect_uris: apps sign their own users in.
+  await assert.rejects(wake.publishManifest({ accounts: "wakeshift" } as Manifest), (e: any) => isCode(e, "bad_manifest"));
+  await assert.rejects(wake.publishManifest({ agent: { wake: scope, post: scope, ttl_days: 30, redirect_uris: [base + "/cb"] } as AgentScope }), (e: any) => isCode(e, "bad_manifest"));
   const m = await wake.publishManifest({ agent: { wake: scope, post: scope, ttl_days: 30 } });
   assert.equal(m.agent?.ttl_days, 30);
   guest = new GuestAuth({ wake, mcpUrl: base + "/mcp", grants: true });
@@ -427,11 +427,6 @@ test("guest sign-in against a real core", { skip: !harness && "set WAKESHIFT_SDK
   assert.equal(g2.agent, "codex");
   await wake.checkAgent(g2.workspace, g2.agent); // the grant is live
   assert.equal((await tok({ grant_type: "refresh_token", refresh_token: first.out.refresh_token, client_id: reg2.client_id, client_secret: reg2.client_secret })).status, 200);
-
-  // Sign in with Wakeshift: the code exchange reaches the core's token
-  // endpoint as the app (a test app can't sign Wakeshift users in, so only
-  // the refusal of a code that isn't one is checked here).
-  await assert.rejects(wake.signIn({ code: "wsc_not-a-code", verifier, redirectUri: base + "/auth/wakeshift/callback" }), (e: any) => isCode(e, "invalid_grant"));
 });
 
 // receiver is a callback that speaks MCP Events webhooks as a client would:
@@ -486,7 +481,7 @@ test("events against a real core: defined, served, emitted, bridged and native",
   const clients: Client[] = [];
   const connect = async (clientName: string, user: string) => {
     const server = new McpServer({ name: "ci-bot", version: "1.0" });
-    wake.serveEvents(server, { user: () => user });
+    wake.attach(server, { identify: () => ({ user }) });
     const [a, b] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: clientName, version: "1.0" });
     await Promise.all([server.connect(a), client.connect(b)]);

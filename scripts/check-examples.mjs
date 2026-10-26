@@ -5,9 +5,10 @@
 // imports at the top, the rest in an async function, so fragments (a
 // `return` from a tool callback, an `await`) compile; examples/env.d.ts
 // declares what fragments take from around them (extra, repo, body…).
-// It also checks three mistakes tsc can't see: a test key needs `core`,
-// wake.call needs `server` (or `client`), and topics passed to the SDK are
-// lowercase (a topic in a variable isn't checked).
+// It also checks two mistakes tsc can't see: wake.call needs `server` (or
+// `client`), and topics passed to the SDK are lowercase (a topic in a
+// variable isn't checked). `core` isn't required: the SDK reads
+// WAKESHIFT_CORE itself, which is what an example would pass.
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, copyFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
@@ -67,9 +68,6 @@ if (!readmeOnly) {
 // What tsc can't see.
 const problems = [];
 for (const e of examples) {
-  for (const m of e.code.matchAll(/new Wakeshift\(\{([^}]*)\}\)/g)) {
-    if (!/\bcore\b/.test(m[1])) problems.push(`${e.from}: new Wakeshift without core (a test key needs it)`);
-  }
   // wake.call throws without the client's name.
   for (const m of e.code.matchAll(/\bwake\.call\(\s*\w+\s*(?:,\s*\{([^}]*)\})?\s*\)/g)) {
     if (!/\b(server|client)\b/.test(m[1] ?? "")) problems.push(`${e.from}: wake.call without server or client (it throws)`);
