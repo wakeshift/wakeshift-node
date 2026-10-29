@@ -28,19 +28,19 @@ function scripted(answers: (() => Response)[]) {
   return { bodies, fetchFn };
 }
 
-test("a publish the load balancer refused is sent again, body and all, and gets through", async () => {
-  const s = scripted([gfe500, () => json(200, { matched: 1 })]);
+test("a POST the load balancer refused is sent again, body and all, and gets through", async () => {
+  const s = scripted([gfe500, () => json(200, { forgotten: true })]);
   const wake = new Wakeshift({ key: KEY, core: "http://core.test", fetch: retryRefused(s.fetchFn, [1, 1]) });
   // The SDK wraps whatever fetch it's given: the wrapper above only makes the pauses short.
-  const r = await wake.publish("ci/x", { text: "hi" });
-  assert.equal(r.matched, 1);
+  const r = await wake.forgetUser("ada");
+  assert.equal(r, true);
   assert.ok(s.bodies.length >= 2);
   assert.equal(s.bodies[0], s.bodies[1]);
 });
 
 test("Wakeshift's own errors aren't retried; a refusal that keeps coming is the error", async () => {
   const own = scripted([() => json(500, { error: { code: "internal", message: "x" } })]);
-  await assert.rejects(new Wakeshift({ key: KEY, core: "http://core.test", fetch: own.fetchFn }).publish("ci/x", { text: "x" }), (e: unknown) => e instanceof WakeshiftError && e.status === 500);
+  await assert.rejects(new Wakeshift({ key: KEY, core: "http://core.test", fetch: own.fetchFn }).forgetUser("ada"), (e: unknown) => e instanceof WakeshiftError && e.status === 500);
   assert.equal(own.bodies.length, 1);
 
   const always = scripted([gfe500]);

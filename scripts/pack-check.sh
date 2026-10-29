@@ -26,6 +26,6 @@ for mcp in "$mcp_floor" latest; do
   fi
   npx tsc --strict --noEmit --module nodenext --moduleResolution nodenext --target es2023 --types node --skipLibCheck server.ts
   node --experimental-strip-types --no-warnings server.ts
-  echo "zod $zod ($(node -p 'require("zod/package.json").version')), MCP SDK $(node -p 'require("@modelcontextprotocol/sdk/package.json").version'): ok"
+  echo "zod $zod ($(node -p 'require("zod/package.json").version')), MCP SDK $(node -p 'JSON.parse(require("fs").readFileSync("node_modules/@modelcontextprotocol/sdk/package.json", "utf8")).version'): ok"
 done
 done

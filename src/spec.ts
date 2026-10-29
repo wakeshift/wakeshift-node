@@ -5,9 +5,9 @@
 /** The draft these follow. */
 export const REVISION = "SEP-3415 (2026-10-16)";
 
-/** Capability keys: the draft's extension, and the top-level key ChatGPT reads. A server advertises both. */
+/** Capability keys: the draft's extension, and the top-level key ChatGPT reads. A server advertises both; only the extension is exported. */
 export const EXTENSION_KEY = "io.modelcontextprotocol/events";
-export const LEGACY_KEY = "events";
+export const TOP_LEVEL_KEY = "events";
 
 /** On every events/* result. */
 export const RESULT_TYPE = "complete";

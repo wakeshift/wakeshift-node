@@ -1,6 +1,6 @@
 /**
  * An error response from Wakeshift: `code` is the API's error code (e.g.
- * "private_topic", "other_client", "unknown_subscription", "bad_request"),
+ * "unknown_event", "other_client", "bad_arguments", "bad_request"),
  * `status` the HTTP status. A request that got no answer
  * has code "unreachable" and status 0.
  */

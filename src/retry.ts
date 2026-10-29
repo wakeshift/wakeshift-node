@@ -34,7 +34,7 @@ export async function refused(method: string, resp: Response): Promise<boolean> 
   if (resp.status === 500) {
     if (type !== "text/html") return false;
     const text = await resp.clone().text().catch(() => "");
-    return text.includes("Server Error");
+    return text.slice(0, 4096).includes("Server Error"); // within the first 4 KB, as the Go SDK reads it
   }
   if (resp.status === 502 || resp.status === 503 || resp.status === 504) {
     return (method === "GET" || method === "HEAD") && type !== "application/json";

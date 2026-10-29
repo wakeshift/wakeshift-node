@@ -18,11 +18,6 @@ import { createHash, createPrivateKey, createPublicKey, randomBytes, sign, type 
 // public half.
 
 export interface AppKey {
-  /**
-   * An older key's mode; null for a current key.
-   * @deprecated Modes mean nothing now, and current keys have none.
-   */
-  mode: "test" | "live" | null;
   /** The app's ID, for an older key that names it; null for a current key (ask Wakeshift: `wake.app()`). */
   appId: string | null;
   privateKey: KeyObject;
@@ -79,10 +74,15 @@ export function parseKey(key: string): AppKey {
   const b = Buffer.from(n.toString(16).padStart(72, "0"), "hex");
   const seed = Buffer.from(b.subarray(0, 32));
   if (crc32(seed) !== b.readUInt32BE(32)) throw new Error(errMistyped);
-  return fromSeed(null, null, seed);
+  return fromSeed(null, seed);
 }
 
-// An older key: wst_<mode>_<app id>_<seed>. App IDs have no "_"; the seed
+/** @internal Whether key is an older test key (wst_test_…), from a staging or local console: it has no default core. */
+export function isTestKey(key: string): boolean {
+  return String(key ?? "").trim().startsWith("wst_test_");
+}
+
+// An older key: wst_<test|live>_<app id>_<seed>. App IDs have no "_"; the seed
 // (base64url) may.
 function parseOld(mode: string, after: string): AppKey {
   if (mode !== "test" && mode !== "live") throw new Error(errFormat);
@@ -92,12 +92,12 @@ function parseOld(mode: string, after: string): AppKey {
   const seed = after.slice(j + 1);
   const raw = seedRE.test(seed) ? Buffer.from(seed, "base64url") : Buffer.alloc(0);
   if (raw.length !== 32) throw new Error(errMistyped);
-  return fromSeed(mode, appId, raw);
+  return fromSeed(appId, raw);
 }
 
-function fromSeed(mode: AppKey["mode"], appId: string | null, seed: Buffer): AppKey {
+function fromSeed(appId: string | null, seed: Buffer): AppKey {
   const privateKey = createPrivateKey({ key: Buffer.concat([pkcs8Prefix, seed]), format: "der", type: "pkcs8" });
-  return { mode, appId, privateKey, seed, kid: keyIdOf(rawPublicKey(privateKey)) };
+  return { appId, privateKey, seed, kid: keyIdOf(rawPublicKey(privateKey)) };
 }
 
 function rawPublicKey(k: KeyObject): Buffer {

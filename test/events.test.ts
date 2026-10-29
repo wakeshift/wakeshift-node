@@ -7,6 +7,7 @@ import { McpError, type CallToolResult } from "@modelcontextprotocol/sdk/types.j
 import { z } from "zod";
 import { readFileSync } from "node:fs";
 import {
+  BUILTIN_TOOLS,
   EVENT_TOOL_TEXT,
   EXTENSION_KEY,
   LIST_TOOL_DESCRIPTION,
@@ -14,8 +15,9 @@ import {
   UNSUBSCRIBE_TOOL_DESCRIPTION,
   Wakeshift,
   WakeshiftError,
-  speaksEvents,
+  type BuiltinTool,
 } from "../src/index.js";
+import { speaksEvents } from "../src/events.js";
 
 const seed = Buffer.alloc(32, 9).toString("base64url");
 const KEY = `wst_test_chat_${seed}`;
@@ -75,6 +77,36 @@ test("defineEvent makes the manifest's event type: a topic per required argument
   assert.deepEqual(turn.definition().delivery, ["webhook"]);
 });
 
+test("a filter given without a topic gets the default's added, and the caller's object stays as it was", () => {
+  const { wake } = fakeCore();
+  const filter = { room: "{channel}" };
+  const ev = wake.defineEvent("chat.room", {
+    description: "A message in a room",
+    args: z.object({ channel: z.string(), from: z.string().optional() }),
+    payload: z.object({ from: z.string(), room: z.string() }),
+    text: (m) => m.from,
+    filter,
+  });
+  assert.deepEqual(ev.manifest.filter, { room: "{channel}", from: "{from}" });
+  assert.deepEqual(filter, { room: "{channel}" });
+});
+
+test("a filter on the field an optional argument already filters is refused, naming the field, whatever its value", () => {
+  const { wake } = fakeCore();
+  const opts = {
+    description: "A message in a room",
+    args: z.object({ channel: z.string(), from: z.string().optional() }),
+    payload: z.object({ from: z.string(), room: z.string() }),
+    text: (m: { from: string }) => m.from,
+  };
+  for (const tmpl of ["{channel}", "{from}"]) {
+    assert.throws(() => wake.defineEvent("chat.room", { ...opts, filter: { from: tmpl } }), /filter on from conflicts with optional argument from/);
+  }
+  // With a topic there's no default filter, so the same filter is the app's own.
+  const own = wake.defineEvent("chat.room", { ...opts, topic: "rooms/{channel}", filter: { from: "{from}" } });
+  assert.deepEqual(own.manifest.filter, { from: "{from}" });
+});
+
 test("defineEvent refuses what Wakeshift would", () => {
   const { wake } = fakeCore();
   const p = z.object({ x: z.string() });
@@ -91,19 +123,19 @@ test("defineEvent refuses what Wakeshift would", () => {
 test("emit checks the payload, publishes the manifest first, and sends the rendered line", async () => {
   const { wake, reqs } = fakeCore({ "/events/emit": () => ({ json: { matched: 2, duplicate: false } }) });
   const chat = chatEvent(wake);
-  await assert.rejects(chat.emit({ channel: "eng" }, { from: "ada" } as any), (e: unknown) => e instanceof WakeshiftError && e.code === "bad_payload");
+  await assert.rejects(chat.emit({ channel: "eng" }, { from: "ada" } as any), (e: unknown) => e instanceof WakeshiftError && e.code === "bad_arguments" && e.detail.startsWith("payload for"));
   await assert.rejects(chat.emit({ channel: "eng" }, { from: "ada", text: "hi" }, { to: "u1" }), /isn't personal/);
   const out = await chat.emit({ channel: "eng" }, { from: "ada", text: "shipped" }, { id: "m1" });
-  assert.deepEqual(out, { matched: 2, duplicate: false });
+  assert.deepEqual(out, { matched: 2, duplicate: false, unmatched: [], ended: [] });
   assert.deepEqual(
     reqs.map((r) => `${r.method} ${r.path}`),
-    ["PUT /manifest", "POST /events/emit"],
+    ["GET /manifest", "PUT /manifest", "POST /events/emit"],
   );
-  assert.equal(reqs[0].body.events[0].name, "chat.message");
-  assert.deepEqual(reqs[1].body, { name: "chat.message", arguments: { channel: "eng" }, payload: { from: "ada", text: "shipped" }, text: "ada: shipped", id: "m1" });
-  // Published once: the next emit goes straight out.
+  assert.equal(reqs[1].body.events[0].name, "chat.message");
+  assert.deepEqual(reqs[2].body, { name: "chat.message", arguments: { channel: "eng" }, payload: { from: "ada", text: "shipped" }, text: "ada: shipped", id: "m1" });
+  // Sent once: the next emit goes straight out.
   await chat.emit({ channel: "eng" }, { from: "bob", text: "ok" });
-  assert.equal(reqs.filter((r) => r.path === "/manifest").length, 1);
+  assert.equal(reqs.filter((r) => r.path === "/manifest").length, 2);
 });
 
 test("a personal event is emitted to one subscriber", async () => {
@@ -115,9 +147,72 @@ test("a personal event is emitted to one subscriber", async () => {
   assert.deepEqual(reqs.at(-1)!.body.payload, { hole: ["As", "Kd"], toCall: 2 });
 });
 
-test("speaksEvents: the extension, the older key, or ChatGPT", () => {
+test("a personal event is emitted to many: a plain user alone stays a string, anything else a list", async () => {
+  const { wake, reqs } = fakeCore({
+    "/events/emit": () => ({
+      json: { matched: 1, duplicate: false, unmatched: ["u2", { native: "u3" }], ended: [{ user: "u1", subscription: "es_1" }] },
+    }),
+  });
+  const turn = turnEvent(wake);
+  const p = { hole: ["As", "Kd"], toCall: 2 };
+  await turn.emit({ table: "juniper" }, p, { to: ["user-abc"] });
+  assert.equal(reqs.at(-1)!.body.to, "user-abc");
+  await turn.emit({ table: "juniper" }, p, { to: { native: "u3" } });
+  assert.deepEqual(reqs.at(-1)!.body.to, [{ native: "u3" }]);
+  const out = await turn.emit({ table: "juniper" }, p, { to: [{ user: "u1", subscription: "es_1" }, "u2", { native: "u3" }], id: "h1" });
+  assert.deepEqual(reqs.at(-1)!.body.to, [{ user: "u1", subscription: "es_1" }, "u2", { native: "u3" }]);
+  assert.equal(reqs.at(-1)!.body.id, "h1");
+  assert.deepEqual(out, { matched: 1, duplicate: false, unmatched: ["u2", { native: "u3" }], ended: [{ user: "u1", subscription: "es_1" }] });
+  const sent = reqs.length;
+  await assert.rejects(turn.emit({ table: "juniper" }, p, { to: [] }), /personal: pass \{ to \}/);
+  await assert.rejects(turn.emit({ table: "juniper" }, p, { to: ["u1", " "] }), /user is empty/);
+  await assert.rejects(turn.emit({ table: "juniper" }, p, { to: [{ native: "" }] }), /user is empty/);
+  await assert.rejects(turn.emit({ table: "juniper" }, p, { to: [{ user: "u1", subscription: "" }] }), /subscription is empty/);
+  await assert.rejects(turn.emit({ table: "juniper" }, p, { to: [{ user: "u1" } as any] }), /a recipient is a user/);
+  const chat = chatEvent(wake);
+  await assert.rejects(chat.emit({ channel: "eng" }, { from: "ada", text: "hi" }, { to: [{ native: "u1" }] }), /isn't personal/);
+  assert.equal(reqs.length, sent, "nothing refused is sent");
+});
+
+test("publishUrl takes exactly one plain user", async () => {
+  const { wake, reqs } = fakeCore({ "/events/publish-urls": () => ({ json: { id: "u1", event: "game.turn", url: "http://core.test/x" } }) });
+  const turn = turnEvent(wake);
+  await turn.publishUrl({ table: "juniper" }, { to: "user-abc" });
+  assert.equal(reqs.at(-1)!.body.to, "user-abc");
+  const sent = reqs.length;
+  await assert.rejects(turn.publishUrl({ table: "juniper" }, { to: ["a", "b"] as any }), /exactly one user/);
+  await assert.rejects(turn.publishUrl({ table: "juniper" }, { to: { native: "a" } as any }), /exactly one user/);
+  assert.equal(reqs.length, sent);
+});
+
+test("status counts by arguments; statusOf reads subscriptions by ID", async () => {
+  const { wake, reqs } = fakeCore({
+    "/events/status": (body: any) =>
+      body.subscriptions
+        ? { json: { subscriptions: body.subscriptions.map((s: any) => ({ id: s.id, user: s.user, live: s.id === "s1", connected: s.id === "s1", via: s.id === "s1" ? "stream" : undefined })) } }
+        : { json: { subscriptions: 3, connected: 2, via: { stream: 1, poll: 1 } } },
+  });
+  const turn = turnEvent(wake);
+  assert.deepEqual(await turn.status({ table: "juniper" }, { to: " u1 " }), { subscriptions: 3, connected: 2, via: { stream: 1, poll: 1, hooks: 0, webhook: 0 } });
+  assert.deepEqual(reqs.at(-1)!.body, { name: "game.turn", arguments: { table: "juniper" }, to: "u1" });
+  assert.deepEqual(await turn.statusOf([{ user: "u1", subscription: "s1" }, { user: "u2", subscription: "s2" }]), [
+    { id: "s1", user: "u1", live: true, connected: true, via: "stream" },
+    { id: "s2", user: "u2", live: false, connected: false },
+  ]);
+  assert.deepEqual(reqs.at(-1)!.body, { name: "game.turn", subscriptions: [{ user: "u1", id: "s1" }, { user: "u2", id: "s2" }] });
+  const sent = reqs.length;
+  assert.deepEqual(await turn.statusOf([]), []);
+  await assert.rejects(turn.status({ table: "juniper" }), /personal/);
+  await assert.rejects(turn.status({ table: "juniper" }, { to: ["a"] as any }), /exactly one user/);
+  await assert.rejects(chatEvent(wake).status({ channel: "eng" }, { to: "a" }), /isn't personal/);
+  await assert.rejects(turn.statusOf([{ user: "", subscription: "s1" }]), /user and subscription/);
+  await assert.rejects(turn.statusOf(Array.from({ length: 1001 }, () => ({ user: "u", subscription: "s" }))), /at most 1000/);
+  assert.equal(reqs.length, sent, "nothing refused is sent");
+});
+
+test("speaksEvents: the extension, or ChatGPT; not the older top-level key", () => {
   assert.equal(speaksEvents({ extensions: { [EXTENSION_KEY]: {} } }, "x"), true);
-  assert.equal(speaksEvents({ events: {} }, "x"), true);
+  assert.equal(speaksEvents({ events: {} }, "x"), false);
   assert.equal(speaksEvents({}, "openai-mcp"), true);
   assert.equal(speaksEvents({}, "claude-code"), false);
 });
@@ -163,6 +258,10 @@ test("attach: bridged clients get subscribe_events; every client gets unsubscrib
   assert.ok(Object.keys(sub.inputSchema.properties ?? {}).includes("session_key"));
   assert.equal(byName.get("unsubscribe_events")!.description, UNSUBSCRIBE_TOOL_DESCRIPTION);
   assert.equal(byName.get("list_subscriptions")!.description, LIST_TOOL_DESCRIPTION);
+  // Only list_subscriptions only reads, and says so.
+  assert.equal(byName.get("list_subscriptions")!.annotations?.readOnlyHint, true);
+  assert.notEqual(byName.get("subscribe_events")!.annotations?.readOnlyHint, true);
+  assert.notEqual(byName.get("unsubscribe_events")!.annotations?.readOnlyHint, true);
 
   const r = await client.callTool({ name: "subscribe_events", arguments: { event: "chat.message", arguments: { channel: "eng" }, harness: "claude-code" } });
   assert.equal(text(r), 'Subscribed to chat.message {"channel":"eng"}.\n\nStart the Monitor tool now.');
@@ -355,7 +454,7 @@ test("spec constants match the core's", async () => {
   const str = (name: string) => go.match(new RegExp(`${name}\\s*=\\s*"([^"]+)"`))?.[1];
   assert.equal(spec.REVISION, str("Revision"));
   assert.equal(spec.EXTENSION_KEY, str("ExtensionKey"));
-  assert.equal(spec.LEGACY_KEY, str("LegacyKey"));
+  assert.equal(spec.TOP_LEVEL_KEY, str("TopLevelKey"));
   assert.equal(spec.RESULT_TYPE, str("ResultType"));
   assert.equal(spec.TEXT_META, str("TextMeta"));
   assert.equal(spec.NAME_HEADER, str("NameHeader")?.toLowerCase());
@@ -411,6 +510,25 @@ test("an authorize that throws refuses, on both paths, and the app hears why", a
   assert.equal(reqs.filter((u) => u.includes("subscribe")).length, 0, "nothing reached the core");
 });
 
+test("attach's tools option picks which of its own tools it adds: all three by default, the ones named, or none", async () => {
+  assert.deepEqual([...BUILTIN_TOOLS], ["subscribe_events", "unsubscribe_events", "list_subscriptions"]);
+  const listed = async (tools?: readonly BuiltinTool[]) => {
+    const { wake } = fakeCore();
+    chatEvent(wake);
+    const server = new McpServer({ name: "chat", version: "1.0.0" });
+    server.registerTool("ping", { inputSchema: {} }, async () => ({ content: [] }));
+    wake.attach(server, { identify: () => ({ user: "u1" }), tools });
+    const client = await connect(server, "claude-code");
+    return (await client.listTools()).tools.map((t) => t.name).sort();
+  };
+  assert.deepEqual(await listed(), ["list_subscriptions", "ping", "subscribe_events", "unsubscribe_events"]);
+  assert.deepEqual(await listed(["list_subscriptions", "unsubscribe_events"]), ["list_subscriptions", "ping", "unsubscribe_events"]);
+  assert.deepEqual(await listed([]), ["ping"]);
+  const { wake } = fakeCore();
+  chatEvent(wake);
+  assert.throws(() => wake.attach(new McpServer({ name: "x", version: "1.0.0" }), { tools: ["subscribe" as BuiltinTool] }), /"subscribe"/);
+});
+
 test("attach needs events, and must come before connecting", async () => {
   const { wake } = fakeCore();
   const server = new McpServer({ name: "x", version: "1.0.0" });
@@ -423,35 +541,9 @@ test("attach needs events, and must come before connecting", async () => {
   assert.throws(() => wake.attach(late), /before connecting/);
 });
 
-test("an event's subscribe and end: a tool subscribes its own caller, and ends a subscription by ID", async () => {
-  const { wake, reqs } = fakeCore({
-    "/event-subscriptions": () => ({
-      json: {
-        event_subscription: { id: "es_1", event: "game.turn", arguments: { table: "t1" }, created: true },
-        session: "wsc_abc",
-        addition: { text: "Watch with the Monitor tool." },
-        agent: { harness: "claude-code", via: "client", claimed: null },
-      },
-    }),
-    "/event-subscriptions/end": (b) => ({ json: { ended: b.id === "es_1" } }),
-  });
+test("an event's end: ends one of a user's subscriptions by ID, outside a tool", async () => {
+  const { wake, reqs } = fakeCore({ "/event-subscriptions/end": (b) => ({ json: { ended: b.id === "es_1" } }) });
   const turn = turnEvent(wake);
-  // Personal: the subscription belongs to a user, so one is required.
-  await assert.rejects(turn.subscribe({} as any, { table: "t1" }, { client: "claude-code" }), /personal: pass user/);
-  await assert.rejects(turn.subscribe({} as any, {} as any, { client: "claude-code", user: "u1" }), /arguments for game\.turn/);
-  const sub = await turn.subscribe({} as any, { table: "t1" }, { client: "claude-code", user: "u1", wakeArgs: { session_key: "wsc_abc" } });
-  assert.equal(sub.id, "es_1");
-  assert.equal(sub.created, true);
-  assert.equal(sub.session, "wsc_abc");
-  assert.equal(sub.agent.harness, "claude-code");
-  const res = sub.result("Seated.");
-  assert.match(JSON.stringify(res), /Seated\./);
-  assert.match(JSON.stringify(res), /Watch with the Monitor tool/);
-  const req = reqs.find((r) => r.path === "/event-subscriptions")!;
-  assert.equal(req.body.name, "game.turn");
-  assert.deepEqual(req.body.arguments, { table: "t1" });
-  assert.equal(req.body.call.user, "u1");
-  assert.equal(req.body.call.session, "wsc_abc");
   assert.equal(await turn.end("u1", "es_1"), true);
   assert.equal(await turn.end("u1", "es_other"), false);
   assert.deepEqual(
@@ -461,19 +553,6 @@ test("an event's subscribe and end: a tool subscribes its own caller, and ends a
       { user: "u1", id: "es_other" },
     ],
   );
-});
-
-test("an event's unsubscribe: a tool ends its own caller's subscription with those arguments", async () => {
-  const { wake, reqs } = fakeCore({ "/event-subscriptions/unsubscribe": (b) => ({ json: { ended: b.arguments.table === "t1" } }) });
-  const turn = turnEvent(wake);
-  assert.equal(await turn.unsubscribe({} as any, { table: "t1" }, { client: "claude-code", user: "u1", wakeArgs: { session_key: "wsc_abc" } }), true);
-  assert.equal(await turn.unsubscribe({} as any, { table: "t2" }, { client: "claude-code", user: "u1" }), false);
-  await assert.rejects(turn.unsubscribe({} as any, {} as any, { client: "claude-code" }), /arguments for game\.turn/);
-  const req = reqs.find((r) => r.path === "/event-subscriptions/unsubscribe")!;
-  assert.equal(req.body.name, "game.turn");
-  assert.deepEqual(req.body.arguments, { table: "t1" });
-  assert.equal(req.body.call.session, "wsc_abc");
-  assert.equal(req.body.call.user, "u1");
 });
 
 // The Go SDK (pkg/appkit) writes test/event-tools.json and
@@ -541,7 +620,7 @@ test("events/list, tools/list and the manifest match the Go SDK's for the same e
     events: list.events,
     manifest: [chat.manifest, turn.manifest, run.manifest],
     tools: tools
-      .map((t) => ({ name: t.name, description: t.description, inputSchema: inputShape(t.inputSchema) }))
+      .map((t) => ({ name: t.name, description: t.description, inputSchema: inputShape(t.inputSchema), ...(t.annotations ? { annotations: t.annotations } : {}) }))
       .sort((a, b) => (a.name < b.name ? -1 : 1)),
   };
   assert.deepEqual(sorted(JSON.parse(JSON.stringify(got))), goldenFile("events-list.json"));

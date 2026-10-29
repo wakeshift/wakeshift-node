@@ -26,7 +26,7 @@ test("parseKey reads every accepted key in app-keys.json", () => {
     assert.equal(k.seed.toString("base64url"), want.seed, v.key);
     assert.equal(publicKeyOf(k), want.public_key, v.key);
     assert.equal(k.kid, want.kid, v.key);
-    assert.equal(k.mode, v.mode, v.key);
+    assert.ok(!("mode" in k), v.key);
     assert.equal(k.appId, v.app_id, v.key);
   }
 });
@@ -42,7 +42,7 @@ test("parseKey refuses every refused key in app-keys.json, without echoing it", 
   }
 });
 
-const NEW = golden.accepted.find((v) => v.mode === null)!.key;
+const NEW = golden.accepted.find((v) => v.mode === null)!.key; // app-keys.json keeps each key's format
 const NEW_KID = seeds.get(golden.accepted.find((v) => v.mode === null)!.seed)!.kid;
 const OLD_TEST = golden.accepted.find((v) => v.mode === "test")!.key;
 const OLD_LIVE = golden.accepted.find((v) => v.mode === "live")!.key;
@@ -86,7 +86,6 @@ test("the default core: production for a current or live key; a test key needs o
     assert.equal(new Wakeshift({ key: NEW }).core, "https://app.wakeshift.ai");
     assert.equal(new Wakeshift({ key: OLD_LIVE }).core, "https://app.wakeshift.ai");
     assert.throws(() => new Wakeshift({ key: OLD_TEST }), /no core URL for this test key: set WAKESHIFT_CORE/);
-    assert.equal(new Wakeshift({ key: NEW }).mode, null);
   });
   withCore("https://app.staging.wakeshift.ai", () => {
     assert.equal(new Wakeshift({ key: NEW }).core, "https://app.staging.wakeshift.ai");
@@ -112,7 +111,7 @@ function fakeCore(app: () => [number, unknown]) {
     let json: unknown = {};
     if (path === "/api/apps/v1/app") [status, json] = app();
     else if (path === "/oauth/token") json = { access_token: "at", refresh_token: "rt", expires_in: 900, wakeshift_user: "u-1" };
-    else if (path === "/api/apps/v1/topics/publish") json = { matched: 0 };
+    else if (path === "/api/apps/v1/users/forget") json = { forgotten: false };
     else status = 404;
     return new Response(JSON.stringify(json), { status, headers: { "Content-Type": "application/json" } });
   }) as typeof fetch;
@@ -126,7 +125,7 @@ test("a current key: appId throws until app() has asked Wakeshift, once", async 
   const wake = new Wakeshift({ key: NEW, core: "http://core.test", fetch: core.fetchFn });
   assert.throws(() => wake.appId, /call await wake\.app\(\) first: this key doesn't name its app/);
   const [a, b] = await Promise.all([wake.app(), wake.app()]);
-  assert.deepEqual(a, { id: "ci-bot", name: "CI bot" });
+  assert.deepEqual(a, { id: "ci-bot", name: "CI bot", key: { id: NEW_KID.slice(0, 8), name: "default" } });
   assert.deepEqual(b, a);
   assert.deepEqual(await wake.app(), a);
   assert.equal(wake.appId, "ci-bot");
@@ -134,7 +133,7 @@ test("a current key: appId throws until app() has asked Wakeshift, once", async 
   assert.equal(core.sent[0].url, "http://core.test/api/apps/v1/app");
   // The first assertion names the key; once the app is known, the app.
   assert.equal(parts(core.sent[0].auth!.slice("Bearer ".length)).claims.iss, NEW_KID);
-  await wake.publish("ci/x", { text: "hi" });
+  await wake.forgetUser("ada");
   const p = parts(core.sent[1].auth!.slice("Bearer ".length));
   assert.equal(p.header.kid, NEW_KID);
   assert.equal(p.claims.iss, "ci-bot");
@@ -156,6 +155,5 @@ test("an older key: appId from the key, and app() adds the name", async () => {
   const core = fakeCore(() => [200, { ...appReply, name: "CI" }]);
   const wake = new Wakeshift({ key: OLD_TEST, core: "http://core.test", fetch: core.fetchFn });
   assert.equal(wake.appId, "ci-bot");
-  assert.equal(wake.mode, "test");
-  assert.deepEqual(await wake.app(), { id: "ci-bot", name: "CI" });
+  assert.deepEqual(await wake.app(), { id: "ci-bot", name: "CI", key: { id: NEW_KID.slice(0, 8), name: "default" } });
 });

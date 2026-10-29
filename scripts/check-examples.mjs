@@ -5,10 +5,9 @@
 // imports at the top, the rest in an async function, so fragments (a
 // `return` from a tool callback, an `await`) compile; examples/env.d.ts
 // declares what fragments take from around them (extra, repo, body…).
-// It also checks two mistakes tsc can't see: wake.call needs `server` (or
-// `client`), and topics passed to the SDK are lowercase (a topic in a
-// variable isn't checked). `core` isn't required: the SDK reads
-// WAKESHIFT_CORE itself, which is what an example would pass.
+// It also checks a mistake tsc can't see: attached.events names the tool
+// it's registered as. `core` isn't required: the SDK reads WAKESHIFT_CORE
+// itself, which is what an example would pass.
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, copyFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
@@ -65,79 +64,14 @@ if (!readmeOnly) {
   examples.push({ from: "web/src/pages/app/Overview.tsx", code });
 }
 
-// What tsc can't see.
+// What tsc can't see: attached.events("name", …) inside registerTool("name", …)
+// with another name throws at the first call. Each registration is checked
+// against the first attached.events in it, before the next registerTool.
 const problems = [];
 for (const e of examples) {
-  // wake.call throws without the client's name.
-  for (const m of e.code.matchAll(/\bwake\.call\(\s*\w+\s*(?:,\s*\{([^}]*)\})?\s*\)/g)) {
-    if (!/\b(server|client)\b/.test(m[1] ?? "")) problems.push(`${e.from}: wake.call without server or client (it throws)`);
+  for (const m of e.code.matchAll(/registerTool\(\s*(["'`])([^"'`]+)\1(?:(?!registerTool\()[\s\S])*?attached\.events\(\s*(["'`])([^"'`]+)\3/g)) {
+    if (m[2] !== m[4]) problems.push(`${e.from}: attached.events("${m[4]}") wraps the tool registered as ${m[2]} (it throws)`);
   }
-  for (const t of topicArgs(e.code)) {
-    const why = topicProblem(t);
-    if (why) problems.push(`${e.from}: topic ${t} ${why}`);
-  }
-}
-
-// topicArgs is every topic an example passes the SDK: the topic argument of
-// subscribe, unsubscribe, unsubscribeUser, publish (one, or each in an
-// array), publishUrl, closeTopic and topicStatus, as written (a string or
-// template literal; a variable isn't checked).
-function topicArgs(code) {
-  const out = [];
-  const calls = /\bwake\.(subscribe|unsubscribe|unsubscribeUser|publish|publishUrl|closeTopic|topicStatus)\(/g;
-  let m;
-  while ((m = calls.exec(code))) {
-    const args = splitArgs(code, m.index + m[0].length);
-    const arg = ["subscribe", "unsubscribe", "unsubscribeUser"].includes(m[1]) ? args[1] : args[0];
-    if (!arg) continue;
-    const literals = arg.startsWith("[") ? splitArgs(arg, 1) : [arg];
-    out.push(...literals.filter((l) => /^["'`]/.test(l)));
-  }
-  return out;
-}
-
-// splitArgs splits the arguments of a call whose "(" (or "[") ends just
-// before i, at top-level commas, skipping strings, templates and brackets.
-function splitArgs(code, i) {
-  const args = [];
-  let depth = 0;
-  let start = i;
-  for (; i < code.length; i++) {
-    const c = code[i];
-    if (c === '"' || c === "'" || c === "`") {
-      for (i++; i < code.length && code[i] !== c; i++) {
-        if (code[i] === "\\") i++;
-        else if (c === "`" && code[i] === "$" && code[i + 1] === "{") {
-          let d = 0;
-          for (; i < code.length; i++) {
-            if (code[i] === "{") d++;
-            else if (code[i] === "}" && --d === 0) break;
-          }
-        }
-      }
-    } else if ("([{".includes(c)) depth++;
-    else if (")]}".includes(c)) {
-      if (depth-- === 0) break;
-    } else if (c === "," && depth === 0) {
-      args.push(code.slice(start, i).trim());
-      start = i + 1;
-    }
-  }
-  args.push(code.slice(start, i).trim());
-  return args.filter((a) => a !== "");
-}
-
-// topicProblem says what's wrong with a topic literal: its fixed parts must
-// be lowercase topic characters, and each value in it must be lowercased
-// with .toLowerCase() (or be an ID, which the docs say must already be
-// topic-safe: u/${me.id}/…).
-function topicProblem(t) {
-  const fixed = t.slice(1, -1).replace(/\$\{[^}]*\}/g, "x");
-  if (!/^[a-z0-9._-]+(\/[a-z0-9._-]+)*$/.test(fixed)) return "has characters a topic can't (lowercase a-z 0-9 . _ - joined by /)";
-  for (const v of t.matchAll(/\$\{([^}]*)\}/g)) {
-    if (!/\.toLowerCase\(\)\s*$/.test(v[1]) && !/(^|\.)id$/i.test(v[1].trim())) return "isn't lowercased (use .toLowerCase() on " + v[1].trim() + ")";
-  }
-  return "";
 }
 
 rmSync(out, { recursive: true, force: true });

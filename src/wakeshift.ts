@@ -1,10 +1,10 @@
 import { z } from "zod";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AnySchema } from "@modelcontextprotocol/sdk/server/zod-compat.js";
 import { WakeshiftError } from "./errors.js";
 import { WakeEvent, attachEvents, type AttachOptions, type EventOptions, type EventTypeManifest } from "./events.js";
-import { parseKey, signAssertion, type AppKey } from "./key.js";
+import type { Attached } from "./toolcall.js";
+import { parseKey, signAssertion, type AppKey, isTestKey } from "./key.js";
 import { retryRefused } from "./retry.js";
 
 /** Wakeshift's production core, the default for every key but an older wst_test_ one. Override with `core` or WAKESHIFT_CORE. */
@@ -22,14 +22,6 @@ export const HARNESS_ARG = "harness";
  */
 export const CONVERSATION_ARG = "conversation_id";
 
-// What the agent is told each argument is (the core's own words:
-// internal/harnesses, whose tests check these match).
-const SESSION_DESCRIPTION = "The session key an earlier result gave you, if it did. It's a secret: keep it to this conversation; don't share or log it";
-const HARNESS_DESCRIPTION =
-  "The program you're running in: codex, claude-code, cursor (local CLI or IDE), cursor-cloud (Cursor cloud agent), grok-bot, copilot-cli, opencode, antigravity, openclaw (even when it runs your turns in Codex), hermes, chatgpt, or your program's name if it isn't listed";
-const CONVERSATION_DESCRIPTION =
-  "Your own ID for this conversation, if your program gives you one. Cursor and Grok Bot: the output of `printenv CURSOR_CONVERSATION_ID`. Codex and Antigravity send it automatically; others leave it empty";
-
 export interface WakeshiftOptions {
   /** The app key from the console: wst_ and 50 characters (or an older wst_test_… or wst_live_… key). */
   key: string;
@@ -45,8 +37,10 @@ export interface WakeshiftOptions {
   timeoutMs?: number;
   /**
    * Called with a problem that doesn't fail the call but makes it work less
-   * well, for example a tool call Wakeshift recognised no harness in. Each kind is
-   * reported once. Default: console.warn.
+   * well: each time for a failure, such as a failed call's subscription
+   * that couldn't be rolled back, and once for each kind of misuse, such as
+   * a wrapped tool that returned with a subscribe still in flight. Default:
+   * console.warn.
    */
   onWarning?: (message: string) => void;
 }
@@ -55,30 +49,19 @@ export interface WakeshiftOptions {
 export interface AppInfo {
   id: string;
   name: string;
+  /** The key: the console's ID for it, and its name ("" if Wakeshift didn't say). */
+  key: { id: string; name: string };
 }
 
-/** What the SDK says, once, when Wakeshift recognised no harness in a tool call. */
-export const UNKNOWN_CLIENT_WARNING =
-  "wakeshift: Wakeshift couldn't tell which agent made a tool call (no MCP client name, nothing it knows in the " +
-  "call's _meta or User-Agent, and no harness argument), so it treats the agent as one it can't wake (its messages are held " +
-  "for its next call to the tool). The name comes from the client's initialize request, which a server created per request " +
-  "(stateless Streamable HTTP) never sees; Claude Code, Codex, Antigravity, Copilot CLI, opencode and Cursor are recognised " +
-  "without it. Spread ...wake.args into the tool's input and pass args to wake.call, so the agent can say (harness); for " +
-  "other clients, keep one McpServer per MCP session (a stateful transport), or pass the name yourself: " +
-  "wake.call(extra, { client }) or wake.callOf({ clientName }).";
-
 /**
- * Who called one of the app's tools, as Wakeshift needs it. Make one with
- * `wake.call(extra, …)` inside an MCP tool callback, or `wake.callOf(…)`.
+ * @internal A tool call as Wakeshift takes it: who called, from which
+ * client, in which conversation. The wrapper (attached.events) and attach's
+ * own tools pack it.
  */
 export interface Call {
   /** The app's own ID for the person (optional). */
   user?: string;
-  /**
-   * The MCP client's name (initialize's clientInfo.name). A stateless
-   * server has none; Wakeshift then tells the harness from meta, else
-   * user_agent.
-   */
+  /** The MCP client's name (initialize's clientInfo.name); a stateless server has none. */
   client: string;
   /** The tool call's _meta (Codex sends its thread there). */
   meta?: Record<string, unknown>;
@@ -86,15 +69,11 @@ export interface Call {
   session?: string;
   /** The MCP request's HTTP User-Agent. */
   user_agent?: string;
-  /** The conversation's ID as the agent passed it (conversation_id: Cursor's CURSOR_CONVERSATION_ID). */
+  /** The conversation's ID as the agent passed it (conversation_id). */
   conversation?: string;
   /** The program the agent says it runs in (harness): a hint, never a credential. */
   harness?: string;
-  /**
-   * The name of the tool being called. A connector beacon in its result
-   * names it, and Wakeshift's hooks act on the beacon only from that
-   * tool's result: put the addition in the result of the tool you name.
-   */
+  /** The name of the tool being called: a connector beacon in its result names it. */
   tool?: string;
 }
 
@@ -118,99 +97,55 @@ export interface Recognised {
  */
 export type Duration = number | `${number}${"s" | "m" | "h" | "d"}`;
 
-export interface SubscribeOptions {
-  /** Wake only for events whose data has these top-level fields equal to these values. */
-  filter?: Record<string, string | number | boolean | null>;
-  /** End after the first delivery. */
-  once?: boolean;
-  /** Deliver the latest event published within this long before subscribing (at most 24 hours). */
-  replay?: Duration;
-  /** End after this long without a delivery or a fresh subscribe (1 minute to 365 days; default 30 days). */
-  ttl?: Duration;
-}
+/**
+ * One recipient of a personal event's emit, beside a plain user (the app's
+ * ID for them: every subscription they have to the event with these
+ * arguments): `{ user, subscription }`, exactly that subscription of that
+ * user's; `{ native: user }`, only that user's native (webhook)
+ * subscriptions to the event with these arguments.
+ */
+export type Recipient = { user: string; subscription: string } | { native: string };
 
-/** What Wakeshift adds to a tool result: text for the agent, _meta for its harness. */
-export interface Addition {
-  text?: string;
-  meta?: Record<string, unknown>;
-  /** What Wakeshift recognised the caller's harness as (not added to the result). */
-  agent?: Recognised;
-}
-
-export interface Subscription {
-  /** For `send`. */
-  id: string;
-  topic: string;
-  filter?: Record<string, unknown>;
-  once: boolean;
-  expiresAt: Date;
-  /**
-   * The conversation's session key (the agent passes it back as session_key;
-   * the result says so). It's a secret that acts as the conversation: don't
-   * show, store or log it. To name the conversation, use id, or an HMAC of it.
-   */
-  session: string;
-  /** What the tool result must carry for the caller's harness. */
-  addition: Addition;
-  /** What Wakeshift recognised the caller's harness as. */
-  agent: Recognised;
-  /**
-   * The tool result to return: your text (or result) followed by
-   * Wakeshift's, with its _meta.
-   */
-  result(text: string | CallToolResult): CallToolResult;
-}
-
-export interface TopicEvent {
-  /** What the agent reads first (at most 1000 bytes). */
-  text: string;
-  /** A JSON object, within the 64 KB request limit; filters match its top-level fields. */
-  data?: Record<string, unknown>;
-  /** Makes retries publish once for a day (at most 200 characters); after a day, the same id publishes again. */
-  id?: string;
-}
-
-export interface Published {
+/** What an event's emit did. */
+export interface Emitted {
   /** Conversations it woke (or will). */
   matched: number;
-  /** An earlier publish had this event's id. */
+  /** An earlier emit had this occurrence's id. */
   duplicate: boolean;
+  /** User and native recipients with no live subscription it reached (an emit to several recipients only). */
+  unmatched: (string | Recipient)[];
+  /** Subscription recipients no longer live (or not that user's). */
+  ended: (string | Recipient)[];
 }
 
-/** delivered: on its way to a connected conversation; queued: waits for it; closed: the subscription ended. */
-export type SendStatus = "delivered" | "queued" | "closed";
+// recipientsOf reads an emit's unmatched or ended list: "user",
+// { native: user } or { user, subscription }.
+function recipientsOf(raw: unknown): (string | Recipient)[] {
+  if (!Array.isArray(raw)) return [];
+  const out: (string | Recipient)[] = [];
+  for (const r of raw) {
+    if (typeof r === "string") out.push(r);
+    else if (r && typeof r === "object") {
+      const m = r as Record<string, unknown>;
+      if (typeof m.native === "string" && m.native) out.push({ native: m.native });
+      else if (typeof m.user === "string") out.push({ user: m.user, subscription: typeof m.subscription === "string" ? m.subscription : "" });
+    }
+  }
+  return out;
+}
 
 /**
- * How a conversation is connected: stream (a stream held open, e.g.
- * Cursor's background command), poll (long polls or waits, e.g. Claude
- * Code's Monitor, in the last minute) or hooks (Wakeshift's hooks or
- * connector on the user's machine).
+ * How a connected conversation receives what it's woken by: stream (it holds
+ * a connection to Wakeshift open), poll (it asked Wakeshift for messages
+ * within the last minute), hooks (Wakeshift's connector on the user's
+ * computer delivers to it) or webhook (its client subscribed with MCP
+ * Events, and Wakeshift sends to the client's webhook).
  */
 export type Via = "stream" | "poll" | "hooks" | "webhook";
 
-export interface TopicStatus {
-  topic: string;
-  /** Conversations subscribed (ended or expired subscriptions don't count). */
-  subscriptions: number;
-  /** Of those, connected now. */
-  connected: number;
-  /** How many are connected each way. */
-  via: Record<Via, number>;
-}
-
-export interface SubscriptionStatus {
-  id: string;
-  topic: string;
-  status: "active" | "closed";
-  connected: boolean;
-  via?: Via;
-  expiresAt?: Date;
-}
-
-/** A publish URL: `topic` for a topic's (`wake.publishUrl`), `event` for an event's (`event.publishUrl`). */
+/** An event's publish URL (`event.publishUrl`). */
 export interface PublishUrl {
   id: string;
-  topic?: string;
   event?: string;
   url: string;
 }
@@ -231,15 +166,24 @@ export interface AgentScope {
   wake_limits?: { seconds: number; max: number }[];
   /** What the person should say to their agent once it's connected; at most 120 characters. */
   start_prompt?: string;
-  groups?: boolean;
 }
 
 /** What the app tells Wakeshift it may do (see wake.publishManifest). */
 export interface Manifest {
   description?: string;
   agent?: AgentScope;
-  /** The app's event types: defineEvent fills this in for you. */
+  /** Event types defined elsewhere, not with defineEvent: Wakeshift gets these, then the defined ones. Listing a defined one is an error. */
   events?: EventTypeManifest[];
+  /** Your app wakes its users' agents with what other people and their agents do there (messages, moves): the consent screen says agents of people they don't know can wake theirs. */
+  others_can_wake?: boolean;
+  /**
+   * Your MCP tools (as your server lists them) that agents' programs can run without asking each time:
+   * tools that only read, and routine ones the agent calls on every wake that reach only what it already joined.
+   * Never one that deletes, spends, or reaches people the user hasn't chosen. When a user connects Claude Code
+   * or Cursor CLI, Wakeshift offers to allow exactly these, by name, in the same question as its install.
+   * Letters, digits, _ and -; at most 20.
+   */
+  preapprove_tools?: string[];
 }
 
 /** The parts of an MCP tool callback's `extra` that Wakeshift reads. */
@@ -257,58 +201,45 @@ function userAgentOf(extra: ToolExtra | undefined): string {
   return (Array.isArray(v) ? v[0] : v) ?? "";
 }
 
-/** An McpServer or a low-level Server: anything that knows its client's name. */
-export type ClientInfoSource =
-  | { getClientVersion(): { name: string } | undefined }
-  | { server: { getClientVersion(): { name: string } | undefined } };
-
-export interface CallOptions {
-  /** The MCP server the call came to, for the client's name (or pass client). */
-  server?: ClientInfoSource;
-  /** The client's name, if you know it (instead of server). */
-  client?: string;
-  /** The app's own ID for the person. */
+/** @internal Packs a tool call as Wakeshift takes it: empty fields left out, the agent's claims trimmed. */
+export function packCall(c: {
+  meta?: Record<string, unknown>;
+  clientName: string;
   user?: string;
-  /** The tool's arguments: session_key, harness and conversation_id (wake.args) are read from them. */
-  args?: { [SESSION_ARG]?: string; [HARNESS_ARG]?: string; [CONVERSATION_ARG]?: string } | Record<string, unknown>;
-  /** The session key, if you read it yourself. */
   session?: string;
-  /** The program the agent says it runs in (harness), if you read it yourself. */
+  userAgent?: string;
   harness?: string;
-  /** The conversation's ID the agent passed (conversation_id), if you read it yourself. */
   conversation?: string;
-  /**
-   * The name of the tool being called (the MCP SDK doesn't hand callbacks
-   * it, so pass it): Wakeshift's hooks act on a connector beacon only from
-   * the result of the tool it names.
-   */
   tool?: string;
-}
-
-export function clientNameOf(s: ClientInfoSource): string {
-  const info = "getClientVersion" in s ? s.getClientVersion() : s.server.getClientVersion();
-  return info?.name ?? "";
-}
-
-/** Adds Wakeshift's text and _meta to a tool result (a copy). */
-export function applyAddition(a: Addition, base: string | CallToolResult): CallToolResult {
-  let out: CallToolResult;
-  if (typeof base === "string") {
-    const text = (base.trim() + "\n\n" + (a.text ?? "")).trim();
-    out = { content: text ? [{ type: "text", text }] : [] };
-  } else {
-    out = { ...base, content: [...(base.content ?? [])] };
-    if (a.text) out.content.push({ type: "text", text: a.text });
-  }
-  if (a.meta && Object.keys(a.meta).length > 0) out._meta = { ...(out._meta ?? {}), ...a.meta };
+}): Call {
+  const out: Call = { client: c.clientName ?? "" };
+  if (c.user) out.user = c.user;
+  if (c.meta && Object.keys(c.meta).length > 0) out.meta = c.meta;
+  if (c.session) out.session = c.session;
+  if (c.userAgent) out.user_agent = c.userAgent;
+  if (c.harness?.trim()) out.harness = c.harness.trim();
+  if (c.conversation?.trim()) out.conversation = c.conversation.trim();
+  if (c.tool?.trim()) out.tool = c.tool.trim();
   return out;
 }
 
-const argsShape = {
-  [SESSION_ARG]: z.string().optional().describe(SESSION_DESCRIPTION),
-  [HARNESS_ARG]: z.string().optional().describe(HARNESS_DESCRIPTION),
-  [CONVERSATION_ARG]: z.string().optional().describe(CONVERSATION_DESCRIPTION),
-};
+/**
+ * @internal The call to one of attach's own tools (subscribe_events and the
+ * others): its _meta and User-Agent, the client's name, the user, and
+ * session_key, harness and conversation_id from its arguments.
+ */
+export function toolCallOf(extra: ToolExtra | undefined, client: string, user: string | undefined, args: Record<string, unknown>, tool: string): Call {
+  return packCall({
+    meta: extra?._meta,
+    clientName: client,
+    user,
+    session: str(args, SESSION_ARG),
+    userAgent: userAgentOf(extra),
+    harness: str(args, HARNESS_ARG),
+    conversation: str(args, CONVERSATION_ARG),
+    tool,
+  });
+}
 
 // str is a tool argument's value if it's a string.
 function str(args: Record<string, unknown> | undefined, name: string): string | undefined {
@@ -316,15 +247,10 @@ function str(args: Record<string, unknown> | undefined, name: string): string | 
 }
 
 /**
- * The Wakeshift client for an app: subscribe the conversations that call
- * your tools to topics, and publish to them.
+ * The Wakeshift client for an app: define the events your app offers,
+ * attach them to your MCP server, and emit them when they happen.
  */
 export class Wakeshift {
-  /**
-   * An older key's mode (wst_test_…, wst_live_…); null for a current key.
-   * @deprecated Modes mean nothing now, and current keys have none.
-   */
-  readonly mode: "test" | "live" | null;
   readonly core: string;
   private readonly key: AppKey;
   // The app's ID: from the key, if it names the app, or else from app().
@@ -339,10 +265,9 @@ export class Wakeshift {
     if (!opts?.key) throw new Error("wakeshift: no app key (WAKESHIFT_KEY?)");
     this.key = parseKey(opts.key);
     this.knownAppId = this.key.appId;
-    this.mode = this.key.mode;
     // Test keys come from staging and local consoles, and one sent to
     // production fails in a way that's hard to read: ask for the core.
-    const core = opts.core || process.env.WAKESHIFT_CORE || (this.mode === "test" ? "" : DEFAULT_CORE);
+    const core = opts.core || process.env.WAKESHIFT_CORE || (isTestKey(opts.key) ? "" : DEFAULT_CORE);
     if (!core) {
       throw new Error(
         "wakeshift: no core URL for this test key: set WAKESHIFT_CORE, or pass { core }, to the address of the console the key came from (for example https://app.staging.wakeshift.ai)",
@@ -366,19 +291,21 @@ export class Wakeshift {
   }
 
   /**
-   * Which app the key is, as Wakeshift says: its ID and name. Asks once
+   * Which app the key is, as Wakeshift says: its ID and name, and the
+   * key's. Asks once
    * (GET /api/apps/v1/app) and remembers the answer; afterwards
    * `wake.appId` works for any key.
    */
   app(): Promise<AppInfo> {
-    this.appInfo ??= this.request<{ id?: unknown; name?: unknown }>("GET", "/app")
+    this.appInfo ??= this.request<{ id?: unknown; name?: unknown; key?: { key_id?: unknown; name?: unknown } }>("GET", "/app")
       .then((r) => {
         if (typeof r.id !== "string" || !r.id) {
           throw new WakeshiftError(200, "bad_response", `Wakeshift at ${this.core} didn't say which app this key is`);
         }
         const id = this.knownAppId ?? r.id;
         this.knownAppId = id;
-        return { id, name: typeof r.name === "string" ? r.name : "" };
+        const str = (v: unknown) => (typeof v === "string" ? v : "");
+        return { id, name: str(r.name), key: { id: str(r.key?.key_id), name: str(r.key?.name) } };
       })
       .catch((err: unknown) => {
         this.appInfo = undefined; // a later call asks again
@@ -402,228 +329,106 @@ export class Wakeshift {
     this.warnFn(message);
   }
 
-  /** Reports a warning, once per kind. */
-  private warnOnce(kind: string, message: string): void {
+  /** @internal Reports a warning, once per kind. */
+  warnOnce(kind: string, message: string): void {
     if (this.warned.has(kind)) return;
     this.warned.add(kind);
     this.warnFn(message);
   }
 
-  /**
-   * The arguments the agent passes Wakeshift's part of the call in, as a
-   * zod shape for your subscribe tool's input (and any other tool whose
-   * results you annotate): `inputSchema: { repo: z.string(), ...wake.args }`.
-   * session_key (the key a result gives the conversation), harness (the
-   * program the agent runs in) and conversation_id (its own ID for the
-   * conversation, where its program gives one). Wakeshift adds nothing to
-   * tools you don't spread it into.
-   */
-  get args(): typeof argsShape {
-    return argsShape;
-  }
-
-  /**
-   * Packs the tool call from an MCP tool callback's `extra`: its _meta and
-   * User-Agent, the client's name (from `server`, or pass `client`), the
-   * user, and session_key, harness and conversation_id from `args`.
-   */
-  call(extra: ToolExtra | undefined, opts: CallOptions = {}): Call {
-    let client = opts.client;
-    if (client === undefined) {
-      if (!opts.server) throw new Error("wakeshift: wake.call needs the MCP client's name: pass { server } (your McpServer), or { client }");
-      client = clientNameOf(opts.server);
-    }
-    const args = opts.args as Record<string, unknown> | undefined;
-    return this.callOf({
-      meta: extra?._meta,
-      clientName: client,
-      user: opts.user,
-      session: opts.session ?? str(args, SESSION_ARG),
-      userAgent: userAgentOf(extra),
-      harness: opts.harness ?? str(args, HARNESS_ARG),
-      conversation: opts.conversation ?? str(args, CONVERSATION_ARG),
-      tool: opts.tool,
-    });
-  }
-
-  /** Packs a tool call without an MCP framework. */
-  callOf(c: {
-    meta?: Record<string, unknown>;
-    clientName: string;
-    user?: string;
-    session?: string;
-    userAgent?: string;
-    harness?: string;
-    conversation?: string;
-    tool?: string;
-  }): Call {
-    const out: Call = { client: c.clientName ?? "" };
-    if (c.user) out.user = c.user;
-    if (c.meta && Object.keys(c.meta).length > 0) out.meta = c.meta;
-    if (c.session) out.session = c.session;
-    if (c.userAgent) out.user_agent = c.userAgent;
-    if (c.harness?.trim()) out.harness = c.harness.trim();
-    if (c.conversation?.trim()) out.conversation = c.conversation.trim();
-    if (c.tool?.trim()) out.tool = c.tool.trim();
-    return out;
-  }
-
-  // recognised reads what the core recognised the caller as, and warns
-  // once if it was nothing and the agent didn't say (an older core that
-  // doesn't say: no warning).
-  private recognised(agent: Partial<Recognised> | undefined): Recognised {
-    if (agent && !agent.harness && !agent.claimed) this.warnOnce("unknown_client", UNKNOWN_CLIENT_WARNING);
-    return { harness: agent?.harness ?? null, via: agent?.via ?? null, claimed: agent?.claimed ?? null };
-  }
-
-  /**
-   * Subscribes the calling conversation to topic (again: refreshes it).
-   * Check the caller may see the topic first: Wakeshift only refuses another
-   * user's u/<user>/… topics.
-   */
-  async subscribe(call: Call, topic: string, opts: SubscribeOptions = {}): Promise<Subscription> {
-    const body: Record<string, unknown> = { call, topic, once: !!opts.once };
-    if (opts.filter && Object.keys(opts.filter).length > 0) body.filter = opts.filter;
-    if (opts.replay !== undefined) body.replay = opts.replay;
-    if (opts.ttl !== undefined) body.ttl = opts.ttl;
-    const out = await this.request<{
-      subscription: { id: string; topic: string; filter?: Record<string, unknown>; once: boolean; expires_at: string };
-      session: string;
-      addition: Addition;
-      agent?: Recognised;
-    }>("POST", "/topics/subscribe", body);
-    const agent = this.recognised(out.agent);
-    const addition = out.addition ?? {};
-    const s = out.subscription;
-    return {
-      id: s.id,
-      topic: s.topic,
-      filter: s.filter,
-      once: s.once,
-      expiresAt: new Date(s.expires_at),
-      session: out.session,
-      addition,
-      agent,
-      result: (text) => applyAddition(addition, text),
-    };
-  }
-
-  /** Ends the conversation's subscription to topic, or to all the app's topics. Returns how many ended. */
-  async unsubscribe(call: Call, topic?: string): Promise<number> {
-    const out = await this.request<{ unsubscribed: number }>("POST", "/topics/unsubscribe", topic ? { call, topic } : { call });
-    return out.unsubscribed;
-  }
-
-  /** Wakes every conversation subscribed to one of topics whose filter the event passes (each once). */
-  async publish(topics: string | string[], event: TopicEvent): Promise<Published> {
-    const out = await this.request<Published>("POST", "/topics/publish", { topics: typeof topics === "string" ? [topics] : topics, event });
-    return { matched: out.matched, duplicate: !!out.duplicate };
-  }
-
-  /** Wakes exactly one subscription's conversation, whatever its filter. */
-  async send(subscriptionId: string, event: TopicEvent): Promise<SendStatus> {
-    const out = await this.request<{ status: SendStatus }>("POST", `/subscriptions/${encodeURIComponent(subscriptionId)}/send`, { event });
-    return out.status;
-  }
-
-  /**
-   * How many conversations are subscribed to topic, and how many are
-   * connected now, and how. Only reads: nothing is delivered, minted or ended.
-   */
-  async topicStatus(topic: string): Promise<TopicStatus> {
-    const out = await this.request<Omit<TopicStatus, "via"> & { via?: Partial<Record<Via, number>> }>("GET", `/topics/status?topic=${encodeURIComponent(topic)}`);
-    return { topic: out.topic, subscriptions: out.subscriptions, connected: out.connected, via: { stream: 0, poll: 0, hooks: 0, webhook: 0, ...out.via } };
-  }
-
-  /** Whether a subscription is active and its conversation connected now, and how. Only reads. */
-  async subscriptionStatus(subscriptionId: string): Promise<SubscriptionStatus> {
-    const out = await this.request<{ id: string; topic: string; status: "active" | "closed"; connected: boolean; via?: Via; expires_at?: string }>(
-      "GET",
-      `/subscriptions/${encodeURIComponent(subscriptionId)}`,
-    );
-    const s: SubscriptionStatus = { id: out.id, topic: out.topic, status: out.status, connected: out.connected };
-    if (out.via) s.via = out.via;
-    if (out.expires_at) s.expiresAt = new Date(out.expires_at);
-    return s;
-  }
-
-  /** A capability URL that publishes to topic: a POST's body becomes an event. */
-  async publishUrl(topic: string): Promise<PublishUrl> {
-    return this.request<PublishUrl>("POST", "/topics/publish-urls", { topic });
-  }
-
-  /** Stops a publish URL working, a topic's or an event's (410 from then on). */
+  /** Stops a publish URL working (410 from then on). */
   async revokePublishUrl(id: string): Promise<void> {
     await this.request("DELETE", `/events/publish-urls/${encodeURIComponent(id)}`);
   }
 
-  /** What Wakeshift would add to any other tool result for this conversation (creates nothing). */
-  async addition(call: Call): Promise<Addition> {
-    const out = await this.request<Addition>("POST", "/topics/annotate", { call });
-    return { ...out, agent: this.recognised(out.agent) };
-  }
-
-  /**
-   * Adds what Wakeshift has for the calling conversation to a tool result
-   * of yours (a copy): what's waiting for a harness that can't be woken, a
-   * fresh connector beacon while a Codex thread's connector isn't running.
-   * Only results you pass here (and a subscription's result()) change.
-   */
-  async annotate(call: Call, result: CallToolResult): Promise<CallToolResult> {
-    return applyAddition(await this.addition(call), result);
-  }
-
-  /** Ends every subscription to topic; each conversation is told. Returns how many ended. */
-  async closeTopic(topic: string): Promise<number> {
-    return (await this.request<{ closed: number }>("POST", "/topics/close", { topic })).closed;
-  }
-
-  /**
-   * Ends one subscription by its id, telling its conversation that the app
-   * ended it. Returns false if it had already ended (or there's no such
-   * subscription of the app's).
-   */
-  async endSubscription(subscriptionId: string): Promise<boolean> {
-    return (await this.request<{ ended: boolean }>("POST", `/subscriptions/${encodeURIComponent(subscriptionId)}/end`, {})).ended;
-  }
-
-  /**
-   * Ends the subscriptions of every conversation of one of the app's users
-   * to topic, or to all of the app's topics (they lost access to something),
-   * telling each conversation. Returns how many ended.
-   */
-  async unsubscribeUser(user: string, topic?: string): Promise<number> {
-    return (await this.request<{ unsubscribed: number }>("POST", "/topics/unsubscribe", topic ? { user, topic } : { user })).unsubscribed;
-  }
-
   /**
    * Deletes everything Wakeshift keeps for one of the app's users: their
-   * conversations, subscriptions, events and deliveries, recent publishes to
-   * their u/<user>/… topics and publish URLs for them, and their ID. Open
-   * streams close. Returns false if there was nothing to forget.
+   * conversations, subscriptions, events and deliveries, publish URLs for
+   * them, and their ID. Open streams close. Returns false if there was nothing to forget.
    */
   async forgetUser(user: string): Promise<boolean> {
     return (await this.request<{ forgotten: boolean }>("POST", "/users/forget", { user })).forgotten;
   }
 
   /**
-   * Tells Wakeshift what the app may do, replacing what it said before.
-   * The events you defined (defineEvent) are added unless m has events of
-   * its own. Returns the manifest as Wakeshift keeps it.
+   * Tells Wakeshift what the app may do, replacing what it said before: m,
+   * with the events you defined (defineEvent) after m's own events. An
+   * event both defined and listed in m.events is an error, and nothing is
+   * sent. You needn't call it: Wakeshift gets the manifest automatically
+   * when the app first needs it. Once called, m is what every automatic
+   * send carries (even if this one failed), with the events defined by
+   * then. Returns the manifest as Wakeshift keeps it.
    */
   async publishManifest(m: Manifest): Promise<Manifest> {
-    const body: Manifest = m.events === undefined && this.events.size > 0 ? { ...m, events: [...this.events.values()].map((e) => e.manifest) } : m;
-    const out = await this.request<Manifest>("PUT", "/manifest", body);
+    const version = this.manifestVersion; // before the body: a later defineEvent is sent again
+    const body = this.manifestBody(m);
     this.manifestBase = m;
-    this.published = Promise.resolve();
-    return out;
+    const run = this.serial(() => this.request<Manifest>("PUT", "/manifest", body));
+    this.track(run, version);
+    return run;
+  }
+
+  // serial runs a send after every send before it, explicit or automatic,
+  // so the last manifest Wakeshift gets is the newest.
+  private sending: Promise<unknown> = Promise.resolve();
+  private serial<T>(send: () => Promise<T>): Promise<T> {
+    const run = this.sending.then(send, send);
+    this.sending = run.catch(() => undefined);
+    return run;
+  }
+
+  // track makes a send the one event calls wait for: once it's done,
+  // Wakeshift has the manifest for the events defined at version, unless it
+  // failed (the next call sends again) or an event was defined since.
+  private track(send: Promise<unknown>, version: number): void {
+    const p: Promise<void> = send.then(() => {
+      if (this.manifestVersion !== version && this.published === p) this.published = null;
+    });
+    this.published = p;
+    p.catch(() => {
+      if (this.published === p) this.published = null;
+    });
+  }
+
+  // The manifest as Wakeshift gets it: m's events, then the defined ones,
+  // refusing a name in both.
+  private manifestBody(m: Manifest): Manifest {
+    const listed = m.events ?? [];
+    for (const name of this.events.keys()) {
+      if (listed.some((e) => e.name === name)) {
+        throw new Error(`wakeshift: event ${name} is defined with defineEvent and listed in the manifest's events: keep one`);
+      }
+    }
+    const events = [...listed, ...[...this.events.values()].map((e) => e.manifest)];
+    const { events: _listed, ...rest } = m;
+    return events.length > 0 ? { ...rest, events } : rest;
+  }
+
+  // The automatic send: the manifest the app last published, or else the
+  // settings Wakeshift has (asked for first, so the send never wipes what
+  // was published separately), with the defined events.
+  private async sendManifest(): Promise<void> {
+    if (this.manifestBase) {
+      await this.request("PUT", "/manifest", this.manifestBody(this.manifestBase));
+      return;
+    }
+    const stored = await this.request<Record<string, unknown>>("GET", "/manifest");
+    const kept: Manifest = { description: typeof stored.description === "string" ? stored.description : "" };
+    if (stored.agent !== null && typeof stored.agent === "object") kept.agent = stored.agent as AgentScope;
+    if (stored.others_can_wake === true) kept.others_can_wake = true;
+    if (Array.isArray(stored.preapprove_tools) && stored.preapprove_tools.length > 0) kept.preapprove_tools = stored.preapprove_tools as string[];
+    await this.request("PUT", "/manifest", this.manifestBody(kept));
   }
 
   // ── Events (MCP Events, natively or bridged) ──────────────────────────
 
   private readonly events = new Map<string, WakeEvent>();
-  private manifestBase: Manifest = {};
+  // What publishManifest was last given (null: nothing yet); whether
+  // Wakeshift has the manifest for the events defined now (the send; null:
+  // not yet, or a defineEvent since); and how many defineEvents there were.
+  private manifestBase: Manifest | null = null;
   private published: Promise<void> | null = null;
+  private manifestVersion = 0;
 
   /**
    * Defines one of the app's event types: what a subscriber picks (args),
@@ -643,7 +448,8 @@ export class Wakeshift {
     if (this.events.has(name)) throw new Error(`wakeshift: event ${name} is defined twice`);
     const ev = new WakeEvent<A, P>(this, name, opts);
     this.events.set(name, ev as unknown as WakeEvent);
-    this.published = null; // the manifest changed
+    this.published = null; // the manifest changed: sent again when next needed
+    this.manifestVersion++;
     return ev;
   }
 
@@ -656,32 +462,30 @@ export class Wakeshift {
    * unsubscribe_events and list_subscriptions for every client, so a person
    * can always see and stop what they're subscribed to.
    *
-   *   wake.attach(server, { identify: (extra) => ({ user: myUser(extra) }) })
+   *   const attached = wake.attach(server, { identify: (extra) => ({ user: myUser(extra) }) })
+   *
+   * It returns the handle your own tools use to subscribe the conversation
+   * calling them: wrap a tool's callback with attached.events, and give it
+   * Wakeshift's arguments with attached.inputs.
    */
-  attach(server: McpServer, opts: AttachOptions = {}): void {
-    attachEvents(this, server, [...this.events.values()], opts);
+  attach(server: McpServer, opts: AttachOptions = {}): Attached {
+    return attachEvents(this, server, [...this.events.values()], opts);
   }
 
-  /** @internal Publishes the manifest with the defined events, once (again after a defineEvent). */
+  /** @internal Sends the manifest with the defined events, once (again after a defineEvent). */
   ensureEvents(): Promise<void> {
-    if (!this.published) {
-      const p = this.publishManifest(this.manifestBase).then(() => undefined);
-      this.published = p;
-      p.catch(() => {
-        if (this.published === p) this.published = null; // try again next time
-      });
-    }
-    return this.published;
+    if (!this.published) this.track(this.serial(() => this.sendManifest()), this.manifestVersion);
+    return this.published!;
   }
 
   /** @internal An event's emit. */
-  async emitEvent(e: { name: string; arguments: unknown; payload: unknown; text: string; id?: string; to?: string }): Promise<Published> {
+  async emitEvent(e: { name: string; arguments: unknown; payload: unknown; text: string; id?: string; to?: string | (string | Recipient)[] }): Promise<Emitted> {
     await this.ensureEvents();
     const body: Record<string, unknown> = { name: e.name, arguments: e.arguments, payload: e.payload, text: e.text };
     if (e.id) body.id = e.id;
     if (e.to) body.to = e.to;
-    const out = await this.request<Published>("POST", "/events/emit", body);
-    return { matched: out.matched, duplicate: !!out.duplicate };
+    const out = await this.request<{ matched: number; duplicate?: boolean; unmatched?: unknown; ended?: unknown }>("POST", "/events/emit", body);
+    return { matched: out.matched, duplicate: !!out.duplicate, unmatched: recipientsOf(out.unmatched), ended: recipientsOf(out.ended) };
   }
 
   /** @internal A call to the app API (the events machinery's), after the manifest with the defined events is published. */
@@ -694,8 +498,8 @@ export class Wakeshift {
 
   /**
    * The workspace Wakeshift keeps for one of the app's users (user: the
-   * app's own ID for them, as in wake.call's user), created on first use.
-   * Topics keep that user's conversations there.
+   * app's own ID for them, as attach's identify gives it), created on first
+   * use. Wakeshift keeps that user's conversations there.
    */
   async workspace(user: string, name: string): Promise<string> {
     return (await this.request<{ workspace: string }>("POST", "/workspaces", { external_id: user, name })).workspace;
@@ -738,13 +542,16 @@ export class Wakeshift {
       json = undefined;
     }
     if (!resp.ok) {
-      const e = json?.error ?? {};
-      throw new WakeshiftError(resp.status, e.code ?? "", e.message ?? (text.slice(0, 200) || resp.statusText), {
-        reason: typeof e.reason === "string" ? e.reason : undefined,
+      // Wakeshift's code, message and reason where it sent them as strings, else
+      // the body's start, else the status's text, as every SDK reads it (test/errors.json).
+      const e = json?.error !== null && typeof json?.error === "object" ? json.error : {};
+      const str = (v: unknown) => (typeof v === "string" ? v : "");
+      throw new WakeshiftError(resp.status, str(e.code), str(e.message) || text.slice(0, 200) || resp.statusText, {
+        reason: str(e.reason) || undefined,
       });
     }
     // A 2xx that isn't Wakeshift's JSON: a proxy's page, or a wrong core.
-    if (json === null || typeof json !== "object") {
+    if (json === null || typeof json !== "object" || Array.isArray(json)) {
       throw new WakeshiftError(
         resp.status,
         "bad_response",
