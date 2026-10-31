@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "./mcp.js";
 import { z } from "zod";
 import { Wakeshift, type Manifest } from "../src/index.js";
 

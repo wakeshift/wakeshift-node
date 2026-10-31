@@ -2,6 +2,23 @@
 
 What changed in each release of `@wakeshift/sdk`. 0.4.0 is the first published release: to start with it, read the [README](README.md). Its notes below, and the earlier releases', are for apps that ran the preview builds.
 
+## 0.6.0 (2026-10-31)
+
+### Breaking
+
+- Both MCP SDKs are optional peer dependencies: install the one you use. npm no longer installs `@modelcontextprotocol/sdk` for you, so list it in your app's own dependencies if your code imports it (as the install line has always said).
+
+### Added
+
+- **`@modelcontextprotocol/server` 2.x.** `attach` now takes an `McpServer` from the MCP TypeScript SDK 2.x (2.0 or later) as well as from `@modelcontextprotocol/sdk` 1.x, and tells them apart by the server you pass. Everything works the same on both: wrapped tools (Wakeshift's block in text and in `structuredContent`, rollback, `call.subscribe`), the built-in tools, MCP Events (`events/list`, `events/subscribe`, `events/unsubscribe`, `events/poll`), Claude Code's `wakeshift_wait` with `tasks/get` and `tasks/cancel`, and who's calling. 2.x speaks protocol 2026-07-28 itself, so with `createMcpHandler` clients on either revision connect with nothing more to set up. See [Using @modelcontextprotocol/server 2.x](README.md#using-modelcontextprotocolserver-2x).
+- On 2.x, `identify`, `events.native` and a wrapped tool's `call.extra` get 2.x's request context (`ctx`: the token in `ctx.http?.authInfo`), and are typed as it. On 1.x they get `extra`, as before.
+- `attached.inputs` and `attached.output` take a zod object as well as a shape (`attached.inputs(z.object({ table: z.string() }))`), as 2.x's `registerTool` does. Shapes work as before.
+
+### Changed
+
+- The SDK's published types no longer import either MCP SDK, so they load with only one installed. `attached.events` returns a callback typed from your tool's arguments and your MCP SDK's context; `ToolCallExtra` is now the parts of a request's context Wakeshift reads, whichever SDK serves it (a wrapped tool's `call.extra` is still your MCP SDK's own type). If you passed a `ToolCallExtra` where 1.x's `RequestHandlerExtra` is expected, use `call.extra` instead.
+- A JSON-RPC error from `attach`'s own methods (for example `events/subscribe` for an event your app doesn't offer) carries just its message, without the MCP SDK 1.x's `MCP error <code>: ` prefix in front of it.
+
 ## 0.5.2 (2026-10-30)
 
 ### Added

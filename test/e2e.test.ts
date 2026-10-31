@@ -5,16 +5,16 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { MCP, McpServer, headerOf } from "./mcp.js";
+import { Client } from "./mcp.js";
+import { InMemoryTransport } from "./mcp.js";
+import type { CallToolResult } from "./mcp.js";
 import { z } from "zod";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createHmac, randomBytes } from "node:crypto";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPServerTransport } from "./mcp.js";
+import { StreamableHTTPClientTransport } from "./mcp.js";
 import { Wakeshift, isCode, type AgentScope, type Manifest, type Subscription } from "../src/index.js";
 
 const harness = process.env.WAKESHIFT_SDK_HARNESS;
@@ -601,7 +601,8 @@ test("events against a real core: defined, served, emitted, bridged and native",
     { method: "events/subscribe", params: { name: "game.turn", arguments: { table: "t1" }, delivery: { mode: "webhook", url: hook.url, secret: hook.secret }, ttlMs: 3600000 } } as any,
     z.any() as any,
   )) as any;
-  assert.equal(nativeSub.resultType, "complete");
+  // The MCP SDK 2.x client drops resultType from a result on older revisions (the server sent it).
+  if (MCP === 1) assert.equal(nativeSub.resultType, "complete");
   assert.match(nativeSub.id, /^sub_/);
   await turn.emit({ table: "t1" }, { hole: ["Qh", "Qs"], toCall: 0 }, { to: "p3" });
   await eventually("p3's webhook", async () => (hook.got.length === 1 ? true : undefined), 15000);
@@ -644,7 +645,7 @@ test("wrapped tools against a real core", { skip: !harness && "set WAKESHIFT_SDK
   // A stateless server, one per request, as such apps run; X-User is who's calling.
   const http = createServer(async (req, res) => {
     const server = new McpServer({ name: "cards", version: "1" });
-    const attached = wake.attach(server, { identify: (extra) => ({ user: String(extra.requestInfo?.headers?.["x-user"] ?? "") || undefined }) });
+    const attached = wake.attach(server, { identify: (extra) => ({ user: headerOf(extra, "x-user") || undefined }) });
     server.registerTool(
       "join",
       { description: "Join a table (and the lobby)", inputSchema: attached.inputs({ table: z.string() }) },

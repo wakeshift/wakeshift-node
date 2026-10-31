@@ -48,10 +48,17 @@ export {
   type ToolCall,
   type ToolCallExtra,
   type ToolSubscribeOptions,
+  type WakeArgs,
   type WakeInputs,
+  type WakeInputsV3,
+  type WakeInputsV4,
   type WakeKey,
   type WakeOutputShape,
+  type WakeOutputV3,
+  type WakeOutputV4,
   type WakeShape,
+  type WrappedCallback,
   type WrappedResult,
 } from "./toolcall.js";
+export type { AuthInfo, CallToolResult, ContentBlock, HostContext, McpServerLike } from "./mcp.js";
 export { EXTENSION_KEY, TEXT_META, REVISION as EVENTS_REVISION } from "./spec.js";

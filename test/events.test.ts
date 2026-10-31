@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { McpError, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { MCP, McpServer, rawRpc } from "./mcp.js";
+import { Client } from "./mcp.js";
+import { InMemoryTransport } from "./mcp.js";
+import { McpError, type CallToolResult } from "./mcp.js";
 import { z } from "zod";
 import { readFileSync } from "node:fs";
 import {
@@ -260,6 +260,11 @@ async function connect(server: McpServer, clientName: string) {
   return client;
 }
 
+// wireResult is the last result the server sent the client, as it sent it.
+function wireResult(client: Client): any {
+  return sent.get(client)!.filter((m) => m && "result" in m).at(-1)?.result;
+}
+
 function text(r: unknown): string {
   return ((r as CallToolResult).content[0] as { text: string }).text;
 }
@@ -389,7 +394,7 @@ test("attach: a client that speaks MCP Events subscribes natively, and isn't off
   assert.deepEqual(names, ["list_subscriptions", "unsubscribe_events"]);
 
   const list = (await client.request({ method: "events/list", params: {} } as any, z.any() as any)) as any;
-  assert.equal(list.resultType, "complete");
+  assert.equal(wireResult(client).resultType, "complete");
   assert.equal(list.events[0].name, "chat.message");
   assert.deepEqual(list.events[0].delivery, ["webhook", "poll"]);
 
@@ -398,7 +403,7 @@ test("attach: a client that speaks MCP Events subscribes natively, and isn't off
     { method: "events/subscribe", params: { name: "chat.message", arguments: { channel: "eng" }, delivery, ttlMs: 3600000 } } as any,
     z.any() as any,
   )) as any;
-  assert.deepEqual(res, { resultType: "complete", id: "sub_1", refreshBefore: "2026-10-22T10:00:00Z", cursor: "c1", truncated: false });
+  assert.deepEqual(wireResult(client), { resultType: "complete", id: "sub_1", refreshBefore: "2026-10-22T10:00:00Z", cursor: "c1", truncated: false });
   const body = reqs.find((q) => q.path === "/events/subscribe")!.body;
   assert.equal(body.dialect, "chatgpt");
   assert.equal(body.call.user, "u1");
@@ -419,7 +424,8 @@ test("attach: a client that speaks MCP Events subscribes natively, and isn't off
   assert.equal((await rpcError({ name: "chat.message", arguments: { channel: "eng" }, delivery: { mode: "poll" } })).code, -32602, "ChatGPT has no Unsupported");
   // Unsubscribing nothing: ChatGPT gets the empty result it always has.
   const un = (await client.request({ method: "events/unsubscribe", params: { name: "chat.message", arguments: { channel: "eng" }, delivery } } as any, z.any() as any)) as any;
-  assert.deepEqual(un, { resultType: "complete" });
+  void un;
+  assert.deepEqual(wireResult(client), { resultType: "complete" });
   await client.close();
 });
 
@@ -671,7 +677,9 @@ test("the MCP Events wire format is every SDK's (test/mcp-events-wire.json)", as
       wake.attach(server, { identify: () => ({ user: "u1" }) });
       const client = await connect(server, "some-draft-client");
       const res = await client.request({ method: `events/${kind}`, params: c.params } as any, z.any() as any);
-      assert.deepEqual(res, c.result, `${kind}: ${c.name}: result`);
+      // As the server sent it: the MCP SDK 2.x client drops resultType from a result on older revisions.
+      void res;
+      assert.deepEqual(wireResult(client), c.result, `${kind}: ${c.name}: result`);
       const { call, dialect: _dialect, ...body } = reqs.find((q) => q.path === `/events/${kind}`)!.body;
       assert.equal(call.user, "u1", `${kind}: ${c.name}: the caller`);
       assert.deepEqual(body, c.core_request, `${kind}: ${c.name}: what Wakeshift is asked`);
@@ -679,23 +687,6 @@ test("the MCP Events wire format is every SDK's (test/mcp-events-wire.json)", as
     }
   }
 });
-
-// rawRpc sends JSON-RPC requests straight to server, with no initialize
-// first (protocol 2026-07-28 has none), returning each response.
-async function rawRpc(server: McpServer) {
-  const [a, b] = InMemoryTransport.createLinkedPair();
-  const waiting = new Map<number, (m: any) => void>();
-  b.onmessage = (m: any) => waiting.get(m.id)?.(m);
-  await server.connect(a);
-  await b.start();
-  let n = 0;
-  return (method: string, params: any = {}) =>
-    new Promise<any>((resolve) => {
-      const id = ++n;
-      waiting.set(id, resolve);
-      b.send({ jsonrpc: "2.0", id, method, params } as any);
-    });
-}
 
 const as2026 = (caps: any = {}) => ({
   _meta: {
@@ -705,32 +696,41 @@ const as2026 = (caps: any = {}) => ({
   },
 });
 
-// Protocol 2026-07-28 on the MCP SDK 1.x (discover.ts): server/discover,
+// Protocol 2026-07-28: on the MCP SDK 1.x (discover.ts) server/discover,
 // resultType on every 2026-07-28 result (and only those), the version the
-// transport accepts, and no subscribe_events for a request that declares the
-// extension itself.
+// transport accepts; on 2.x its own. On both, no subscribe_events for a
+// request that declares the extension itself.
 test("attach: a stateless server answers protocol 2026-07-28 clients", async () => {
   const { wake } = fakeCore();
   chatEvent(wake);
-  const server = new McpServer({ name: "chat", version: "1.0.0" }, { instructions: "A chat app." });
-  wake.attach(server, { identify: () => ({ user: "u1" }) });
-  server.registerTool("ping", { description: "Ping" }, async () => ({ content: [{ type: "text", text: "pong" }] }));
-  const rpc = await rawRpc(server);
-  const { SUPPORTED_PROTOCOL_VERSIONS } = await import("@modelcontextprotocol/sdk/types.js");
-  assert.ok(SUPPORTED_PROTOCOL_VERSIONS.includes("2026-07-28"), "the transport takes the version's header");
+  // A server per request, as a stateless app makes them (2.x: createMcpHandler).
+  const make = () => {
+    const server = new McpServer({ name: "chat", version: "1.0.0" }, { instructions: "A chat app." });
+    wake.attach(server, { identify: () => ({ user: "u1" }) });
+    server.registerTool("ping", { description: "Ping" }, async () => ({ content: [{ type: "text", text: "pong" }] }));
+    return server;
+  };
+  const rpc = await rawRpc(make);
+  if (MCP === 1) {
+    const { SUPPORTED_PROTOCOL_VERSIONS } = await import("@modelcontextprotocol/sdk/types.js");
+    assert.ok(SUPPORTED_PROTOCOL_VERSIONS.includes("2026-07-28"), "the transport takes the version's header");
+  }
 
   const d = (await rpc("server/discover", as2026())).result;
   assert.equal(d.resultType, "complete");
   assert.equal(d.supportedVersions[0], "2026-07-28");
-  assert.ok(d.supportedVersions.includes("2025-11-25"));
+  // 1.x's list is the SDK's own (older revisions too); 2.x lists only 2026-07-28 and later there.
+  if (MCP === 1) assert.ok(d.supportedVersions.includes("2025-11-25"));
   assert.deepEqual(d.capabilities.events, { listChanged: false });
   assert.deepEqual(d.capabilities.extensions[EXTENSION_KEY], { listChanged: false });
   assert.ok(d.capabilities.tools);
   assert.deepEqual(d._meta["io.modelcontextprotocol/serverInfo"], { name: "chat", version: "1.0.0" });
   assert.equal(d.instructions, "A chat app.");
+  assert.equal(d.ttlMs, 0);
 
   const tools = (await rpc("tools/list", as2026())).result;
   assert.equal(tools.resultType, "complete");
+  assert.equal(tools.cacheScope, "private", "tools/list differs per request: this client's only");
   assert.ok(tools.tools.some((t: any) => t.name === "subscribe_events"), "a client that doesn't declare the extension is offered it");
   const nativeTools = (await rpc("tools/list", as2026({ extensions: { [EXTENSION_KEY]: {} } }))).result;
   assert.deepEqual(nativeTools.tools.map((t: any) => t.name).sort(), ["list_subscriptions", "ping", "unsubscribe_events"]);
@@ -743,4 +743,18 @@ test("attach: a stateless server answers protocol 2026-07-28 clients", async () 
   // An older client's results are as they were.
   const old = (await rpc("tools/list", {})).result;
   assert.equal(old.resultType, undefined);
+});
+
+test("attach: a tools/list cache hint the app set stays, scoped to the client (MCP SDK 2.x)", { skip: MCP !== 2 }, async () => {
+  const { wake } = fakeCore();
+  chatEvent(wake);
+  const make = () => {
+    const server = new McpServer({ name: "chat", version: "1.0.0" }, { cacheHints: { "tools/list": { ttlMs: 60000, cacheScope: "public" } } } as any);
+    wake.attach(server, { identify: () => ({ user: "u1" }) });
+    return server;
+  };
+  const rpc = await rawRpc(make);
+  const tools = (await rpc("tools/list", as2026())).result;
+  assert.equal(tools.ttlMs, 60000);
+  assert.equal(tools.cacheScope, "private");
 });

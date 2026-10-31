@@ -1,7 +1,7 @@
-import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { AnySchema } from "@modelcontextprotocol/sdk/server/zod-compat.js";
 import { WakeshiftError } from "./errors.js";
+import type { AnySchema } from "./zod.js";
+import type { HostContext, McpServerLike } from "./mcp.js";
+import { v1Req, type Req } from "./host.js";
 import { WakeEvent, attachEvents, type AttachOptions, type EventOptions, type EventTypeManifest } from "./events.js";
 import type { Attached } from "./toolcall.js";
 import { parseKey, signAssertion, type AppKey, isTestKey } from "./key.js";
@@ -201,13 +201,9 @@ export interface ToolExtra {
   requestInfo?: { headers?: Record<string, string | string[] | undefined> };
 }
 
-// userAgentOf is the User-Agent of the HTTP request a tool call came in
-// ("" if there's none, e.g. over stdio).
-function userAgentOf(extra: ToolExtra | undefined): string {
-  const headers = extra?.requestInfo?.headers;
-  if (!headers) return "";
-  const v = headers["user-agent"] ?? headers["User-Agent"];
-  return (Array.isArray(v) ? v[0] : v) ?? "";
+/** @internal The User-Agent of the HTTP request a tool call came in ("" if there's none, e.g. over stdio). */
+export function userAgentOf(req: Req): string {
+  return req.header("user-agent") || req.header("User-Agent");
 }
 
 /** @internal Packs a tool call as Wakeshift takes it: empty fields left out, the agent's claims trimmed. */
@@ -239,17 +235,18 @@ export function packCall(c: {
  * others): its _meta and User-Agent, the client's name, the user, and
  * session_key, harness and conversation_id from its arguments.
  */
-export function toolCallOf(extra: ToolExtra | undefined, client: string, user: string | undefined, args: Record<string, unknown>, tool: string): Call {
+export function toolCallOf(extra: Req | ToolExtra | undefined, client: string, user: string | undefined, args: Record<string, unknown>, tool: string): Call {
+  const req = v1Req(extra); // a request already read passes through
   return packCall({
-    meta: extra?._meta,
+    meta: req.meta,
     clientName: client,
     user,
     session: str(args, SESSION_ARG),
-    userAgent: userAgentOf(extra),
+    userAgent: userAgentOf(req),
     harness: str(args, HARNESS_ARG),
     conversation: str(args, CONVERSATION_ARG),
     tool,
-    tasks: takesTasks(extra?._meta, extra),
+    tasks: takesTasks(req.meta, req),
   });
 }
 
@@ -482,8 +479,12 @@ export class Wakeshift {
    * It returns the handle your own tools use to subscribe the conversation
    * calling them: wrap a tool's callback with attached.events, and give it
    * Wakeshift's arguments with attached.inputs.
+   *
+   * server is an McpServer from @modelcontextprotocol/server 2.x or
+   * @modelcontextprotocol/sdk 1.x; identify gets that SDK's own request
+   * context (2.x's ctx, 1.x's extra).
    */
-  attach(server: McpServer, opts: AttachOptions = {}): Attached {
+  attach<S extends McpServerLike>(server: S, opts: AttachOptions<HostContext<S>> = {}): Attached<HostContext<S>> {
     const attached = attachEvents(this, server, [...this.events.values()], opts);
     this.serving = true; // the manifest is sent automatically from now on
     return attached;

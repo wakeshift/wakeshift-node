@@ -2,13 +2,15 @@
 
 Let agents subscribe to things in your app. You define the events your app offers, serve them on your MCP server, and emit them when they happen; Wakeshift wakes every subscribed agent, whether it's Claude Code, Codex, ChatGPT or another. Your events follow MCP Events: clients that speak it subscribe natively, and Wakeshift bridges every other agent. You don't deal with harnesses.
 
-Node 22 or later. The package is ESM-only: load it with `import`, from an ES module (`"type": "module"`, or a `.mjs` or `.mts` file). It has no CommonJS build, so `require("@wakeshift/sdk")` works only where Node can require ES modules. Peer dependencies: `@modelcontextprotocol/sdk` (1.23 or later: the first that takes zod 4) and `zod` (3.25 or later, or 4). Import `z` from `"zod"`, not `"zod/v4"`: the SDK's schemas are built from `"zod"`, and the MCP SDK refuses a schema that mixes the two.
+Node 22 or later. The package is ESM-only: load it with `import`, from an ES module (`"type": "module"`, or a `.mjs` or `.mts` file). It has no CommonJS build, so `require("@wakeshift/sdk")` works only where Node can require ES modules. It works with either MCP TypeScript SDK: `@modelcontextprotocol/sdk` 1.x (1.23 or later: the first that takes zod 4) or `@modelcontextprotocol/server` 2.x ([below](#using-modelcontextprotocolserver-2x)). Its peer dependencies are the one you use and `zod` (3.25 or later, or 4; 4.2 or later with 2.x). Import `z` from `"zod"`, not `"zod/v4"`: the SDK's schemas are built from `"zod"`, and the MCP SDK refuses a schema that mixes the two.
 
 ## Install
 
 ```sh
 npm install @wakeshift/sdk @modelcontextprotocol/sdk zod
 ```
+
+On `@modelcontextprotocol/server` 2.x, install that instead of `@modelcontextprotocol/sdk`.
 
 Install the package, not a checkout of this repository (a `file:` dependency): a `file:` dependency links the directory along with its `node_modules`, so the SDK can load its own development copy of zod instead of yours, and the MCP SDK then fails with "Mixed Zod versions detected in object shape". To try a change of your own, `npm pack` and install the tarball it writes.
 
@@ -153,6 +155,57 @@ server.registerTool(
 
 A wrapped tool that subscribes to nothing, like `look`, still gets what Wakeshift has for the conversation calling it: occurrences held for an agent Wakeshift can't wake, or what it needs to reconnect. Usually that's nothing.
 
+## Using @modelcontextprotocol/server 2.x
+
+`attach` takes an `McpServer` from either MCP TypeScript SDK: `@modelcontextprotocol/sdk` 1.x or `@modelcontextprotocol/server` 2.x (2.0 or later). It tells them apart by the server you pass, and everything on this page works the same on both.
+
+```sh
+npm install @wakeshift/sdk @modelcontextprotocol/server @modelcontextprotocol/node zod
+```
+
+2.x serves HTTP with `createMcpHandler`, which makes a server for each request, so attach in the function that makes it. Define your events once, outside it:
+
+```ts
+import { createServer } from "node:http"
+import { McpServer, createMcpHandler } from "@modelcontextprotocol/server"
+import { toNodeHandler } from "@modelcontextprotocol/node"
+import { z } from "zod"
+import { Wakeshift } from "@wakeshift/sdk"
+
+const wake = new Wakeshift({ key: process.env.WAKESHIFT_KEY! })
+
+const ciFinished = wake.defineEvent("ci.finished", {
+  description: "CI finished on a GitHub repo",
+  args: z.object({ owner: z.string(), repo: z.string() }),
+  payload: z.object({ branch: z.string(), conclusion: z.string() }),
+  text: (run, { owner, repo }) => `CI ${run.conclusion} on ${owner}/${repo} ${run.branch}`,
+})
+
+const mcp = createMcpHandler(() => {
+  const server = new McpServer({ name: "ci-bot", version: "1.0.0" })
+  // identify gets 2.x's request context: your auth middleware's verified token is ctx.http?.authInfo.
+  const attached = wake.attach(server, { identify: (ctx) => ({ user: myUser(ctx.http?.authInfo) }) })
+  server.registerTool(
+    "watch_ci",
+    { description: "Watch CI on a repo", inputSchema: attached.inputs(z.object({ owner: z.string(), repo: z.string() })) },
+    attached.events("watch_ci", async ({ owner, repo }, call) => {
+      await call.subscribe(ciFinished, { owner, repo }, { reason: `Watching ${owner}/${repo}` })
+      return `Watching CI on ${owner}/${repo}.`
+    }),
+  )
+  return server
+})
+
+createServer(toNodeHandler(mcp)).listen(3000)
+```
+
+What's different on 2.x:
+
+- `identify`, `events.native` and a wrapped tool's `call.extra` get 2.x's request context (`ctx`) instead of 1.x's `extra`: the verified token is `ctx.http?.authInfo`, and the HTTP request is `ctx.http?.req`.
+- `attached.inputs` and `attached.output` take a zod object, as 2.x's `registerTool` does: `attached.inputs(z.object({ … }))`. A bare shape works too.
+- Write your schemas, events' included, with zod 4 (4.2 or later), which 2.x requires.
+- 2.x speaks MCP protocol 2026-07-28 itself, and `createMcpHandler` answers older clients too, so clients on either revision connect with nothing more to set up. Wakeshift lists its tools for each request's client, so `tools/list` is cached by that client only, whatever cache hint you set for it.
+
 ## Reference
 
 ### `new Wakeshift({ key, core?, fetch?, timeoutMs?, onWarning? })`
@@ -201,7 +254,8 @@ The guides and the full reference are at [wakeshift.ai/docs](https://wakeshift.a
 ```sh
 npm ci
 npm run typecheck
-npm test          # unit tests (node:test) and the README's examples
+npm test          # unit tests (node:test) on @modelcontextprotocol/sdk 1.x, and the README's examples
+npm run test:v2   # the same unit tests on @modelcontextprotocol/server 2.x
 npm run build     # dist/
 ```
 

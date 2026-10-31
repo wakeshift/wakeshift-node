@@ -8,11 +8,11 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { readFileSync } from "node:fs";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { McpError, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { McpServer, headerOf } from "./mcp.js";
+import { Client } from "./mcp.js";
+import { StreamableHTTPClientTransport } from "./mcp.js";
+import { StreamableHTTPServerTransport } from "./mcp.js";
+import { McpError, type CallToolResult } from "./mcp.js";
 import { z } from "zod";
 import { CallEnded, Wakeshift, WakeshiftError, isCode, type Attached, type Subscription, type ToolCall } from "../src/index.js";
 import { CONVERSATION_META, mergeBlock, namesConversation, withWakeshiftField, type CallAddition } from "../src/toolcall.js";
@@ -130,7 +130,7 @@ async function wrapped(
         opts.identify === false
           ? undefined
           : (extra) => {
-              const user = String(extra.requestInfo?.headers?.authorization ?? "").replace(/^Bearer /, "") || undefined;
+              const user = headerOf(extra, "authorization").replace(/^Bearer /, "") || undefined;
               return { user, client: user ? opts.clients?.[user] : undefined };
             },
       events: opts.native ? { native: opts.native } : undefined,
@@ -530,7 +530,7 @@ test("native callers aren't subscribed: the block names the events to subscribe 
         }),
       );
     },
-    { native: (extra) => extra.requestInfo?.headers?.["x-house"] === "yes" },
+    { native: (extra) => headerOf(extra, "x-house") === "yes" },
   );
   w.core.addition = { text: 'To be woken by game.turn with {"table":"oak"}, subscribe to it (MCP Events).' };
   w.core.native = [
