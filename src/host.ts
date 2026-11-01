@@ -67,6 +67,10 @@ export type ZodApi = { string(): any; record(k: any, v: any): any; any(): any; e
 export interface Host {
   /** The MCP SDK's major version: 1 (@modelcontextprotocol/sdk) or 2 (@modelcontextprotocol/server). */
   readonly version: 1 | 2;
+  /** The framework adapter serving it ("mastra", "xmcp"), or undefined for attach on an McpServer. */
+  readonly framework?: string;
+  /** Whether the server serves MCP Events (events/*): only then does a wrapped call have native callers. */
+  readonly servesEvents: boolean;
   readonly server: McpServerLike;
   /** The zod attach's own tools are written with: zod 4 for 2.x, which takes only zod 4. */
   readonly zod: ZodApi;
@@ -103,13 +107,86 @@ function lowOf(server: McpServerLike): any {
  * Server has projectCallToolResult, which 1.x's lacks.
  */
 export function hostOf(server: unknown): Host {
-  const low = (server as { server?: any } | null)?.server;
-  if (!low || typeof low.setRequestHandler !== "function" || typeof (server as { registerTool?: unknown }).registerTool !== "function") {
-    throw new Error(
-      "wakeshift: attach takes an McpServer, from @modelcontextprotocol/server 2.x or @modelcontextprotocol/sdk 1.x (@modelcontextprotocol/sdk/server/mcp.js)",
-    );
-  }
+  if (!isMcpServer(server)) throw new Error(unsupportedServer(server));
+  const low = (server as { server: any }).server;
   return typeof low.projectCallToolResult === "function" ? new V2Host(server as McpServerLike) : new V1Host(server as McpServerLike);
+}
+
+/** Where the docs list the MCP server frameworks Wakeshift works with, and how. */
+export const FRAMEWORKS_DOCS = "https://wakeshift.ai/docs/frameworks";
+
+// isMcpServer: an McpServer from either MCP SDK (its low-level server, and registerTool).
+function isMcpServer(server: unknown): boolean {
+  const low = (server as { server?: any } | null | undefined)?.server;
+  return !!low && typeof low.setRequestHandler === "function" && typeof (server as { registerTool?: unknown }).registerTool === "function";
+}
+
+const TAKES = "wakeshift: attach takes an McpServer, from @modelcontextprotocol/server 2.x or @modelcontextprotocol/sdk 1.x (@modelcontextprotocol/sdk/server/mcp.js)";
+
+/**
+ * @internal What attach says when it's given something other than an
+ * McpServer: what it got, what it takes, and, for a framework it knows,
+ * what to do instead.
+ */
+export function unsupportedServer(server: unknown): string {
+  const got = describe(server);
+  const hint = frameworkHint(server);
+  return `${TAKES}, and got ${got}.${hint ? " " + hint : ""} Frameworks Wakeshift works with, and how: ${FRAMEWORKS_DOCS}`;
+}
+
+function has(o: unknown, ...fns: string[]): boolean {
+  return !!o && (typeof o === "object" || typeof o === "function") && fns.every((f) => typeof (o as Record<string, unknown>)[f] === "function");
+}
+
+function ctorName(o: unknown): string {
+  const name = (o as { constructor?: { name?: unknown } } | null)?.constructor?.name;
+  return typeof name === "string" && name && name !== "Object" ? name : "";
+}
+
+// describe names what attach was given: its class, else its type.
+function describe(server: unknown): string {
+  if (server === null) return "null";
+  if (server === undefined) return "undefined";
+  if (typeof server !== "object") return `a ${typeof server}`;
+  const name = ctorName(server);
+  return name ? `a ${name}` : "an object";
+}
+
+// frameworkHint says what to do for a server from a framework attach knows
+// but can't take: "" for any other.
+function frameworkHint(server: unknown): string {
+  if (!server || typeof server !== "object") return "";
+  // Mastra's MCPServer (@mastra/mcp): builds its MCP server per request, inside.
+  if (has(server, "startHTTP", "convertTools") || (has(server, "startHTTP", "startStdio") && "toolActions" in server)) {
+    return "This looks like Mastra's MCPServer (@mastra/mcp), which builds its MCP server inside: use attachMastra from @wakeshift/sdk/mastra.";
+  }
+  // punkpeye's fastmcp: its FastMCP, or a session of it.
+  if (has(server, "addTool", "start") && ctorName(server) === "FastMCP") {
+    return "This looks like fastmcp's FastMCP (punkpeye), which Wakeshift doesn't support: it refuses MCP protocol 2026-07-28.";
+  }
+  if (ctorName(server) === "FastMCPSession") {
+    return "This looks like a fastmcp session (punkpeye), which Wakeshift doesn't support: fastmcp refuses MCP protocol 2026-07-28.";
+  }
+  // A low-level Server, not the McpServer around it.
+  if (has(server, "setRequestHandler", "connect") && !has(server, "registerTool")) {
+    return "This is a low-level MCP Server: pass the McpServer instead (new McpServer(…), whose .server it is).";
+  }
+  // Cloudflare's McpAgent: its server is the McpServer.
+  if ("server" in server && has(server, "init") && isMcpServer((server as { server: unknown }).server)) {
+    return "This looks like a Cloudflare McpAgent: pass its McpServer (this.server).";
+  }
+  return "";
+}
+
+/**
+ * @internal attach's error when the server refused Wakeshift's
+ * capabilities: an McpServer already connected to a transport, or
+ * whatever else its MCP SDK said.
+ */
+export function capabilitiesError(host: Host, err: unknown): Error {
+  const low = (host.server as { server?: { transport?: unknown } }).server;
+  if (low?.transport) return new Error("wakeshift: call attach before connecting the server to a transport", { cause: err });
+  return new Error(`wakeshift: attach couldn't add Wakeshift's capabilities to this server: ${String((err as Error)?.message ?? err)}`, { cause: err });
 }
 
 // headerOf reads a header from a plain record (1.x's requestInfo.headers).
@@ -159,6 +236,7 @@ export function v2Req(raw: unknown): Req {
 }
 
 abstract class BaseHost {
+  readonly servesEvents: boolean = true;
   constructor(readonly server: McpServerLike) {}
   protected get low(): any {
     return lowOf(this.server);
@@ -258,6 +336,130 @@ function objectFromV4Shape(shape: ZodRawShapeCompat): unknown {
   const values = Object.values(shape);
   if (values.length === 0) return z4.object({});
   return z4.object(shape as Record<string, z4.ZodType>);
+}
+
+// ── Framework adapters (mastra.ts, xmcp.ts) ─────────────────────────────
+
+/**
+ * @internal The Host for a low-level Server from @modelcontextprotocol/server
+ * 2.x, as a framework builds one for each request and fills in itself
+ * (Mastra's MCPServer). It has no McpServer to register attach's own
+ * tools on, so they're kept here and served from its handler map, beneath
+ * every other wrapper attach adds: tools/list lists them after the
+ * framework's own, and tools/call answers them. Everything else is
+ * V2Host's, on the same map.
+ */
+export function lowServerHost(low: any, framework: string): Host {
+  if (!low || typeof low.setRequestHandler !== "function" || !(low._requestHandlers instanceof Map)) {
+    throw new Error(`wakeshift: ${framework} built an MCP server Wakeshift can't serve (no request handlers it can wrap): check for a newer @wakeshift/sdk`);
+  }
+  return new LowV2Host(new ToolRegistry(low), framework);
+}
+
+interface OwnTool {
+  description: string;
+  annotations?: Record<string, unknown>;
+  schema: z4.ZodObject;
+  cb: (args: Record<string, unknown>, raw: unknown) => Promise<CallToolResult>;
+  enabled: boolean;
+}
+
+// ToolRegistry stands in for an McpServer around a low-level Server: what
+// attach registers on it is listed and called through the server's handlers.
+class ToolRegistry {
+  readonly tools = new Map<string, OwnTool>();
+  constructor(readonly server: any) {
+    const handlers = server._requestHandlers as Map<string, Handler>;
+    const list = handlers.get("tools/list");
+    const call = handlers.get("tools/call");
+    if (list) {
+      Map.prototype.set.call(handlers, "tools/list", async (request: any, raw: any) => {
+        const out = await list(request, raw);
+        const own = [...this.tools].filter(([, t]) => t.enabled);
+        if (own.length === 0 || !out || !Array.isArray(out.tools)) return out;
+        const listed = new Set(out.tools.map((t: { name?: unknown }) => t?.name));
+        return { ...out, tools: [...out.tools, ...own.filter(([name]) => !listed.has(name)).map(([name, t]) => listedTool(name, t))] };
+      });
+    }
+    if (call) {
+      Map.prototype.set.call(handlers, "tools/call", async (request: any, raw: any) => {
+        const t = this.tools.get(request?.params?.name);
+        if (!t || !t.enabled) return call(request, raw);
+        const parsed = await t.schema.safeParseAsync(request?.params?.arguments ?? {});
+        if (!parsed.success) {
+          return { isError: true, content: [{ type: "text", text: `Invalid arguments for tool ${request.params.name}: ${parsed.error.message}` }] };
+        }
+        return t.cb(parsed.data as Record<string, unknown>, raw);
+      });
+    }
+  }
+  registerTool(name: string, config: { description: string; inputSchema: z4.ZodObject; annotations?: Record<string, unknown> }, cb: OwnTool["cb"]) {
+    const t: OwnTool = { description: config.description, annotations: config.annotations, schema: config.inputSchema, cb, enabled: true };
+    this.tools.set(name, t);
+    return {
+      enable: () => void (t.enabled = true),
+      disable: () => void (t.enabled = false),
+    };
+  }
+}
+
+function listedTool(name: string, t: OwnTool): Record<string, unknown> {
+  const out: Record<string, unknown> = { name, description: t.description, inputSchema: z4.toJSONSchema(t.schema, { io: "input" }) };
+  if (t.annotations) out.annotations = t.annotations;
+  return out;
+}
+
+class LowV2Host extends V2Host {
+  constructor(
+    registry: ToolRegistry,
+    readonly framework: string,
+  ) {
+    super(registry as unknown as McpServerLike);
+  }
+  registeredTool(): null {
+    return null; // the framework's own tools are its own
+  }
+}
+
+/** @internal How a framework adapter that has no MCP server (xmcp's) reads a request and registers attach's own tools. */
+export interface ToolsOnlyOptions {
+  framework: string;
+  /** A tool callback's request context, as the framework passes it. */
+  req(raw: unknown): Req;
+  /** Where attach's own tools go: the adapter serves them its framework's way. */
+  registerTool(name: string, config: ToolRegistration, cb: (args: Record<string, unknown>, raw: unknown) => Promise<CallToolResult>): void;
+}
+
+/**
+ * @internal The Host for a framework that keeps its MCP server to itself
+ * (xmcp): attach's own tools go to the adapter, the request is read its
+ * way, and there are no handlers to wrap, so no MCP Events, no wait tool
+ * and no tools/list changes. Its tools are on @modelcontextprotocol/server
+ * 2.x, so they're written in zod 4.
+ */
+export function toolsOnlyHost(opts: ToolsOnlyOptions): Host {
+  const noop = () => {};
+  return {
+    version: 2,
+    framework: opts.framework,
+    servesEvents: false,
+    server: { server: {}, registerTool: noop } as unknown as McpServerLike,
+    zod: z4 as unknown as ZodApi,
+    req: opts.req,
+    registerCapabilities: noop,
+    registerTool(name, config, cb) {
+      opts.registerTool(name, config, cb);
+      return { enable: noop, disable: noop };
+    },
+    setMethod: noop,
+    setTaskMethod: noop,
+    handlers: () => null,
+    clientName: () => undefined,
+    clientCapabilities: () => undefined,
+    onInitialized: noop,
+    registeredTool: () => null,
+    validOutput: async () => true,
+  };
 }
 
 /** The protocol revision that has server/discover, MCP Events and the tasks extension. */

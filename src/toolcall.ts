@@ -383,8 +383,8 @@ export interface AttachContext {
   warnOnce(key: string, message: string): void;
 }
 
-/** One tools/call of a wrapped tool: what its handler subscribed, for the block and the rollback. */
-class CallScope<C> implements ToolCall<C> {
+/** @internal One tools/call of a wrapped tool: what its handler subscribed, for the block and the rollback. */
+export class CallScope<C> implements ToolCall<C> {
   user: string | undefined;
   tool: string;
   native = false;
@@ -614,6 +614,8 @@ function isRecord(v: unknown): v is Record<string, unknown> {
  * _meta's). conversation is ChatGPT's conversation, when it names one.
  */
 export function nativeOf(at: Pick<AttachContext, "host" | "clientOf" | "events">, extra: unknown, identified?: string): { native: boolean; conversation: string | null } {
+  // A server that doesn't serve MCP Events (an xmcp app's) has no native callers.
+  if (!at.host.servesEvents) return { native: false, conversation: null };
   const req = at.host.req(extra);
   const meta = (req.meta ?? {}) as Record<string, unknown>;
   const conversation = typeof meta["openai/session"] === "string" && meta["openai/session"] ? (meta["openai/session"] as string) : null;
@@ -720,22 +722,49 @@ export class Attached<C = any> {
         throw new Error(`wakeshift: the tool ${name} doesn't take Wakeshift's arguments: make its inputSchema with attached.inputs(…)`);
       }
       outputSchema = tool.outputSchema;
-    } else {
+    } else if (!host.framework) {
       this.at.warnOnce("internals", "wakeshift: this MCP SDK keeps its tools where Wakeshift can't read them, so wrapped tools' registration and output aren't checked");
     }
-    const str = (k: string) => (typeof input[k] === "string" && (input[k] as string) ? (input[k] as string) : undefined);
-    const call = new CallScope<C>(this.at, name, extra, { session: str(SESSION_ARG), harness: str(HARNESS_ARG), conversation: str(CONVERSATION_ARG) });
-    const appArgs: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(input)) if (!(WAKE_KEYS as readonly string[]).includes(k)) appArgs[k] = v;
-
+    const { call, appArgs } = this.begin(name, input, extra);
     let result: WrappedResult;
     try {
       result = await handler(appArgs, call);
     } catch (err) {
-      await call.end();
-      await call.rollback();
+      await this.fail(call);
       throw err;
     }
+    return this.finish(call, result, outputSchema);
+  }
+
+  /**
+   * @internal The first half of a wrapped call: the call's scope, from the
+   * tool's arguments (Wakeshift's three among them) and the request's
+   * context, and the app's own arguments. finish (or fail) ends it.
+   */
+  begin(name: string, input: Record<string, unknown>, extra: C): { call: CallScope<C>; appArgs: Record<string, unknown> } {
+    const str = (k: string) => (typeof input[k] === "string" && (input[k] as string) ? (input[k] as string) : undefined);
+    const call = new CallScope<C>(this.at, name, extra, { session: str(SESSION_ARG), harness: str(HARNESS_ARG), conversation: str(CONVERSATION_ARG) });
+    const appArgs: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(input ?? {})) if (!(WAKE_KEYS as readonly string[]).includes(k)) appArgs[k] = v;
+    return { call, appArgs };
+  }
+
+  /** @internal Ends a call whose handler threw: what it subscribed is rolled back. */
+  async fail(call: CallScope<C>): Promise<void> {
+    await call.end();
+    await call.rollback();
+  }
+
+  /**
+   * @internal The second half of a wrapped call: the handler's result with
+   * Wakeshift's block, or rolled back (a failed result, a canceled call, an
+   * output its schema refuses). outputSchema is the tool's, as its MCP SDK
+   * checks it (undefined: not checked here).
+   */
+  async finish(call: CallScope<C>, result: WrappedResult, outputSchema: unknown): Promise<CallToolResult> {
+    const host = this.at.host;
+    const name = call.tool;
+    const extra = call.extra;
     await call.end();
     // Rollback is decided from the final result, the one the client would
     // receive: MCP validates the output after this callback returns, so
@@ -778,6 +807,11 @@ export class Attached<C = any> {
    * sets the handler when the first tool is registered, perhaps after
    * attach, so a later set is wrapped too (as tasks.ts does).
    */
+  /** @internal Marks name as a wrapped tool, for tools/list (a framework adapter's tool, wrapped outside this handle). */
+  markWrapped(name: string): void {
+    if (!this.wrapped.has(name)) this.wrapped.set(name, true);
+  }
+
   amendToolsList(): void {
     type Handler = (request: any, extra: any) => Promise<any>;
     const handlers = this.at.host.handlers();

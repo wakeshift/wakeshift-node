@@ -491,6 +491,16 @@ export class Wakeshift {
   }
 
   /**
+   * @internal For a framework adapter (@wakeshift/sdk/mastra, /xmcp): the
+   * defined events, and from now on this process serves the app's tools,
+   * so the manifest is sent automatically, as after attach.
+   */
+  serveEvents(): WakeEvent[] {
+    this.serving = true;
+    return [...this.events.values()];
+  }
+
+  /**
    * @internal Sends the manifest with the defined events, once (again after
    * a defineEvent), from a process that serves the app's tools (attach). A
    * process that only emits never sends it: its events may be fewer, or

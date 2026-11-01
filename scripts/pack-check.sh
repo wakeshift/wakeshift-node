@@ -19,8 +19,16 @@ which=${PACK_CHECK_MCP:-both}
 cd "$sdk"
 tgz="$dir/$(npm pack --silent --pack-destination "$dir" | tail -1)"
 
-# The published types name neither MCP SDK, so they load with either one missing.
 tar -xzf "$tgz" -C "$dir"
+
+# No source maps: they carried the whole TypeScript source inline, for a
+# src/ the package doesn't ship.
+if ls "$dir"/package/dist/*.map >/dev/null 2>&1; then
+  echo "the package ships source maps: $(ls "$dir"/package/dist/*.map | xargs -n1 basename | tr '\n' ' ')" >&2
+  exit 1
+fi
+
+# The published types name neither MCP SDK, so they load with either one missing.
 if grep -lE "(from |import\()[\"']@modelcontextprotocol/" "$dir"/package/dist/*.d.ts >/dev/null 2>&1; then
   echo "the published types import an MCP SDK: $(grep -lE "(from |import\()[\"']@modelcontextprotocol/" "$dir"/package/dist/*.d.ts | xargs -n1 basename | tr '\n' ' ')" >&2
   exit 1

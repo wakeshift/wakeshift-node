@@ -206,6 +206,83 @@ What's different on 2.x:
 - Write your schemas, events' included, with zod 4 (4.2 or later), which 2.x requires.
 - 2.x speaks MCP protocol 2026-07-28 itself, and `createMcpHandler` answers older clients too, so clients on either revision connect with nothing more to set up. Wakeshift lists its tools for each request's client, so `tools/list` is cached by that client only, whatever cache hint you set for it.
 
+## Mastra
+
+Mastra's `MCPServer` (`@mastra/mcp` 2.7 or later) builds its MCP server itself, so it has its own entry point, `@wakeshift/sdk/mastra` (0.7.0 or later). Wrap the `execute` of each Mastra tool that subscribes, and serve your `MCPServer` with it:
+
+```ts
+import { createTool } from "@mastra/core/tools"
+import { MCPServer } from "@mastra/mcp"
+import { z } from "zod"
+import { Wakeshift } from "@wakeshift/sdk"
+import { attachMastra } from "@wakeshift/sdk/mastra"
+
+const wake = new Wakeshift({ key: process.env.WAKESHIFT_KEY! })
+const ciFinished = wake.defineEvent("ci.finished", {
+  description: "CI finished on a GitHub repo",
+  args: z.object({ owner: z.string(), repo: z.string() }),
+  payload: z.object({ branch: z.string(), conclusion: z.string() }),
+  text: (run, { owner, repo }) => `CI ${run.conclusion} on ${owner}/${repo} ${run.branch}`,
+})
+
+// identify gets the request's MCP context: the verified token is ctx.http?.authInfo.
+const attached = attachMastra(wake, { identify: (ctx) => ({ user: myUser(ctx.http?.authInfo) }) })
+
+const watchCi = createTool({
+  id: "watch_ci",
+  description: "Watch CI on a repo",
+  inputSchema: attached.inputs(z.object({ owner: z.string(), repo: z.string() })),
+  execute: attached.events("watch_ci", async ({ owner, repo }: { owner: string; repo: string }, call) => {
+    await call.subscribe(ciFinished, { owner, repo }, { reason: `Watching ${owner}/${repo}` })
+    return `Watching CI on ${owner}/${repo}.`
+  }),
+})
+
+const server = attached.serve(new MCPServer({ id: "ci-bot", name: "CI bot", version: "1.0.0", tools: { watch_ci: watchCi } }))
+```
+
+Serve it as Mastra's docs do (`server.startHTTP`, `server.startStdio`, or registered on your `Mastra` instance). It gets everything `attach` gives: the built-in tools, MCP Events for clients that speak it, Claude Code's `wakeshift_wait`, and Wakeshift's addition in your wrapped tools' results.
+
+- `attached.events(name, handler)` wraps a tool's `execute` for the tool your `MCPServer` serves under `name` (its key in `tools`). `handler(args, call, context)` returns what a Mastra tool returns: a string, or your output. Run outside an MCP client's call (by an agent, a workflow or Studio), `call.subscribe` throws.
+- Wrapped tools answer in one call: a Mastra task or a request for input from one ends what it subscribed.
+- Your own MCP Events (`MCPServer`'s `events`) keep working: `events/list` lists yours and Wakeshift's, and each request goes to whichever serves the event it names.
+- `attached.serve` checks your `@mastra/mcp` version and throws for one outside 2.7–2.x.
+
+## xmcp
+
+xmcp builds its MCP server from your tool files, so Wakeshift comes in through them, with `@wakeshift/sdk/xmcp` (0.7.0 or later):
+
+```ts
+import { z } from "zod"
+import { Wakeshift } from "@wakeshift/sdk"
+import { attachXmcp } from "@wakeshift/sdk/xmcp"
+
+// src/wake.ts
+const wake = new Wakeshift({ key: process.env.WAKESHIFT_KEY! })
+const ciFinished = wake.defineEvent("ci.finished", {
+  description: "CI finished on a GitHub repo",
+  args: z.object({ owner: z.string(), repo: z.string() }),
+  payload: z.object({ branch: z.string(), conclusion: z.string() }),
+  text: (run, { owner, repo }) => `CI ${run.conclusion} on ${owner}/${repo} ${run.branch}`,
+})
+// identify gets xmcp's tool context: the verified token is extra.authInfo.
+const attached = attachXmcp(wake, { identify: (extra) => ({ user: myUser(extra.authInfo) }) })
+
+// src/tools/watch_ci.ts: export these three
+const schema = attached.inputs({ owner: z.string(), repo: z.string() })
+const metadata = { name: "watch_ci", description: "Watch CI on a repo" }
+const handler = attached.events("watch_ci", async ({ owner, repo }: { owner: string; repo: string }, call) => {
+  await call.subscribe(ciFinished, { owner, repo }, { reason: `Watching ${owner}/${repo}` })
+  return `Watching CI on ${owner}/${repo}.`
+})
+
+// src/tools/subscribe_events.ts, and the same for unsubscribe_events and list_subscriptions
+const tool = attached.tool("subscribe_events")
+// export const schema = tool.schema; export const metadata = tool.metadata; export default tool.handler
+```
+
+Each wrapped tool's result gets Wakeshift's addition in its content and `_meta` (not in `structuredContent`, which xmcp checks strictly against your output schema). xmcp can't serve MCP methods of an app's own, so on xmcp there are no MCP Events (ChatGPT and other clients that subscribe natively can't subscribe) and no `wakeshift_wait`: Claude Code is woken its other ways, and every other agent as usual.
+
 ## Reference
 
 ### `new Wakeshift({ key, core?, fetch?, timeoutMs?, onWarning? })`

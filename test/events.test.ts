@@ -577,6 +577,65 @@ test("attach needs events, and must come before connecting", async () => {
   assert.throws(() => wake.attach(late), /before connecting/);
 });
 
+test("attach says what it got, when it isn't an McpServer, and what to do for a framework it knows", () => {
+  const { wake } = fakeCore();
+  chatEvent(wake);
+  const refused = (server: unknown): string => {
+    try {
+      wake.attach(server as McpServer);
+    } catch (err) {
+      return (err as Error).message;
+    }
+    assert.fail("attach took it");
+  };
+  const docs = /https:\/\/wakeshift\.ai\/docs\/frameworks/;
+  // Shapes of the frameworks' own objects, as they are at run time.
+  class MCPServer {
+    toolActions = {};
+    startHTTP() {}
+    startStdio() {}
+    convertTools() {}
+  }
+  class FastMCP {
+    addTool() {}
+    start() {}
+  }
+  class FastMCPSession {
+    server = {};
+  }
+  const low = new McpServer({ name: "x", version: "1.0.0" }).server;
+  for (const [server, want] of [
+    [new MCPServer(), /got a MCPServer\. This looks like Mastra's MCPServer \(@mastra\/mcp\).*use attachMastra from @wakeshift\/sdk\/mastra/],
+    [new FastMCP(), /got a FastMCP\. This looks like fastmcp's FastMCP \(punkpeye\).*2026-07-28/],
+    [new FastMCPSession(), /This looks like a fastmcp session/],
+    [low, /This is a low-level MCP Server: pass the McpServer instead/],
+    [undefined, /got undefined\. Frameworks/],
+    [null, /got null\./],
+    ["server", /got a string\./],
+    [{}, /got an object\./],
+  ] as const) {
+    const msg = refused(server);
+    assert.match(msg, /^wakeshift: attach takes an McpServer, from @modelcontextprotocol\/server 2\.x or @modelcontextprotocol\/sdk 1\.x/);
+    assert.match(msg, want);
+    assert.match(msg, docs);
+    assert.doesNotMatch(msg, /before connecting/);
+  }
+});
+
+test("attach blames connecting only when the server is connected", () => {
+  const { wake } = fakeCore();
+  chatEvent(wake);
+  const server = new McpServer({ name: "x", version: "1.0.0" });
+  const low = server.server as unknown as { registerCapabilities(c: unknown): void };
+  low.registerCapabilities = () => {
+    throw new Error("capabilities refused");
+  };
+  assert.throws(
+    () => wake.attach(server),
+    (err: Error) => /couldn't add Wakeshift's capabilities to this server: capabilities refused/.test(err.message) && !/before connecting/.test(err.message),
+  );
+});
+
 test("an event's end: ends one of a user's subscriptions by ID, outside a tool", async () => {
   const { wake, reqs } = fakeCore({ "/event-subscriptions/end": (b) => ({ json: { ended: b.id === "es_1" } }) });
   const turn = turnEvent(wake);

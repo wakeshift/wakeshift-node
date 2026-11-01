@@ -2,6 +2,19 @@
 
 What changed in each release of `@wakeshift/sdk`. 0.4.0 is the first published release: to start with it, read the [README](README.md). Its notes below, and the earlier releases', are for apps that ran the preview builds.
 
+## 0.7.0 (2026-10-31)
+
+### Added
+
+- **Mastra.** `@wakeshift/sdk/mastra` serves Wakeshift from a Mastra `MCPServer` (`@mastra/mcp` 2.7 or later): `attachMastra(wake, opts)`, then `attached.inputs` and `attached.events` for the Mastra tools that subscribe, and `attached.serve(new MCPServer({ … }))`. Everything `attach` gives an `McpServer` works there: Wakeshift's block (text and `_meta`) in your wrapped tools' results, the built-in tools, MCP Events, Claude Code's `wakeshift_wait`, and who's calling (`identify` gets the request's `ctx`). Mastra's own MCP Events keep working beside Wakeshift's: `events/list` lists both. See [Mastra](README.md#mastra).
+- **xmcp.** `@wakeshift/sdk/xmcp` brings Wakeshift into an xmcp app through its tool files: `attachXmcp(wake, opts)`, then `attached.inputs` and `attached.events` in the tools that subscribe, and `attached.tool("subscribe_events")` (and the other two) for a tool file each. xmcp offers no way to add MCP methods, so clients that subscribe natively (ChatGPT) and Claude Code's `wakeshift_wait` aren't served there; Claude Code and every other agent are woken their usual ways. See [xmcp](README.md#xmcp).
+- Both are subpath exports, so an app that uses neither loads neither, and `@mastra/mcp` and `xmcp` are optional peer dependencies.
+
+### Changed
+
+- **A smaller package.** It no longer ships source maps (`dist/*.js.map`), which carried the SDK's TypeScript source inline: about half the unpacked size. Stack traces point at the compiled JavaScript in `dist/`, which is readable as it is.
+- **A clearer error from `attach`.** Given something other than an `McpServer`, `attach` says what it got and what it takes, and, for a framework it recognizes (Mastra's `MCPServer`, punkpeye's `fastmcp`, a low-level `Server`, a Cloudflare `McpAgent`), what to do instead (for Mastra, `attachMastra`), with a link to [the frameworks Wakeshift works with](https://wakeshift.ai/docs/frameworks). It says to call `attach` before connecting only when the server is already connected.
+
 ## 0.6.0 (2026-10-31)
 
 ### Breaking

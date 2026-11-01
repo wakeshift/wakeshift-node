@@ -9,7 +9,7 @@
 
 import { RpcError, type CallToolResult, type McpServerLike, type ToolCallExtra } from "./mcp.js";
 import { isSchema, objectFromShape, safeParse, toJsonSchema, type AnySchema, type SchemaInput, type SchemaOutput, type ZodRawShapeCompat } from "./zod.js";
-import { hostOf, type Host } from "./host.js";
+import { capabilitiesError, hostOf, type Host } from "./host.js";
 import { WakeshiftError } from "./errors.js";
 import {
   DELIVERY,
@@ -538,11 +538,20 @@ const MAX_LISTED_EVENTS = 20;
 
 /** @internal The events part of Wakeshift.attach. */
 export function attachEvents<C>(wake: Wakeshift, server: McpServerLike, events: WakeEvent[], opts: AttachOptions<C> = {}): Attached<C> {
-  if (events.length === 0) throw new Error("wakeshift: attach needs at least one event (wake.defineEvent) defined first");
+  checkAttach(events, opts);
+  return attachHost(wake, hostOf(server), events, opts);
+}
+
+/** @internal What attach refuses before it touches a server: no events, or an own tool it doesn't have. */
+export function checkAttach(events: WakeEvent[], opts: AttachOptions<any>, what = "attach"): void {
+  if (events.length === 0) throw new Error(`wakeshift: ${what} needs at least one event (wake.defineEvent) defined first`);
   for (const t of opts.tools ?? []) {
-    if (!(BUILTIN_TOOLS as readonly string[]).includes(t)) throw new Error(`wakeshift: attach's tools names "${t}": its own tools are ${BUILTIN_TOOLS.join(", ")}`);
+    if (!(BUILTIN_TOOLS as readonly string[]).includes(t)) throw new Error(`wakeshift: ${what}'s tools names "${t}": its own tools are ${BUILTIN_TOOLS.join(", ")}`);
   }
-  const host = hostOf(server);
+}
+
+/** @internal attach on a Host: an McpServer's, or a framework adapter's (mastra.ts, xmcp.ts). */
+export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], opts: AttachOptions<C> = {}): Attached<C> {
   const tools = new Set<BuiltinTool>(opts.tools ?? BUILTIN_TOOLS);
   // raw is the MCP SDK's own request context (1.x's extra, 2.x's ctx): what identify gets.
   const identityOf = (raw: unknown): Identity | undefined => opts.identify?.(raw as C) ?? undefined;
@@ -563,9 +572,9 @@ export function attachEvents<C>(wake: Wakeshift, server: McpServerLike, events: 
   try {
     host.registerCapabilities({ [TOP_LEVEL_KEY]: { listChanged: false }, extensions: { [EXTENSION_KEY]: { listChanged: false } } });
   } catch (err) {
-    throw new Error("wakeshift: call attach before connecting the server to a transport", { cause: err });
+    throw capabilitiesError(host, err);
   }
-  if (!host.handlers()) {
+  if (!host.handlers() && !host.framework) {
     // An MCP SDK release that keeps its request handlers elsewhere: the native
     // events and the built-in tools still work, but not what wraps the SDK's own methods.
     wake.warnOnce(
