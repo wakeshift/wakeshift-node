@@ -356,6 +356,14 @@ test("the SDK against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNE
   assert.notEqual(subs.at(-1)!.session, "wsc_AAAAAAAAAAAAAAAAAAAAAA");
   assert.match(text(stale), /session_key you passed isn't known/);
 
+  // Unsubscribing without the session key (Claude Code's calls name no
+  // conversation): nothing ends, and the block says to call again with it.
+  const keyless = (await claude.callTool({ name: "unwatch_ci", arguments: { repo: "alpha" } })) as CallToolResult;
+  assert.match(text(keyless), /^Stopped watching alpha \(false\)\./);
+  assert.match(text(keyless), /nothing was unsubscribed, and this conversation may still be subscribed/);
+  assert.ok(!text(keyless).includes(claudeSub.session));
+  assert.equal((await status("bob", claudeSub)).live, true);
+
   // Ending one subscription by its ID, outside a tool.
   await claude.callTool({ name: "watch_ci", arguments: { repo: "beta", session_key: claudeSub.session } });
   const bobBeta = subs.at(-1)!;

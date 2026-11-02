@@ -398,6 +398,9 @@ export class CallScope<C> implements ToolCall<C> {
   armed = false;
   created: CreatedSub[] = [];
   nativeLines: NativeLine[] = [];
+  // Wakeshift's notes from the call's unsubscribes (one that ended nothing
+  // because the call passed no session key), for the block.
+  notes: string[] = [];
   inflight = new Set<Promise<unknown>>();
   private queue: Promise<unknown> = Promise.resolve();
   // The client's name identify gave, for a request that names none.
@@ -497,7 +500,15 @@ export class CallScope<C> implements ToolCall<C> {
       this.checkEvent(event);
       const known = event.parseArgs(args);
       if (this.native) return this.endNative(event.name, known);
-      const out = await this.at.wake.requestApp<{ ended?: boolean }>("POST", "/event-subscriptions/unsubscribe", { call: this.wire(), name: event.name, arguments: known });
+      const out = await this.at.wake.requestApp<{ ended?: boolean; addition?: CallAddition }>("POST", "/event-subscriptions/unsubscribe", {
+        call: this.wire(),
+        name: event.name,
+        arguments: known,
+      });
+      // addition: the call passed no session key, so it ended nothing; the
+      // block says to call again with it.
+      const note = out.addition?.text?.trim();
+      if (note && !this.notes.includes(note)) this.notes.push(note);
       return !!out.ended;
     });
   }
@@ -576,7 +587,16 @@ export class CallScope<C> implements ToolCall<C> {
   // should subscribe to. A call that names no conversation, and subscribed
   // nothing, gets nothing (null). Only a failure for a call that subscribed
   // is thrown: without a subscription, the block is a courtesy.
+  //
+  // Notes from the call's unsubscribes come first, whatever else it gets.
   async addition(): Promise<CallAddition | null> {
+    const add = await this.fetchAddition();
+    if (this.notes.length === 0) return add;
+    const text = [this.notes.join(" "), add?.text?.trim() ?? ""].filter(Boolean).join("\n\n");
+    return { ...(add ?? {}), text };
+  }
+
+  private async fetchAddition(): Promise<CallAddition | null> {
     const wire = this.wire();
     if (!this.pending && this.nativeLines.length === 0 && !wire.session && !wire.conversation && !namesConversation(wire.meta)) return null;
     const body: Record<string, unknown> = { call: wire };

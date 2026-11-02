@@ -2,6 +2,12 @@
 
 What changed in each release of `@wakeshift/sdk`. 0.4.0 is the first published release: to start with it, read the [README](README.md). Its notes below, and the earlier releases', are for apps that ran the preview builds.
 
+## 0.7.3 (2026-11-02)
+
+### Fixed
+
+- **An unsubscribe without the session key says so.** When a wrapped tool's `call.unsubscribe` ends nothing because the call didn't pass the conversation's `session_key` (Claude Code's calls name no conversation, so the key is the only way Wakeshift finds it), Wakeshift's block on that call now tells the agent that nothing ended, to call again with the key it was given when it subscribed, and not to subscribe again until it has. `call.unsubscribe` still returns `false`, and the note follows your tool's own text. Before, the agent saw only your text ("This chat wasn't watching…"), subscribed again without the key, and got every message twice. The built-in `unsubscribe_events` tool's reply carries the same note.
+
 ## 0.7.2 (2026-11-02)
 
 ### Fixed

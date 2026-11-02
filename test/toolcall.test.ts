@@ -35,6 +35,7 @@ class WakeCore {
   addition: any = { text: WOKEN, trailer: TRAILER, meta: { "wakeshift/connector": "tok", other: "x" } };
   fail = new Set<string>();
   native: any[] = [];
+  unsubscribeReply: any = { ended: true };
   emitReply: any = { matched: 2, duplicate: false, unmatched: ["u3", { native: "u4" }], ended: [{ user: "u2", subscription: "s2" }] };
   // A subscribe waits for this, when set (the in-flight test).
   hold?: Promise<void>;
@@ -67,6 +68,7 @@ class WakeCore {
       case "/calls/addition":
         return reply(200, this.addition);
       case "/event-subscriptions/unsubscribe":
+        return reply(200, this.unsubscribeReply);
       case "/event-subscriptions/end":
         return reply(200, { ended: true });
       case "/event-subscriptions/list":
@@ -249,6 +251,37 @@ test("a wrapped tool that subscribes to nothing asks only when something names t
   w.core.reset();
   assert.deepEqual(texts(await w.call("ada", "plain", { table: "oak", session_key: "wsc_s1" })), ["Plain."]);
   assert.deepEqual(w.core.paths(), []);
+});
+
+test("an unsubscribe without the session key: Wakeshift's note comes first in the block, even when nothing else names the conversation", async (t) => {
+  const NOTE = "Wakeshift: nothing was unsubscribed. Call this tool again with the session_key you were given.";
+  const ended: boolean[] = [];
+  const w = await wrapped(t, (server, attached, ev) => {
+    server.registerTool(
+      "unwatch",
+      { inputSchema: attached.inputs({}) },
+      attached.events("unwatch", async (_a, call) => {
+        const ok = await call.unsubscribe(ev.news, { table: "oak" });
+        ended.push(ok);
+        return { content: [{ type: "text", text: ok ? "Stopped watching." : "This chat wasn't watching." }] };
+      }),
+    );
+  });
+  w.core.unsubscribeReply = { ended: false, addition: { text: NOTE } };
+  // Keyless, from a client nothing names: no /calls/addition, the note alone.
+  let res = await w.call("ada", "unwatch", {});
+  assert.deepEqual(ended, [false]);
+  assert.deepEqual(texts(res), ["This chat wasn't watching.", NOTE]);
+  assert.deepEqual(w.core.paths(), ["/event-subscriptions/unsubscribe"]);
+  // With something that names the conversation: the note, then the rest.
+  w.core.reset();
+  res = await w.call("ada", "unwatch", { session_key: "wsc_s1" });
+  assert.deepEqual(texts(res), ["This chat wasn't watching.", NOTE + "\n\n" + WOKEN, TRAILER]);
+  // No note: the block is as before.
+  w.core.reset();
+  w.core.unsubscribeReply = { ended: true };
+  res = await w.call("ada", "unwatch", {});
+  assert.deepEqual(texts(res), ["Stopped watching."]);
 });
 
 test("resolveSession makes the call's record without subscribing; a subscribe after it passes it on", async (t) => {
