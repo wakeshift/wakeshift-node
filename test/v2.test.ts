@@ -252,3 +252,25 @@ test("2.x: tasks/get for an ID that isn't Wakeshift's goes to the app's own hand
   assert.equal(own.result.status, "completed");
   assert.ok(!reqs.some((r) => r.path.startsWith("/calls/task")), "never asks Wakeshift");
 });
+
+// @modelcontextprotocol/server before 2.3.0 answers tasks/get on 2026-07-28
+// itself (modelcontextprotocol/typescript-sdk#2598), so the wait task never
+// completes: attach says so, once, naming the version to upgrade to. The
+// one installed (the peer range's floor or later) routes them.
+test("2.x: attach warns, once, on a server too old to route tasks/get", () => {
+  const warnings: string[] = [];
+  const wake = new Wakeshift({ key: `wst_test_chat_${seed}`, core: "http://core.test", onWarning: (m) => warnings.push(m) });
+  chatApp(wake);
+  wake.attach(new McpServer({ name: "chat", version: "1" }));
+  assert.deepEqual(warnings, [], "the installed 2.x routes them");
+  for (let i = 0; i < 2; i++) {
+    const old = new McpServer({ name: "chat", version: "1" });
+    // What 2.0 to 2.2 lack: the Set of methods registered with a schema,
+    // which 2.3.0's era gate lets through (stubbed, so registering still works).
+    (old.server as unknown as Record<string, unknown>)._customSchemaRequestMethods = { add() {}, delete() {}, has: () => false };
+    wake.attach(old);
+  }
+  assert.equal(warnings.length, 1, warnings.join("\n"));
+  assert.match(warnings[0], /@modelcontextprotocol\/server is older than 2\.3\.0/);
+  assert.match(warnings[0], /Upgrade @modelcontextprotocol\/server to 2\.3\.0 or later/);
+});

@@ -15,7 +15,10 @@
 //     and a params schema on 2.x;
 //   - tasks/get and tasks/cancel: 2.x answers them on protocol 2026-07-28
 //     only for a handler registered with a params schema (the tasks
-//     extension's methods), so setTaskMethod registers them that way;
+//     extension's methods), so setTaskMethod registers them that way.
+//     Before 2.3.0 it refused them there whatever was registered
+//     (modelcontextprotocol/typescript-sdk#2598, fixed by #2599), so the
+//     peer range starts at 2.3.0 and routesTasks tells attach to warn;
 //   - protocol 2026-07-28: 1.x doesn't speak it, so discover.ts teaches it;
 //     2.x speaks it itself (server/discover, resultType, ttlMs and
 //     cacheScope).
@@ -82,6 +85,13 @@ export interface Host {
   setMethod(method: string, handler: (params: Record<string, any>, raw: unknown) => Promise<unknown>): void;
   /** Makes the SDK route tasks/get or tasks/cancel on every protocol revision; the caller then sets its handler in handlers(). */
   setTaskMethod(method: string): void;
+  /**
+   * Whether the SDK passes tasks/get and tasks/cancel on protocol
+   * 2026-07-28 to the handlers setTaskMethod registered: false for
+   * @modelcontextprotocol/server before TASKS_MIN_SERVER, which answers
+   * them -32601 itself.
+   */
+  routesTasks(): boolean;
   /** The SDK's request handlers, or null if this SDK keeps them where Wakeshift can't wrap them. */
   handlers(): Map<string, Handler> | null;
   /** The client's name from initialize (or, on 2.x, the request's envelope). */
@@ -97,6 +107,13 @@ export interface Host {
 }
 
 const VERSION_META = "io.modelcontextprotocol/protocolVersion";
+
+/**
+ * @internal The oldest @modelcontextprotocol/server that serves tasks/get
+ * and tasks/cancel on protocol 2026-07-28 (modelcontextprotocol/typescript-sdk#2599):
+ * the floor of the SDK's peer range for it.
+ */
+export const TASKS_MIN_SERVER = "2.3.0";
 
 function lowOf(server: McpServerLike): any {
   return (server as { server?: unknown }).server;
@@ -287,6 +304,9 @@ class V1Host extends BaseHost implements Host {
     // setRequestHandler would ask for its own tasks capability, an older
     // revision's, never advertised.)
   }
+  routesTasks(): boolean {
+    return true;
+  }
   async validOutput(outputSchema: unknown, result: CallToolResult | string): Promise<boolean> {
     // McpServer 1.x's validateToolOutput: an object schema, and structured content that parses.
     if (!outputSchema) return true;
@@ -317,6 +337,15 @@ class V2Host extends BaseHost implements Host {
     this.low.setRequestHandler(method, { params: z4.looseObject({}) }, async () => {
       throw Object.assign(new Error("Method not found"), { code: -32601 });
     });
+  }
+  routesTasks(): boolean {
+    // 2.3.0's fix keeps the methods registered with a schema in this set,
+    // and lets them past the era gate; 2.0 to 2.2 have no such set. 2.x
+    // doesn't expose its version (nor its package.json), so the fix is
+    // what's checked, private like _requestHandlers. A release that renames
+    // it would only warn wrongly, and fails v2.test.ts's check that the
+    // installed 2.x doesn't warn, on the Dependabot bump that brings it.
+    return this.low._customSchemaRequestMethods instanceof Set;
   }
   async validOutput(outputSchema: unknown, result: CallToolResult | string): Promise<boolean> {
     // McpServer 2.x's validateToolOutput: structured content (any JSON
@@ -453,6 +482,7 @@ export function toolsOnlyHost(opts: ToolsOnlyOptions): Host {
     },
     setMethod: noop,
     setTaskMethod: noop,
+    routesTasks: () => true,
     handlers: () => null,
     clientName: () => undefined,
     clientCapabilities: () => undefined,

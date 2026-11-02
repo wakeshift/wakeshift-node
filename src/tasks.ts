@@ -17,7 +17,7 @@
 
 import { WakeshiftError } from "./errors.js";
 import { TASKS_EXTENSION, takesTasks } from "./discover.js";
-import type { Handler, Host } from "./host.js";
+import { TASKS_MIN_SERVER, type Handler, type Host } from "./host.js";
 import { RpcError } from "./mcp.js";
 import { WAKE_ARG_DESCRIPTIONS } from "./toolcall.js";
 import { toolCallOf, type Wakeshift } from "./wakeshift.js";
@@ -70,6 +70,12 @@ export type CallerOf = (raw: unknown) => { user: string | undefined; client: str
 export function serveTasks(wake: Wakeshift, host: Host, callerOf: CallerOf): void {
   const handlers = host.handlers();
   if (!handlers) return; // a future SDK: nothing to hook (no wait tool)
+  if (!host.routesTasks()) {
+    wake.warnOnce(
+      "tasks-routing",
+      `wakeshift: this server's @modelcontextprotocol/server is older than ${TASKS_MIN_SERVER} (2.0 to 2.2 answer tasks/get with "Method not found" on protocol 2026-07-28 themselves), so Claude Code's ${WAIT_TOOL} never completes and conversations that use it aren't woken. Upgrade @modelcontextprotocol/server to ${TASKS_MIN_SERVER} or later.`,
+    );
+  }
 
   const call = (raw: unknown, args: Record<string, unknown>) => {
     const { user, client } = callerOf(raw);

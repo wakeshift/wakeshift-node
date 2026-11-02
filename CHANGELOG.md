@@ -2,6 +2,13 @@
 
 What changed in each release of `@wakeshift/sdk`. 0.4.0 is the first published release: to start with it, read the [README](README.md). Its notes below, and the earlier releases', are for apps that ran the preview builds.
 
+## 0.7.2 (2026-11-02)
+
+### Fixed
+
+- **`@modelcontextprotocol/server` 2.3.0 or later.** The peer dependency was `^2.0.0`, but on 2.0, 2.1 and 2.2 Claude Code's `wakeshift_wait` never completes: those releases answer `tasks/get` and `tasks/cancel` on protocol 2026-07-28 with "Method not found" themselves, before `attach` sees them ([modelcontextprotocol/typescript-sdk#2598](https://github.com/modelcontextprotocol/typescript-sdk/issues/2598), fixed in 2.3.0 by [#2599](https://github.com/modelcontextprotocol/typescript-sdk/pull/2599)). So conversations told to use the wait tool weren't woken. Everything else (wrapped tools, the built-in tools, MCP Events with `events/poll` and webhooks) works on 2.0 and later. The peer range is now `^2.3.0`: upgrade with `npm install @modelcontextprotocol/server@^2.3.0`. `@modelcontextprotocol/sdk` 1.x is unaffected.
+- **`attach` warns on an older 2.x.** Given a server from `@modelcontextprotocol/server` before 2.3.0, `attach` warns once (through `onWarning`), naming the version to upgrade to.
+
 ## 0.7.1 (2026-11-01)
 
 ### Fixed

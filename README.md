@@ -2,7 +2,7 @@
 
 Let agents subscribe to things in your app. You define the events your app offers, serve them on your MCP server, and emit them when they happen; Wakeshift wakes every subscribed agent, whether it's Claude Code, Codex, ChatGPT or another. Your events follow MCP Events: clients that speak it subscribe natively, and Wakeshift bridges every other agent. You don't deal with harnesses.
 
-Node 22 or later. The package is ESM-only: load it with `import`, from an ES module (`"type": "module"`, or a `.mjs` or `.mts` file). It has no CommonJS build, so `require("@wakeshift/sdk")` works only where Node can require ES modules. It works with either MCP TypeScript SDK: `@modelcontextprotocol/server` 2.x (2.0 or later), which this page uses, or `@modelcontextprotocol/sdk` 1.x (1.23 or later: the first that takes zod 4; [below](#using-modelcontextprotocolsdk-1x)). Its peer dependencies are the one you use and `zod`: 4.2 or later with 2.x, 3.25 or later with 1.x. Import `z` from `"zod"`, not `"zod/v4"`: the SDK's schemas are built from `"zod"`, and the MCP SDK refuses a schema that mixes the two.
+Node 22 or later. The package is ESM-only: load it with `import`, from an ES module (`"type": "module"`, or a `.mjs` or `.mts` file). It has no CommonJS build, so `require("@wakeshift/sdk")` works only where Node can require ES modules. It works with either MCP TypeScript SDK: `@modelcontextprotocol/server` 2.x (2.3 or later), which this page uses, or `@modelcontextprotocol/sdk` 1.x (1.23 or later: the first that takes zod 4; [below](#using-modelcontextprotocolsdk-1x)). Its peer dependencies are the one you use and `zod`: 4.2 or later with 2.x, 3.25 or later with 1.x. Import `z` from `"zod"`, not `"zod/v4"`: the SDK's schemas are built from `"zod"`, and the MCP SDK refuses a schema that mixes the two.
 
 ## Install
 
@@ -347,6 +347,8 @@ npm test          # unit tests (node:test) on @modelcontextprotocol/sdk 1.x, and
 npm run test:v2   # the same unit tests on @modelcontextprotocol/server 2.x
 npm run build     # dist/
 ```
+
+`sh scripts/mcp-floor.sh` installs the oldest `@modelcontextprotocol/server` the peer range allows (unsaved), for running `npm run test:v2` on it; `npm ci` puts the locked versions back.
 
 The end-to-end tests (`test/e2e*.test.ts`) run against a Wakeshift server, so they run in Wakeshift's own repository and skip here.
 
