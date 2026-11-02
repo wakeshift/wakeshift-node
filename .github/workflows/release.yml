@@ -64,15 +64,18 @@ jobs:
             echo "CHANGELOG.md has no entry for $version (## $version (<date>))" >&2
             exit 1
           fi
-          # The entry's notes, for the GitHub release.
-          mkdir -p dist
+      - run: npm ci --ignore-scripts --no-fund --no-audit
+      # npm pack runs prepack (the build), explicitly here.
+      - run: mkdir -p dist && npm pack --pack-destination dist
+      # After the pack: the build empties dist/ first.
+      - name: Release notes, the CHANGELOG entry
+        run: |
+          version=$(node -p 'require("./package.json").version')
           awk -v v="$version" '
             $0 ~ "^## " { if (on) exit; if (index($0, "## " v " (") == 1) { on = 1; next } }
             on { print }
           ' CHANGELOG.md >dist/notes.md
-      - run: npm ci --ignore-scripts --no-fund --no-audit
-      # npm pack runs prepack (the build), explicitly here.
-      - run: npm pack --pack-destination dist
+          test -s dist/notes.md
       - name: SBOM
         run: npm sbom --sbom-format cyclonedx --omit dev >"dist/wakeshift-sdk-$(node -p 'require("./package.json").version').cdx.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
