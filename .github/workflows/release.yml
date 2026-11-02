@@ -116,7 +116,8 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          tgz=$(ls dist/*.tgz)
+          # ./ first: npm reads "dist/x.tgz" as the GitHub repository dist/x.tgz.
+          tgz=./$(ls dist/*.tgz)
           # A prerelease (0.7.0-rc.1) doesn't become latest.
           case "$TAG" in
           *-*) dist_tag=next ;;
