@@ -276,7 +276,7 @@ test("attach: bridged clients get subscribe_events; every client gets unsubscrib
       json: { subscriptions: [{ id: "es1", event: "chat.message", arguments: { channel: "eng" }, destination: "conversation", created_at: "2026-10-21T10:00:00Z" }] },
     }),
     "/event-subscriptions/end": () => ({ json: { ended: true } }),
-    "/event-subscriptions/unsubscribe": () => ({ json: { ended: true } }),
+    "/event-subscriptions/unsubscribe": () => ({ json: { ended: true, addition: { text: "Keep passing session_key." } } }),
   });
   chatEvent(wake);
   turnEvent(wake);
@@ -321,9 +321,10 @@ test("attach: bridged clients get subscribe_events; every client gets unsubscrib
   assert.match(text(listed), /- es1: chat\.message \{"channel":"eng"\}, wakes a conversation, since 2026-10-21/);
   assert.match(text(await client.callTool({ name: "unsubscribe_events", arguments: { id: "es1" } })), /Stopped subscription es1/);
   assert.deepEqual(reqs.find((q) => q.path === "/event-subscriptions/end")!.body, { user: "u1", id: "es1" });
-  assert.match(
+  // Wakeshift's addition (the session key stays the same) follows the reply.
+  assert.equal(
     text(await client.callTool({ name: "unsubscribe_events", arguments: { event: "chat.message", arguments: { channel: "eng" } } })),
-    /Stopped chat\.message/,
+    'Stopped chat.message {"channel":"eng"}.\n\nKeep passing session_key.',
   );
   await client.close();
 });

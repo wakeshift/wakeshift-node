@@ -2,6 +2,16 @@
 
 What changed in each release of `@wakeshift/sdk`. 0.4.0 is the first published release: to start with it, read the [README](README.md). Its notes below, and the earlier releases', are for apps that ran the preview builds.
 
+## 0.7.1 (2026-11-01)
+
+### Fixed
+
+- **Subscribing again after unsubscribing keeps the conversation's session.** The reply from the built-in `unsubscribe_events` tool now tells the agent its session key stays the same and to pass it when it subscribes again. Without it, Claude Code often subscribed again without the key, which started a second session and, on the MCP task path, a second `wakeshift_wait`.
+
+### Changed
+
+- The README and docs lead with `@modelcontextprotocol/server` 2.x; 1.x is the alternative. Nothing changes in the code.
+
 ## 0.7.0 (2026-10-31)
 
 ### Added
@@ -44,6 +54,8 @@ What changed in each release of `@wakeshift/sdk`. 0.4.0 is the first published r
 - On protocol 2026-07-28, `server/discover` and the lists' results now say how long a client may cache them (`ttlMs`, `cacheScope`), as that revision requires.
 
 ## 0.5.1 (2026-10-30)
+
+Never published to npm. Everything below first shipped in 0.5.2.
 
 ### Added
 

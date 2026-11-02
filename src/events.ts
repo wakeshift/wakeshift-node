@@ -755,12 +755,13 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
         const ev = event ? byName.get(event) : undefined;
         if (!ev) return fail(fill("need"));
         const args = ev.parseArgs(rawArgs ?? {});
-        const out = await wake.requestApp<{ ended: boolean }>("POST", "/event-subscriptions/unsubscribe", {
+        const out = await wake.requestApp<{ ended: boolean; addition?: ToolAddition }>("POST", "/event-subscriptions/unsubscribe", {
           call: toolCallOf(host.req(raw), client, user, rest, "unsubscribe_events"),
           name: ev.name,
           arguments: args,
         });
-        return result(fill(out.ended ? "unsubscribed" : "not_subscribed", { event: ev.name, arguments: canonical(args) }));
+        // addition: the conversation's session key stays the same.
+        return result(fill(out.ended ? "unsubscribed" : "not_subscribed", { event: ev.name, arguments: canonical(args) }), out.addition);
       } catch (err) {
         return fail(err instanceof ArgsError ? err.detail : fill("unsubscribe_failed", { detail: detailOf(err) }));
       }
