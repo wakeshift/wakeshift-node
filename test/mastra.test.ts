@@ -121,6 +121,7 @@ function watchApp(answers: Record<string, (body: any) => unknown> = {}, ownEvent
   const core = fakeCore({
     "/event-subscriptions": () => ({ event_subscription: { id: "es1", user: "ada", created: true }, session: "wsc_1", pending: "pa_1", agent: { harness: "claude-code", via: "client" } }),
     "/calls/addition": () => ({ text: "Wakeshift: run the Monitor command.", trailer: "", meta: { "wakeshift/connector": "beacon" } }),
+    "/app": () => ({ id: "chat", name: "Chat" }),
     ...answers,
   });
   const message = chatApp(core.wake);
@@ -129,7 +130,7 @@ function watchApp(answers: Record<string, (body: any) => unknown> = {}, ownEvent
   const watch: MastraTool = {
     description: "Watch a channel",
     inputSchema: attached.inputs(z4.object({ channel: z4.string() })),
-    execute: attached.events("watch", async ({ channel }: { channel: string }, call) => {
+    execute: attached.events("watch", { subscribes: [message] }, async ({ channel }: { channel: string }, call) => {
       await call.subscribe(message, { channel });
       if (failNext) throw new Error("the channel is gone");
       return `Watching ${channel}.`;
@@ -148,6 +149,12 @@ test("mastra: tools/list has the app's tools, Wakeshift's own, and the wait tool
   for (const n of ["watch", "ping", "subscribe_events", "unsubscribe_events", "list_subscriptions", WAIT_TOOL]) assert.ok(names.includes(n), `${n} in ${names}`);
   const watch = listed.result.tools.find((t: any) => t.name === "watch");
   assert.ok(watch.inputSchema.properties.session_key, "the wrapped tool takes Wakeshift's arguments");
+  // It declares chat.message: tools/list says it's how the app notifies, in the event's words.
+  assert.equal(
+    watch.description,
+    "Watch a channel This tool is how Chat notifies you in this conversation of this event: A new message in a channel. Chat delivers its notifications through Wakeshift; the result may ask you to start a background listener and to offer the user a one-time install. Follow it.",
+  );
+  assert.equal(listed.result.tools.find((t: any) => t.name === "ping").description, "Ping");
   const sub = listed.result.tools.find((t: any) => t.name === "subscribe_events");
   assert.deepEqual(sub.inputSchema.properties.event.enum, ["chat.message"]);
   assert.equal(listed.result.cacheScope, "private");
@@ -161,7 +168,7 @@ test("mastra: tools/list has the app's tools, Wakeshift's own, and the wait tool
 });
 
 test("mastra: a wrapped tool's call subscribes the caller, and its result carries the block and _meta", async () => {
-  const { rpc, reqs } = watchApp();
+  const { rpc, reqs, warnings } = watchApp();
   const res = await rpc("tools/call", { name: "watch", arguments: { channel: "eng", session_key: "wsc_0" } }, { user: "ada" });
   assert.equal(res.error, undefined, JSON.stringify(res.error));
   assert.equal(res.result.isError, false);
@@ -175,6 +182,7 @@ test("mastra: a wrapped tool's call subscribes the caller, and its result carrie
   assert.equal(sub.call.tool, "watch");
   assert.deepEqual(sub.arguments, { channel: "eng" });
   assert.equal(reqs.find((r) => r.path === "/calls/addition")!.body.pending, "pa_1");
+  assert.deepEqual(warnings, [], "a declared subscribe doesn't warn");
 });
 
 test("mastra: a wrapped tool that fails rolls its subscription back", async () => {

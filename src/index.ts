@@ -18,7 +18,7 @@ export {
   type ScopeEvent,
 } from "./wakeshift.js";
 export { harnessAgent } from "./harness.js";
-export { WakeshiftError, isCode } from "./errors.js";
+export { IdReusedError, WakeshiftError, isCode } from "./errors.js";
 export { parseKey, signAssertion, type AppKey } from "./key.js";
 export {
   WakeEvent,
@@ -43,6 +43,11 @@ export {
 } from "./events.js";
 export {
   CallEnded,
+  type AnyWakeEvent,
+  type EventArgs,
+  type ToolCallBase,
+  type ToolCallSubscribe,
+  type ToolEventsOptions,
   type Attached,
   type AppArgs,
   type EventsOptions,

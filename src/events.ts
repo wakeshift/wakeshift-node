@@ -83,7 +83,12 @@ export interface EventOptions<A extends AnySchema, P extends AnySchema> {
 }
 
 export interface EmitOptions {
-  /** Makes retries emit once for a day (at most 200 characters). A retry must name the same recipients: Wakeshift uses the first's. */
+  /**
+   * Makes retries emit once for a day (at most 200 characters): a retry of
+   * the same emit (arguments, recipients and payload) returns the first's
+   * result with `duplicate: true`. The id on a different emit throws
+   * IdReusedError (`id_reused`) and sends nothing: give each occurrence its own.
+   */
   id?: string;
   /**
    * A personal event's recipients (at most 1,000), one or a list, mixed: a
@@ -158,9 +163,9 @@ function issues(err: unknown): string {
   return list.map((i) => (i.path?.length ? i.path.join(".") + ": " : "") + i.message).join("; ");
 }
 
-/** One of the app's event types (wake.defineEvent). */
-export class WakeEvent<A extends AnySchema = AnySchema, P extends AnySchema = AnySchema> {
-  readonly name: string;
+/** One of the app's event types (wake.defineEvent). N is its name, as defineEvent was given it. */
+export class WakeEvent<A extends AnySchema = AnySchema, P extends AnySchema = AnySchema, N extends string = string> {
+  readonly name: N;
   readonly description: string;
   readonly title?: string;
   readonly personal: boolean;
@@ -173,7 +178,7 @@ export class WakeEvent<A extends AnySchema = AnySchema, P extends AnySchema = An
   /** Use wake.defineEvent rather than this constructor. */
   constructor(
     private readonly wake: Wakeshift,
-    name: string,
+    name: N,
     opts: EventOptions<A, P>,
   ) {
     if (!nameRE.test(name) || name.length > 64) throw new Error(`wakeshift: event name ${JSON.stringify(name)}: lowercase dot-separated words (chat.message), at most 64 characters`);
@@ -512,6 +517,9 @@ export const EVENT_TOOL_TEXT = {
   none: "You have no subscriptions to this app's events.",
   not_subscribed: "This conversation wasn't subscribed to {event} {arguments}.",
   notifies: "This tool is how {app} notifies you in this conversation{when}. {App} delivers its notifications through Wakeshift; the result may ask you to start a background listener and to offer the user a one-time install. Follow it.",
+  notifies_event: " of this event: {events}",
+  notifies_events: " of these events: {events}",
+  notifies_events_separator: "; ",
   personal_no_user: "{event} is personal, and this app couldn't tell who you are: sign in to it first.",
   polled: "polled by an MCP client",
   refused: "You may not subscribe to {event} with these arguments.",
@@ -538,6 +546,52 @@ export function notifiesSentence(app: string, when?: string): string {
   const w = when?.trim().replace(/[.\s]+$/, "");
   const App = app.charAt(0).toUpperCase() + app.slice(1);
   return EVENT_TOOL_TEXT.notifies.replace(/\{when\}/g, w ? ` when ${w}` : "").replace(/\{App\}/g, App).replace(/\{app\}/g, app);
+}
+
+/**
+ * @internal The sentence tools/list adds to a tool that declares the events
+ * it subscribes to (attached.events' subscribes): notifies' sentence with
+ * the events' own descriptions where when goes, "of this event: <d>" or
+ * "of these events: <d1>; <d2>". Each description is on one line, without
+ * its trailing period: the sentence adds one. test/subscribes.json pins it.
+ */
+export function subscribesSentence(app: string, descriptions: readonly string[]): string {
+  const ds = eventDescriptions(descriptions);
+  if (ds.length === 0) return "";
+  const of = fill(ds.length === 1 ? "notifies_event" : "notifies_events", { events: ds.join(EVENT_TOOL_TEXT.notifies_events_separator) });
+  const App = app.charAt(0).toUpperCase() + app.slice(1);
+  return EVENT_TOOL_TEXT.notifies.replace(/\{when\}/g, () => of).replace(/\{App\}/g, () => App).replace(/\{app\}/g, () => app);
+}
+
+// eventDescriptions is the declared events' descriptions as the sentence
+// quotes them: each on one line, its trailing periods trimmed, each once.
+function eventDescriptions(descriptions: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const d of descriptions) {
+    const c = (d ?? "").replace(/\s+/g, " ").trim().replace(/[.\s]+$/, "");
+    if (c && !out.includes(c)) out.push(c);
+  }
+  return out;
+}
+
+// NOTIFIES_TAIL is the part of every notifies sentence after the app's
+// name, whatever its app and events: a description that has it already
+// says how the app notifies (notifies() wrote it).
+const NOTIFIES_TAIL = EVENT_TOOL_TEXT.notifies.slice(EVENT_TOOL_TEXT.notifies.indexOf("{App}") + "{App}".length);
+
+/**
+ * @internal A tool's description as tools/list gives it for a tool that
+ * declares the events it subscribes to: the subscribes sentence after the
+ * tool's own description. A description that already has a notifies
+ * sentence (notifies(), for custom wording), or no events, leaves it as it
+ * was. app is the app's name ("this app" until tools/list names it).
+ */
+export function withSubscribes(description: string, descriptions: readonly string[], app: string = UNNAMED_APP): string {
+  const d = (description ?? "").trim();
+  if (d.includes(NOTIFIES_TAIL)) return description;
+  const n = subscribesSentence(app.trim() || UNNAMED_APP, descriptions);
+  if (!n) return description;
+  return d ? `${d} ${n}` : n;
 }
 
 /** @internal The parts of notifies' sentence that name the app, for "this app": tools/list names it. */

@@ -10,13 +10,13 @@
 //   const attached = wake.attach(server, { identify: (extra) => ({ user: userOf(extra) }) })
 //   server.registerTool("join",
 //     { description: "…", inputSchema: attached.inputs({ table: z.string() }) },
-//     attached.events("join", async ({ table }, call) => {
+//     attached.events("join", { subscribes: [turn] }, async ({ table }, call) => {
 //       const sub = await call.subscribe(turn, { table }, { reason: `Playing at ${table}` })
 //       await casino.seat(call.user!, table, sub.id)
 //       return `You're seated at ${table}.`
 //     }))
 
-import { UNNAMED_APP, unnamedNotifiesParts } from "./events.js";
+import { UNNAMED_APP, unnamedNotifiesParts, withSubscribes } from "./events.js";
 import { z } from "zod";
 import * as z3 from "zod/v3";
 import * as z4 from "zod/v4";
@@ -176,12 +176,18 @@ export interface ToolSubscribeOptions {
   label?: string;
 }
 
+/** Any of the app's events: what call.subscribe takes in a tool that doesn't declare its events. */
+export type AnyWakeEvent = WakeEvent<any, any, any>;
+
+/** The arguments event takes, as call.subscribe takes them. */
+export type EventArgs<E> = E extends WakeEvent<infer A, any, any> ? SchemaInput<A> : never;
+
 /**
- * One call of a wrapped tool (attached.events): who's calling, and the
- * calls that subscribe the calling conversation. Only the wrapper makes
- * one, and it works until the handler returns (then CallEnded).
+ * What every ToolCall has, whatever its tool subscribes to: who's calling,
+ * unsubscribe and resolveSession. Only the wrapper makes one, and it works
+ * until the handler returns (then CallEnded).
  */
-export interface ToolCall<C = any> {
+export interface ToolCallBase<C = any> {
   /** Who attach's identify says is calling (undefined for none). */
   readonly user: string | undefined;
   /** The tool being called. */
@@ -201,15 +207,6 @@ export interface ToolCall<C = any> {
   /** The call's request context, as your MCP SDK passes it to the tool's callback: 2.x's ctx, 1.x's extra. */
   readonly extra: C;
   /**
-   * Subscribes the calling conversation to event with args, or renews its
-   * subscription. The reply then carries what the conversation needs to be
-   * woken (one block for the call, however many subscribes it makes), and
-   * if the call fails, the subscription is ended. For a native caller
-   * nothing is made. Your tool decides who may: authorize isn't consulted.
-   * A personal event needs a user (identify's).
-   */
-  subscribe<A extends AnySchema>(event: WakeEvent<A, any>, args: SchemaInput<A>, opts?: ToolSubscribeOptions): Promise<Subscription>;
-  /**
    * Ends the calling conversation's subscription to event with args,
    * resolving to whether one ended. For a native caller it ends the user's
    * own (webhook) subscriptions to the event with those arguments.
@@ -217,6 +214,68 @@ export interface ToolCall<C = any> {
   unsubscribe<A extends AnySchema>(event: WakeEvent<A, any>, args: SchemaInput<A>): Promise<boolean>;
   /** Finds or starts the calling conversation's session without subscribing it (it doesn't make it wakeable). */
   resolveSession(): Promise<string>;
+}
+
+/** call.subscribe, for a tool that subscribes to the events E. */
+export interface ToolCallSubscribe<E extends AnyWakeEvent = AnyWakeEvent> {
+  /**
+   * Subscribes the calling conversation to event with args, or renews its
+   * subscription. The reply then carries what the conversation needs to be
+   * woken (one block for the call, however many subscribes it makes), and
+   * if the call fails, the subscription is ended. For a native caller
+   * nothing is made. Your tool decides who may: authorize isn't consulted.
+   * A personal event needs a user (identify's). event is one of the events
+   * the tool declares (attached.events' subscribes).
+   */
+  subscribe<Ev extends E>(event: Ev, args: EventArgs<Ev>, opts?: ToolSubscribeOptions): Promise<Subscription>;
+}
+
+/**
+ * One call of a wrapped tool (attached.events): who's calling, and the
+ * calls that subscribe the calling conversation. E is the events the tool
+ * declares (`attached.events(name, { subscribes: [...] }, handler)`):
+ * call.subscribe takes only those, and a tool that declares none has no
+ * call.subscribe. A tool wrapped without subscribes gets a call whose
+ * subscribe takes any of the app's events, and warns when it's used.
+ */
+export type ToolCall<C = any, E extends AnyWakeEvent = AnyWakeEvent> = ToolCallBase<C> & ([E] extends [never] ? {} : ToolCallSubscribe<E>);
+
+/** attached.events' options for a tool. */
+export interface ToolEventsOptions<E extends readonly AnyWakeEvent[] = readonly AnyWakeEvent[]> {
+  /**
+   * The events the tool subscribes the calling conversation to (with
+   * call.subscribe). tools/list then adds a sentence to the tool's
+   * description saying the tool is how the app notifies the agent of them,
+   * in their own descriptions' words, and that the result may ask to start
+   * a listener and offer an install. Agents set Wakeshift's part of a
+   * result aside as unrequested unless the tool's description says so. An
+   * empty list declares that the tool subscribes to nothing.
+   */
+  subscribes: E;
+}
+
+/**
+ * @internal What a subscribe the tool doesn't declare does: warns once per
+ * tool (this release) or throws (error: the next release). Tests flip it.
+ */
+export const undeclaredSubscribe = { error: false };
+
+// eventRef is how a warning writes an event in its fix: the name of the
+// event wake.defineEvent returned.
+const eventRef = (name: string) => `<${name}'s event>`;
+
+/** @internal The warning (or, with undeclaredSubscribe.error, the error) for a subscribe the tool doesn't declare. */
+export function undeclaredMessage(tool: string, event: string, declared: readonly string[] | null, error: boolean): string {
+  const all = [...(declared ?? []), event];
+  const fix = `attached.events(${JSON.stringify(tool)}, { subscribes: [${all.map(eventRef).join(", ")}] }, handler)`;
+  const what =
+    declared === null
+      ? `the tool ${tool} subscribed to ${event} without declaring the events it subscribes to`
+      : declared.length === 0
+        ? `the tool ${tool} subscribed to ${event}, but declares that it subscribes to nothing`
+        : `the tool ${tool} subscribed to ${event}, which its subscribes doesn't list (${declared.join(", ")})`;
+  if (error) return `wakeshift: ${what}, so the subscribe was refused. Fix: ${fix}.`;
+  return `wakeshift: ${what}, so tools/list doesn't tell the agent that the tool is how this app notifies it. Fix: ${fix}. It works for now; from the next release an undeclared subscribe throws.`;
 }
 
 /** A ToolCall used after its handler returned. */
@@ -386,6 +445,8 @@ export interface AttachContext {
 
 /** @internal One tools/call of a wrapped tool: what its handler subscribed, for the block and the rollback. */
 export class CallScope<C> implements ToolCall<C> {
+  /** The events the tool declares (null: it declares none: attached.events without subscribes). */
+  readonly declared: readonly AnyWakeEvent[] | null;
   user: string | undefined;
   tool: string;
   native = false;
@@ -412,7 +473,9 @@ export class CallScope<C> implements ToolCall<C> {
     tool: string,
     extra: C,
     private readonly args: { session?: string; harness?: string; conversation?: string },
+    declared: readonly AnyWakeEvent[] | null = null,
   ) {
+    this.declared = declared;
     this.tool = tool;
     this.extra = extra;
     const id = at.identify(extra);
@@ -463,9 +526,20 @@ export class CallScope<C> implements ToolCall<C> {
     }
   }
 
-  subscribe<A extends AnySchema>(event: WakeEvent<A, any>, args: SchemaInput<A>, opts: ToolSubscribeOptions = {}): Promise<Subscription> {
+  // checkDeclared warns once per tool (or throws, once undeclared subscribes
+  // are an error) when the tool doesn't declare event.
+  private checkDeclared(event: AnyWakeEvent): void {
+    const d = this.declared;
+    if (d && d.some((e) => e === event || e.name === event.name)) return;
+    const names = d ? d.map((e) => e.name) : null;
+    if (undeclaredSubscribe.error) throw new Error(undeclaredMessage(this.tool, event.name, names, true));
+    this.at.warnOnce("undeclared:" + this.tool, undeclaredMessage(this.tool, event.name, names, false));
+  }
+
+  subscribe<Ev extends AnyWakeEvent>(event: Ev, args: EventArgs<Ev>, opts: ToolSubscribeOptions = {}): Promise<Subscription> {
     return this.request(async () => {
       this.checkEvent(event);
+      this.checkDeclared(event);
       const known = event.parseArgs(args);
       if (this.native) {
         this.addNative(event.name, known);
@@ -660,6 +734,8 @@ export function nativeOf(at: Pick<AttachContext, "host" | "clientOf" | "events">
 export class Attached<C = any> {
   /** @internal */
   private readonly wrapped = new Map<string, unknown>();
+  // The events each wrapped tool declares (attached.events' subscribes), by tool.
+  private readonly declared = new Map<string, readonly AnyWakeEvent[]>();
 
   /** @internal Use wake.attach. */
   constructor(private readonly at: AttachContext) {}
@@ -715,13 +791,50 @@ export class Attached<C = any> {
    * a CallToolResult; the reply gets Wakeshift's block. The tool's
    * inputSchema must come from attached.inputs (a type error otherwise).
    * Register it on the server passed to attach.
+   *
+   * subscribes lists the events the tool subscribes to: call.subscribe
+   * takes only those, and tools/list adds a sentence to the tool's
+   * description saying it's how the app notifies the agent of them.
+   *
+   *   attached.events("watch_build", { subscribes: [buildFinished] }, async ({ build }, call) => { … })
+   *
+   * Without subscribes (attached.events(name, handler)), call.subscribe
+   * takes any of the app's events but warns: declare them.
    */
-  events<A extends WakeArgs>(name: string, handler: (args: Omit<A, WakeKey>, call: ToolCall<C>) => WrappedResult | Promise<WrappedResult>): WrappedCallback<A, C> {
+  events<A extends WakeArgs, const E extends readonly AnyWakeEvent[]>(
+    name: string,
+    opts: ToolEventsOptions<E>,
+    handler: (args: Omit<A, WakeKey>, call: ToolCall<C, E[number]>) => WrappedResult | Promise<WrappedResult>,
+  ): WrappedCallback<A, C>;
+  events<A extends WakeArgs>(name: string, handler: (args: Omit<A, WakeKey>, call: ToolCall<C>) => WrappedResult | Promise<WrappedResult>): WrappedCallback<A, C>;
+  events(name: string, optsOrHandler: unknown, maybeHandler?: unknown): WrappedCallback<any, C> {
     if (!name || typeof name !== "string") throw new Error("wakeshift: attached.events needs the tool's name, as registered");
+    const declared = typeof optsOrHandler === "function" ? null : this.declaredOf(name, optsOrHandler);
+    const handler = typeof optsOrHandler === "function" ? optsOrHandler : maybeHandler;
     if (typeof handler !== "function") throw new Error("wakeshift: attached.events needs a handler");
-    const cb = (async (args: Record<string, unknown>, extra: C) => this.run(name, cb, handler as any, args ?? {}, extra)) as unknown as WrappedCallback<A, C>;
+    const cb = (async (args: Record<string, unknown>, extra: C) => this.run(name, cb, handler as any, args ?? {}, extra)) as unknown as WrappedCallback<any, C>;
     this.wrapped.set(name, cb);
+    this.declare(name, declared);
     return cb;
+  }
+
+  // declaredOf checks attached.events' options: the tool's subscribes, each
+  // one of this app's events.
+  private declaredOf(name: string, opts: unknown): readonly AnyWakeEvent[] {
+    const list = (opts as { subscribes?: unknown } | null)?.subscribes;
+    if (!Array.isArray(list)) throw new Error(`wakeshift: attached.events("${name}", options, handler): options.subscribes lists the events the tool subscribes to ([] for none)`);
+    for (const e of list) {
+      if (!e || typeof (e as AnyWakeEvent).owner !== "function" || (e as AnyWakeEvent).owner() !== this.at.wake) {
+        throw new Error(`wakeshift: attached.events("${name}", …): subscribes lists ${(e as { name?: unknown })?.name ?? String(e)}, which isn't one of this app's events (wake.defineEvent)`);
+      }
+    }
+    return [...list];
+  }
+
+  // declare records the events a tool declares (null: none declared).
+  private declare(name: string, declared: readonly AnyWakeEvent[] | null): void {
+    if (declared) this.declared.set(name, declared);
+    else this.declared.delete(name);
   }
 
   private async run(
@@ -764,7 +877,7 @@ export class Attached<C = any> {
    */
   begin(name: string, input: Record<string, unknown>, extra: C): { call: CallScope<C>; appArgs: Record<string, unknown> } {
     const str = (k: string) => (typeof input[k] === "string" && (input[k] as string) ? (input[k] as string) : undefined);
-    const call = new CallScope<C>(this.at, name, extra, { session: str(SESSION_ARG), harness: str(HARNESS_ARG), conversation: str(CONVERSATION_ARG) });
+    const call = new CallScope<C>(this.at, name, extra, { session: str(SESSION_ARG), harness: str(HARNESS_ARG), conversation: str(CONVERSATION_ARG) }, this.declared.get(name) ?? null);
     const appArgs: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(input ?? {})) if (!(WAKE_KEYS as readonly string[]).includes(k)) appArgs[k] = v;
     return { call, appArgs };
@@ -828,9 +941,15 @@ export class Attached<C = any> {
    * sets the handler when the first tool is registered, perhaps after
    * attach, so a later set is wrapped too (as tasks.ts does).
    */
-  /** @internal Marks name as a wrapped tool, for tools/list (a framework adapter's tool, wrapped outside this handle). */
-  markWrapped(name: string): void {
+  /** @internal Marks name as a wrapped tool, for tools/list (a framework adapter's tool, wrapped outside this handle), with the events it declares (null: none). */
+  markWrapped(name: string, declared: readonly AnyWakeEvent[] | null = null): void {
     if (!this.wrapped.has(name)) this.wrapped.set(name, true);
+    this.declare(name, declared);
+  }
+
+  /** @internal The events a framework adapter's tool declares, checked as attached.events checks them. */
+  checkDeclared(name: string, opts: unknown): readonly AnyWakeEvent[] {
+    return this.declaredOf(name, opts);
   }
 
   amendToolsList(): void {
@@ -843,6 +962,7 @@ export class Attached<C = any> {
         const out = await h(request, extra);
         if (out && Array.isArray(out.tools)) {
           this.amendTools(out.tools);
+          this.describeTools(out.tools);
           await this.nameApp(out.tools);
         }
         return out;
@@ -851,6 +971,21 @@ export class Attached<C = any> {
     if (h) Map.prototype.set.call(handlers, "tools/list", wrap(h));
     const set = handlers.set.bind(handlers);
     handlers.set = (method: string, h: Handler) => set(method, method === "tools/list" ? wrap(h) : h);
+  }
+
+  // describeTools adds the subscribes sentence to each tool that declares
+  // events (withSubscribes; "this app" until nameApp names it). A tool's
+  // own notifies() sentence stays the only one.
+  private describeTools(tools: unknown[]): void {
+    for (let i = 0; i < tools.length; i++) {
+      const t = tools[i] as { name?: unknown; description?: unknown } | null;
+      if (!t || typeof t !== "object" || typeof t.name !== "string") continue;
+      const evs = this.declared.get(t.name);
+      if (!evs || evs.length === 0) continue;
+      const d = typeof t.description === "string" ? t.description : "";
+      const described = withSubscribes(d, evs.map((e) => e.description));
+      if (described !== d) tools[i] = { ...t, description: described };
+    }
   }
 
   /**

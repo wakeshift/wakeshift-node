@@ -304,7 +304,7 @@ test("a stateless server forwards the User-Agent, and what the core recognized r
       server.registerTool(
         "watch",
         { inputSchema: attached.inputs({ repo: z.string() }) },
-        attached.events("watch", async ({ repo }, call) => {
+        attached.events("watch", { subscribes: [build] }, async ({ repo }, call) => {
           subs.push(await call.subscribe(build, { repo }));
           return "Watching.";
         }),

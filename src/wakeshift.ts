@@ -1,4 +1,4 @@
-import { WakeshiftError } from "./errors.js";
+import { IdReusedError, WakeshiftError } from "./errors.js";
 import type { AnySchema } from "./zod.js";
 import type { HostContext, McpServerLike } from "./mcp.js";
 import { v1Req, type Req } from "./host.js";
@@ -117,11 +117,15 @@ export type Recipient = { user: string; subscription: string } | { native: strin
 
 /** What an event's emit did. */
 export interface Emitted {
-  /** Conversations it woke (or will). */
+  /** Conversations it reached: each woken now, or as soon as its agent can take it. */
   matched: number;
-  /** An earlier emit had this occurrence's id. */
+  /**
+   * A retry: an earlier emit, the same as this one, had its id, and this is
+   * that emit's result (nothing new was sent). The id on a different emit
+   * throws IdReusedError instead.
+   */
   duplicate: boolean;
-  /** User and native recipients with no live subscription it reached (an emit to several recipients only). */
+  /** User and native recipients with no live subscription it reached, whether `to` names one or many. */
   unmatched: (string | Recipient)[];
   /** Subscription recipients no longer live (or not that user's). */
   ended: (string | Recipient)[];
@@ -478,9 +482,9 @@ export class Wakeshift {
    *   })
    *   await message.emit({ channel: "eng" }, { from: "ada", text: "shipped" })
    */
-  defineEvent<A extends AnySchema, P extends AnySchema>(name: string, opts: EventOptions<A, P>): WakeEvent<A, P> {
+  defineEvent<A extends AnySchema, P extends AnySchema, N extends string = string>(name: N, opts: EventOptions<A, P>): WakeEvent<A, P, N> {
     if (this.events.has(name)) throw new Error(`wakeshift: event ${name} is defined twice`);
-    const ev = new WakeEvent<A, P>(this, name, opts);
+    const ev = new WakeEvent<A, P, N>(this, name, opts);
     this.events.set(name, ev as unknown as WakeEvent);
     this.published = null; // the manifest changed: sent again when next needed
     this.manifestVersion++;
@@ -550,11 +554,16 @@ export class Wakeshift {
     const seen = this.sends;
     let out: Out;
     try {
-      out = await this.request<Out>("POST", "/events/emit", body);
+      try {
+        out = await this.request<Out>("POST", "/events/emit", body);
+      } catch (err) {
+        if (!(err instanceof WakeshiftError && err.status === 404 && err.code === "unknown_event")) throw err;
+        await this.resendManifest(seen);
+        out = await this.request<Out>("POST", "/events/emit", body);
+      }
     } catch (err) {
-      if (!(err instanceof WakeshiftError && err.status === 404 && err.code === "unknown_event")) throw err;
-      await this.resendManifest(seen);
-      out = await this.request<Out>("POST", "/events/emit", body);
+      if (err instanceof WakeshiftError && err.status === 409 && err.code === "id_reused") throw new IdReusedError(err.detail, { cause: err });
+      throw err;
     }
     return { matched: out.matched, duplicate: !!out.duplicate, unmatched: recipientsOf(out.unmatched), ended: recipientsOf(out.ended) };
   }

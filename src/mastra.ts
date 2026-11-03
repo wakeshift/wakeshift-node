@@ -27,7 +27,7 @@
 //     id: "watch_ci",
 //     description: "Watch CI on a repo",
 //     inputSchema: attached.inputs(z.object({ owner: z.string(), repo: z.string() })),
-//     execute: attached.events("watch_ci", async ({ owner, repo }, call) => {
+//     execute: attached.events("watch_ci", { subscribes: [ciFinished] }, async ({ owner, repo }, call) => {
 //       await call.subscribe(ciFinished, { owner, repo })
 //       return `Watching CI on ${owner}/${repo}.`
 //     }),
@@ -41,7 +41,7 @@ import type { ToolCallExtra } from "./mcp.js";
 import type { ZodRawShapeCompat } from "./zod.js";
 import { attachHost, checkAttach, type AttachOptions, type BuiltinTool, type Identity } from "./events.js";
 import { lowServerHost, toolsOnlyHost, v2Req, type Handler } from "./host.js";
-import { Attached, CallEnded, type CallScope, type ToolCall, type WakeArgs, type WakeInputs, type WakeInputsV3, type WakeInputsV4, type WakeKey, type WakeOutputShape, type WakeOutputV3, type WakeOutputV4 } from "./toolcall.js";
+import { Attached, CallEnded, type AnyWakeEvent, type CallScope, type ToolCall, type ToolEventsOptions, type WakeArgs, type WakeInputs, type WakeInputsV3, type WakeInputsV4, type WakeKey, type WakeOutputShape, type WakeOutputV3, type WakeOutputV4 } from "./toolcall.js";
 import type { Wakeshift } from "./wakeshift.js";
 
 /** The @mastra/mcp releases serve() is built for: 2.x, from 2.7. */
@@ -86,6 +86,8 @@ type Scope = { call: CallScope<MastraContext> };
 /** Wakeshift in a Mastra MCPServer: make it with attachMastra, then serve your MCPServer with it. */
 export class MastraAttached {
   private readonly wrapped = new Set<string>();
+  // The events each wrapped tool declares (subscribes), by tool.
+  private readonly declared = new Map<string, readonly AnyWakeEvent[]>();
   // The call each wrapped tool's execute belongs to, by its request (ctx.mcpReq,
   // which Mastra passes the tool as context.mcp.extra.mcpReq).
   private readonly scopes = new WeakMap<object, Scope>();
@@ -132,14 +134,29 @@ export class MastraAttached {
    * subscriptions it made. Its inputSchema must come from attached.inputs.
    * Run outside an MCP request (by an agent, a workflow or Studio), the
    * handler gets a call whose subscribe throws.
+   *
+   * subscribes lists the events the tool subscribes to, as attach's
+   * attached.events takes it: call.subscribe takes only those, and
+   * tools/list says the tool is how the app notifies the agent of them.
+   * `execute: attached.events("watch_ci", { subscribes: [ciFinished] }, async (args, call) => …)`.
    */
+  events<P extends Record<string, any> = Record<string, any>, R = unknown, const E extends readonly AnyWakeEvent[] = readonly AnyWakeEvent[]>(
+    name: string,
+    opts: ToolEventsOptions<E>,
+    handler: (args: P, call: ToolCall<MastraContext, E[number]>, context: MastraToolContext) => R | Promise<R>,
+  ): (input: P & WakeArgs, context?: any) => Promise<R>;
   events<P extends Record<string, any> = Record<string, any>, R = unknown>(
     name: string,
     handler: (args: P, call: ToolCall<MastraContext>, context: MastraToolContext) => R | Promise<R>,
-  ): (input: P & WakeArgs, context?: any) => Promise<R> {
+  ): (input: P & WakeArgs, context?: any) => Promise<R>;
+  events(name: string, optsOrHandler: unknown, maybeHandler?: unknown): (input: any, context?: any) => Promise<any> {
     if (!name || typeof name !== "string") throw new Error("wakeshift: attached.events needs the tool's name, as your MCPServer serves it");
+    const declared = typeof optsOrHandler === "function" ? null : this.shapes.checkDeclared(name, optsOrHandler);
+    const handler = (typeof optsOrHandler === "function" ? optsOrHandler : maybeHandler) as (args: any, call: ToolCall<MastraContext>, context: MastraToolContext) => unknown;
     if (typeof handler !== "function") throw new Error("wakeshift: attached.events needs a handler");
     this.wrapped.add(name);
+    if (declared) this.declared.set(name, declared);
+    else this.declared.delete(name);
     return async (input, context) => {
       const key = context?.mcp?.extra?.mcpReq;
       const scope = key && typeof key === "object" ? this.scopes.get(key) : undefined;
@@ -148,7 +165,7 @@ export class MastraAttached {
         if (k !== "session_key" && k !== "harness" && k !== "conversation_id") args[k] = v;
       }
       const call = scope && scope.call.tool === name ? scope.call : detachedCall(name, context);
-      return handler(args as P, call, context ?? {});
+      return handler(args, call, context ?? {});
     };
   }
 
@@ -194,7 +211,7 @@ export class MastraAttached {
       }
       const events = this.wake.serveEvents();
       const attached = attachHost<MastraContext>(this.wake, host, events, this.opts);
-      for (const name of this.wrapped) attached.markWrapped(name);
+      for (const name of this.wrapped) attached.markWrapped(name, this.declared.get(name) ?? null);
       if (theirs.size > 0) shareEvents(handlers, theirs, new Set(events.map((e) => e.name)));
       this.wrapCalls(handlers, attached);
     } catch (err) {

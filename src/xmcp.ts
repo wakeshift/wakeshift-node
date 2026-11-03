@@ -28,8 +28,8 @@
 //
 //   // src/tools/watch_ci.ts
 //   export const schema = attached.inputs({ owner: z.string(), repo: z.string() })
-//   export const metadata = { name: "watch_ci", description: "Watch CI on a repo" }
-//   export default attached.events("watch_ci", async ({ owner, repo }, call) => { … })
+//   export const metadata = { name: "watch_ci", description: attached.describe("Watch CI on a repo.", { subscribes: [ciFinished] }) }
+//   export default attached.events("watch_ci", { subscribes: [ciFinished] }, async ({ owner, repo }, call) => { … })
 //
 //   // src/tools/subscribe_events.ts (and the same for the other two)
 //   const tool = attached.tool("subscribe_events")
@@ -39,9 +39,9 @@
 
 import type { AuthInfo, CallToolResult } from "./mcp.js";
 import type { ZodRawShapeCompat } from "./zod.js";
-import { BUILTIN_TOOLS, attachHost, checkAttach, type BuiltinTool, type Identity } from "./events.js";
+import { BUILTIN_TOOLS, attachHost, checkAttach, withSubscribes, type BuiltinTool, type Identity } from "./events.js";
 import { toolsOnlyHost, v1Req, type Req } from "./host.js";
-import { WAKESHIFT_FIELD, type Attached, type ToolCall, type WakeArgs, type WakeInputs, type WakeKey, type WrappedResult } from "./toolcall.js";
+import { WAKESHIFT_FIELD, type AnyWakeEvent, type Attached, type ToolCall, type ToolEventsOptions, type WakeArgs, type WakeInputs, type WakeKey, type WrappedResult } from "./toolcall.js";
 import type { Wakeshift } from "./wakeshift.js";
 
 const CLIENT_INFO_META = "io.modelcontextprotocol/clientInfo";
@@ -113,12 +113,27 @@ export class XmcpAttached {
    * a CallToolResult; the reply gets what Wakeshift adds for the
    * conversation, and a call that fails ends the subscriptions it made. Its
    * schema must come from attached.inputs.
+   *
+   * subscribes lists the events the tool subscribes to, as attach's
+   * attached.events takes it: call.subscribe takes only those. xmcp writes
+   * tools/list itself, so give the tool's metadata the same events with
+   * attached.describe.
    */
+  events<P extends Record<string, any> = Record<string, any>, const E extends readonly AnyWakeEvent[] = readonly AnyWakeEvent[]>(
+    name: string,
+    opts: ToolEventsOptions<E>,
+    handler: (args: P, call: ToolCall<XmcpExtra, E[number]>) => WrappedResult | Promise<WrappedResult>,
+  ): (args: P & WakeArgs, extra: XmcpExtra) => Promise<CallToolResult>;
   events<P extends Record<string, any> = Record<string, any>>(
     name: string,
     handler: (args: P, call: ToolCall<XmcpExtra>) => WrappedResult | Promise<WrappedResult>,
-  ): (args: P & WakeArgs, extra: XmcpExtra) => Promise<CallToolResult> {
-    const cb = this.attached.events<P & WakeArgs>(name, handler as (args: Omit<P & WakeArgs, WakeKey>, call: ToolCall<XmcpExtra>) => WrappedResult | Promise<WrappedResult>);
+  ): (args: P & WakeArgs, extra: XmcpExtra) => Promise<CallToolResult>;
+  events(name: string, optsOrHandler: unknown, maybeHandler?: unknown): (args: any, extra: XmcpExtra) => Promise<CallToolResult> {
+    type H = (args: Omit<WakeArgs, WakeKey>, call: ToolCall<XmcpExtra>) => WrappedResult | Promise<WrappedResult>;
+    const cb =
+      typeof optsOrHandler === "function"
+        ? this.attached.events<WakeArgs>(name, optsOrHandler as H)
+        : this.attached.events<WakeArgs, readonly AnyWakeEvent[]>(name, optsOrHandler as ToolEventsOptions<readonly AnyWakeEvent[]>, maybeHandler as H);
     return async (args, extra) => {
       const out = (await cb(args, extra)) as CallToolResult;
       // xmcp checks structuredContent against the tool's output schema after
@@ -131,6 +146,21 @@ export class XmcpAttached {
       }
       return out;
     };
+  }
+
+  /**
+   * A subscribing tool's description, for its tool file's metadata: your
+   * description, then the sentence attach's tools/list adds for the events
+   * the tool declares (their own descriptions: "This tool is how this app
+   * notifies you in this conversation of this event: …"). xmcp writes
+   * tools/list itself, so the sentence goes in the metadata, naming the
+   * app as app ("this app" if not given):
+   * `export const metadata = { name: "watch_ci", description: attached.describe("Watch CI on a repo.", { subscribes: [ciFinished], app: "CI bot" }) }`.
+   */
+  describe(description: string, opts: ToolEventsOptions & { app?: string }): string {
+    const list = opts?.subscribes;
+    if (!Array.isArray(list)) throw new Error("wakeshift: attached.describe(description, { subscribes }): subscribes lists the events the tool subscribes to");
+    return withSubscribes(description, list.map((e) => e.description), opts.app);
   }
 
   /** One of attach's own tools, for a tool file of its own (src/tools/<name>.ts): its schema, metadata and handler. */

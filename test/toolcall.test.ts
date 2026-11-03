@@ -14,8 +14,9 @@ import { StreamableHTTPClientTransport } from "./mcp.js";
 import { StreamableHTTPServerTransport } from "./mcp.js";
 import { McpError, type CallToolResult } from "./mcp.js";
 import { z } from "zod";
-import { CallEnded, notifies, Wakeshift, WakeshiftError, isCode, type Attached, type Subscription, type ToolCall } from "../src/index.js";
-import { CONVERSATION_META, mergeBlock, namesConversation, withWakeshiftField, type CallAddition } from "../src/toolcall.js";
+import { CallEnded, IdReusedError, notifies, Wakeshift, WakeshiftError, isCode, type Attached, type Subscription, type ToolCall } from "../src/index.js";
+import { CONVERSATION_META, mergeBlock, namesConversation, undeclaredSubscribe, withWakeshiftField, type CallAddition } from "../src/toolcall.js";
+import { withSubscribes } from "../src/events.js";
 
 const seed = Buffer.alloc(32, 9).toString("base64url");
 const KEY = `wst_test_cards_${seed}`;
@@ -36,6 +37,7 @@ class WakeCore {
   fail = new Set<string>();
   native: any[] = [];
   unsubscribeReply: any = { ended: true };
+  emitStatus = 200;
   emitReply: any = { matched: 2, duplicate: false, unmatched: ["u3", { native: "u4" }], ended: [{ user: "u2", subscription: "s2" }] };
   // The app's name, as GET /app gives it.
   appName = "Shipyard";
@@ -78,7 +80,7 @@ class WakeCore {
       case "/event-subscriptions/list":
         return reply(200, { subscriptions: this.native });
       case "/events/emit":
-        return reply(200, this.emitReply);
+        return reply(this.emitStatus, this.emitReply);
       case "/events/status":
         return reply(200, body.subscriptions ? { subscriptions: [] } : { subscriptions: 0, connected: 0 });
       case "/events/publish-urls":
@@ -613,7 +615,7 @@ test("native callers aren't subscribed: the block names the events to subscribe 
 
 test("structured output: any wrapped tool's structuredContent carries the block in wakeshift, and tools/list's output schema names it", async (t) => {
   const join = (name: string, ev: Events, attached: Attached) =>
-    attached.events(name, async ({ table }: any, call: ToolCall) => {
+    attached.events(name, { subscribes: [ev.news] }, async ({ table }: any, call) => {
       await call.subscribe(ev.news, { table });
       return { content: [{ type: "text" as const, text: JSON.stringify({ table }) }], structuredContent: { table } };
     });
@@ -746,6 +748,7 @@ test("shared fixture: an emit's recipients and its answer (emit-recipients.json)
   const f = JSON.parse(readFileSync(new URL("../../test/emit-recipients.json", import.meta.url), "utf8")) as {
     cases: { name: string; to: any[]; wire: unknown }[];
     responses: { name: string; response: unknown; emitted: unknown }[];
+    id_reused: { status: number; code: string; message: string };
     refused: { name: string; to: any[] }[];
     refused_code: string;
     one_user: { to: string; wire: string; refused: string[]; refused_code: string };
@@ -765,6 +768,18 @@ test("shared fixture: an emit's recipients and its answer (emit-recipients.json)
     core.emitReply = r.response;
     assert.deepEqual(await turn.emit({ table: "oak" }, { text: "go" }, { to: "u1" }), r.emitted, r.name);
   }
+  // An id used for a different emit: IdReusedError, a WakeshiftError.
+  core.emitStatus = f.id_reused.status;
+  core.emitReply = { error: { code: f.id_reused.code, message: f.id_reused.message } };
+  await assert.rejects(turn.emit({ table: "oak" }, { text: "go" }, { to: "u1", id: "m1" }), (e: unknown) => {
+    assert.ok(e instanceof IdReusedError && e instanceof WakeshiftError, String(e));
+    assert.equal(e.status, f.id_reused.status);
+    assert.equal(e.code, f.id_reused.code);
+    assert.equal(e.detail, f.id_reused.message);
+    assert.ok(isCode(e, "id_reused"));
+    return true;
+  });
+  core.emitStatus = 200;
   core.reset();
   for (const r of f.refused) await assert.rejects(turn.emit({ table: "oak" }, { text: "go" }, { to: r.to }), (e: unknown) => isCode(e, f.refused_code), r.name);
   await assert.rejects(news.emit({ table: "oak" }, { text: "go" }, { to: { native: "u1" } }), /isn't personal/);
@@ -893,4 +908,109 @@ test("notifies: tools/list names the app as the console has it, unless the tool 
   w2.core.appName = "";
   listed = Object.fromEntries((await w2.tools()).map((tool) => [tool.name, tool.description]));
   assert.equal(listed.watch_build, `Watch a build. ${N("this app")}`);
+});
+
+test("shared fixture: a tool that declares its events, as tools/list describes it (subscribes.json)", () => {
+  const { cases } = JSON.parse(readFileSync(new URL("../../test/subscribes.json", import.meta.url), "utf8")) as {
+    cases: { name: string; description: string; app: string; events: string[]; want: string }[];
+  };
+  assert.ok(cases.length >= 8);
+  for (const c of cases) assert.equal(withSubscribes(c.description, c.events, c.app), c.want, c.name);
+});
+
+const BUILT = "News at a table";
+const sentence = (app: string, of: string) =>
+  `This tool is how ${app} notifies you in this conversation ${of}. ${app[0].toUpperCase() + app.slice(1)} delivers its notifications through Wakeshift; the result may ask you to start a background listener and to offer the user a one-time install. Follow it.`;
+
+test("subscribes: tools/list adds the sentence from the declared events' descriptions, naming the app; never twice; not for tools that declare none", async (t) => {
+  const w = await wrapped(t, (server, attached, ev) => {
+    server.registerTool("watch", { description: "Watch a table.", inputSchema: attached.inputs({ table: z.string() }) }, attached.events("watch", { subscribes: [ev.news] }, async ({ table }, call) => {
+      await call.subscribe(ev.news, { table });
+      return "ok";
+    }));
+    server.registerTool("join", { description: "Join a table.", inputSchema: attached.inputs({ table: z.string() }) }, attached.events("join", { subscribes: [ev.turn, ev.news] }, async () => "ok"));
+    server.registerTool("custom", { description: notifies("Watch a table.", { when: "news breaks" }), inputSchema: attached.inputs({}) }, attached.events("custom", { subscribes: [ev.news] }, async () => "ok"));
+    server.registerTool("nothing", { description: "Look at a table.", inputSchema: attached.inputs({}) }, attached.events("nothing", { subscribes: [] }, async () => "ok"));
+    server.registerTool("old", { description: "Old style.", inputSchema: attached.inputs({}) }, attached.events("old", async () => "ok"));
+  });
+  const listed = Object.fromEntries((await w.tools()).map((tool) => [tool.name, tool.description]));
+  assert.equal(listed.watch, `Watch a table. ${sentence("Shipyard", `of this event: ${BUILT}`)}`);
+  assert.equal(listed.join, `Join a table. ${sentence("Shipyard", `of these events: Your turn; ${BUILT}`)}`);
+  assert.equal(listed.custom, `Watch a table. ${sentence("Shipyard", "when news breaks")}`);
+  assert.equal(listed.nothing, "Look at a table.");
+  assert.equal(listed.old, "Old style.");
+  assert.equal(w.core.calls.filter((c) => c.path === "/app").length, 1);
+  // A declared subscribe doesn't warn.
+  const res = await w.call("ada", "watch", { table: "oak" });
+  assert.equal(res.result?.isError, undefined, JSON.stringify(res));
+  assert.deepEqual(w.warnings, []);
+  // No name from Wakeshift: "this app".
+  const w2 = await wrapped(t, (server, attached, ev) => {
+    server.registerTool("watch", { description: "Watch a table.", inputSchema: attached.inputs({}) }, attached.events("watch", { subscribes: [ev.news] }, async () => "ok"));
+  });
+  w2.core.appName = "";
+  const listed2 = Object.fromEntries((await w2.tools()).map((tool) => [tool.name, tool.description]));
+  assert.equal(listed2.watch, `Watch a table. ${sentence("this app", `of this event: ${BUILT}`)}`);
+});
+
+test("subscribes: a subscribe the tool doesn't declare works, and warns once per tool with the fix; in error mode it's refused with the fix", async (t) => {
+  const w = await wrapped(t, (server, attached, ev) => {
+    server.registerTool("old", { inputSchema: attached.inputs({ table: z.string() }) }, attached.events("old", async ({ table }, call) => {
+      await call.subscribe(ev.news, { table });
+      return "ok";
+    }));
+    server.registerTool("other", { inputSchema: attached.inputs({ table: z.string() }) }, attached.events("other", { subscribes: [ev.turn] }, async ({ table }, call) => {
+      await (call as ToolCall).subscribe(ev.news, { table });
+      return "ok";
+    }));
+    server.registerTool("none", { inputSchema: attached.inputs({ table: z.string() }) }, attached.events("none", { subscribes: [] }, async ({ table }, call) => {
+      await (call as ToolCall).subscribe(ev.news, { table });
+      return "ok";
+    }));
+  });
+  for (let i = 0; i < 2; i++) {
+    for (const tool of ["old", "other", "none"]) {
+      const res = await w.call("ada", tool, { table: "oak" });
+      assert.equal(res.result?.isError, undefined, `${tool}: ${JSON.stringify(res)}`);
+    }
+  }
+  assert.equal(w.core.paths().filter((p) => p === "/event-subscriptions").length, 6);
+  assert.deepEqual(w.warnings, [
+    `wakeshift: the tool old subscribed to table.news without declaring the events it subscribes to, so tools/list doesn't tell the agent that the tool is how this app notifies it. Fix: attached.events("old", { subscribes: [<table.news's event>] }, handler). It works for now; from the next release an undeclared subscribe throws.`,
+    `wakeshift: the tool other subscribed to table.news, which its subscribes doesn't list (game.turn), so tools/list doesn't tell the agent that the tool is how this app notifies it. Fix: attached.events("other", { subscribes: [<game.turn's event>, <table.news's event>] }, handler). It works for now; from the next release an undeclared subscribe throws.`,
+    `wakeshift: the tool none subscribed to table.news, but declares that it subscribes to nothing, so tools/list doesn't tell the agent that the tool is how this app notifies it. Fix: attached.events("none", { subscribes: [<table.news's event>] }, handler). It works for now; from the next release an undeclared subscribe throws.`,
+  ]);
+
+  undeclaredSubscribe.error = true;
+  t.after(() => void (undeclaredSubscribe.error = false));
+  const e = await wrapped(t, (server, attached, ev) => {
+    server.registerTool("old", { inputSchema: attached.inputs({ table: z.string() }) }, attached.events("old", async ({ table }, call) => {
+      await call.subscribe(ev.news, { table });
+      return "ok";
+    }));
+    server.registerTool("ok", { inputSchema: attached.inputs({ table: z.string() }) }, attached.events("ok", { subscribes: [ev.news] }, async ({ table }, call) => {
+      await call.subscribe(ev.news, { table });
+      return "ok";
+    }));
+  });
+  const refused = await e.call("ada", "old", { table: "oak" });
+  assert.equal(refused.result?.isError, true, JSON.stringify(refused));
+  assert.ok(
+    texts(refused).join("\n").includes(`wakeshift: the tool old subscribed to table.news without declaring the events it subscribes to, so the subscribe was refused. Fix: attached.events("old", { subscribes: [<table.news's event>] }, handler).`),
+    JSON.stringify(refused),
+  );
+  assert.equal(e.core.paths().filter((p) => p === "/event-subscriptions").length, 0);
+  const fine = await e.call("ada", "ok", { table: "oak" });
+  assert.equal(fine.result?.isError, undefined, JSON.stringify(fine));
+  assert.deepEqual(e.warnings, []);
+});
+
+test("subscribes: only this app's events, as a list", () => {
+  const wake = new Wakeshift({ key: KEY, core: "http://core.test", fetch: (async () => new Response("{}")) as typeof fetch });
+  const other = new Wakeshift({ key: KEY, core: "http://core.test", fetch: (async () => new Response("{}")) as typeof fetch });
+  const ev = defineEvents(wake);
+  const theirs = defineEvents(other);
+  const attached = wake.attach(new McpServer({ name: "t", version: "1" }));
+  assert.throws(() => attached.events("x", { subscribes: [theirs.news] }, async () => "ok"), /subscribes lists table.news, which isn't one of this app's events/);
+  assert.throws(() => attached.events("x", { subscribes: ev.news } as any, async () => "ok"), /options.subscribes lists the events/);
 });

@@ -90,3 +90,57 @@ test("wrapped tools' types on the MCP SDK 2.x", () => {
     attached.events("wrong", () => 42),
   );
 });
+
+test("subscribes: call.subscribe takes only the declared events, and a tool that declares none has none", () => {
+  const { wake, turn, server, attached } = setup();
+  const news = wake.defineEvent("game.news", { description: "News", args: z.object({ table: z.string() }), payload: z.object({ text: z.string() }), text: (n) => n.text });
+  expectTypeOf(turn.name).toEqualTypeOf<"game.turn">();
+
+  server.registerTool(
+    "join",
+    { inputSchema: attached.inputs(z.object({ table: z.string() })) },
+    attached.events("join", { subscribes: [turn] }, async ({ table }, call) => {
+      expectTypeOf(call).toEqualTypeOf<ToolCall<ServerContext, typeof turn>>();
+      const sub = await call.subscribe(turn, { table }, { reason: "Playing" });
+      expectTypeOf(sub).toEqualTypeOf<Subscription>();
+      // @ts-expect-error: the event's arguments are checked
+      await call.subscribe(turn, { tabel: "x" });
+      // @ts-expect-error: game.news isn't declared
+      await call.subscribe(news, { table });
+      await call.unsubscribe(news, { table });
+      return "ok";
+    }),
+  );
+
+  server.registerTool(
+    "both",
+    { inputSchema: attached.inputs(z.object({ table: z.string() })) },
+    attached.events("both", { subscribes: [turn, news] }, async ({ table }, call) => {
+      await call.subscribe(turn, { table });
+      await call.subscribe(news, { table });
+      return "ok";
+    }),
+  );
+
+  server.registerTool(
+    "look",
+    { inputSchema: attached.inputs(z.object({ table: z.string() })) },
+    attached.events("look", { subscribes: [] }, async ({ table }, call) => {
+      // @ts-expect-error: a tool that declares no events has no subscribe
+      await call.subscribe(turn, { table });
+      await call.resolveSession();
+      return "ok";
+    }),
+  );
+
+  // The two-argument form keeps a call that takes any of the app's events (it warns at run time).
+  server.registerTool(
+    "old",
+    { inputSchema: attached.inputs(z.object({ table: z.string() })) },
+    attached.events("old", async ({ table }, call) => {
+      expectTypeOf(call).toEqualTypeOf<ToolCall<ServerContext>>();
+      await call.subscribe(news, { table });
+      return "ok";
+    }),
+  );
+});

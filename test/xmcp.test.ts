@@ -13,13 +13,14 @@ const seed = Buffer.alloc(32, 8).toString("base64url");
 
 function fakeCore(answers: Record<string, (body: any) => unknown> = {}) {
   const reqs: { path: string; body: any }[] = [];
+  const warnings: string[] = [];
   const fakeFetch = (async (url: string | URL | Request, init?: RequestInit) => {
     const path = String(url).replace("http://core.test/api/apps/v1", "");
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     reqs.push({ path, body });
     return new Response(JSON.stringify(answers[path]?.(body) ?? {}), { status: 200, headers: { "Content-Type": "application/json" } });
   }) as typeof fetch;
-  return { reqs, wake: new Wakeshift({ key: `wst_test_chat_${seed}`, core: "http://core.test", fetch: fakeFetch, onWarning: () => {} }) };
+  return { reqs, warnings, wake: new Wakeshift({ key: `wst_test_chat_${seed}`, core: "http://core.test", fetch: fakeFetch, onWarning: (m) => warnings.push(m) }) };
 }
 
 function chatApp(wake: Wakeshift) {
@@ -78,7 +79,7 @@ test("xmcp: a wrapped tool subscribes its caller, and its result carries the blo
   const schema = attached.inputs({ channel: z.string() });
   assert.ok(schema.session_key && schema.harness && schema.conversation_id);
   let native: boolean | undefined;
-  const handler = attached.events("watch", async ({ channel }: { channel: string }, call) => {
+  const handler = attached.events("watch", { subscribes: [message] }, async ({ channel }: { channel: string }, call) => {
     native = call.native;
     await call.subscribe(message, { channel });
     return { content: [{ type: "text", text: `Watching ${channel}.` }], structuredContent: { channel } };
@@ -119,4 +120,25 @@ test("xmcp: attachXmcp needs events, and gives only the tools it names", () => {
   assert.ok(attached.tool("list_subscriptions"));
   assert.throws(() => attached.tool("subscribe_events"), /leave out subscribe_events/);
   assert.throws(() => attached.tool("nope" as any), /attach's own tools are/);
+});
+
+test("xmcp: a subscribing tool's metadata says how the app notifies, from its events' descriptions; an undeclared subscribe warns once", async () => {
+  const { wake, warnings } = fakeCore({
+    "/event-subscriptions": () => ({ event_subscription: { id: "es1", user: "ada", created: true }, session: "wsc_1", pending: "pa_1" }),
+    "/calls/addition": () => ({ text: "Woken by the connector." }),
+  });
+  const message = chatApp(wake);
+  const attached = attachXmcp(wake, { identify });
+  const T = (app: string) =>
+    `Watch a channel. This tool is how ${app} notifies you in this conversation of this event: A new message in a channel. ${app[0].toUpperCase() + app.slice(1)} delivers its notifications through Wakeshift; the result may ask you to start a background listener and to offer the user a one-time install. Follow it.`;
+  assert.equal(attached.describe("Watch a channel.", { subscribes: [message] }), T("this app"));
+  assert.equal(attached.describe("Watch a channel.", { subscribes: [message], app: "Chat" }), T("Chat"));
+  assert.equal(attached.describe("List channels.", { subscribes: [] }), "List channels.");
+  const old = attached.events("old", async ({ channel }: { channel: string }, call) => {
+    await call.subscribe(message, { channel });
+    return "ok";
+  });
+  await old({ channel: "eng" }, extra({}));
+  await old({ channel: "eng" }, extra({}));
+  assert.equal(warnings.filter((w) => w.includes("the tool old subscribed to chat.message without declaring")).length, 1, warnings.join("\n"));
 });
