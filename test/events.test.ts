@@ -157,7 +157,7 @@ test("requestApp never sends the manifest from a process with no events, or one 
   );
 });
 
-test("a process that only emits never sends the manifest", async () => {
+test("a process that only emits sends no manifest while Wakeshift knows the event", async () => {
   const { wake, reqs } = fakeCore({ "/events/emit": () => ({ json: { matched: 0 } }) });
   const chat = chatEvent(wake);
   await chat.emit({ channel: "eng" }, { from: "ada", text: "shipped" });

@@ -14,7 +14,7 @@ import { StreamableHTTPClientTransport } from "./mcp.js";
 import { StreamableHTTPServerTransport } from "./mcp.js";
 import { McpError, type CallToolResult } from "./mcp.js";
 import { z } from "zod";
-import { CallEnded, Wakeshift, WakeshiftError, isCode, type Attached, type Subscription, type ToolCall } from "../src/index.js";
+import { CallEnded, notifies, Wakeshift, WakeshiftError, isCode, type Attached, type Subscription, type ToolCall } from "../src/index.js";
 import { CONVERSATION_META, mergeBlock, namesConversation, withWakeshiftField, type CallAddition } from "../src/toolcall.js";
 
 const seed = Buffer.alloc(32, 9).toString("base64url");
@@ -37,6 +37,8 @@ class WakeCore {
   native: any[] = [];
   unsubscribeReply: any = { ended: true };
   emitReply: any = { matched: 2, duplicate: false, unmatched: ["u3", { native: "u4" }], ended: [{ user: "u2", subscription: "s2" }] };
+  // The app's name, as GET /app gives it.
+  appName = "Shipyard";
   // A subscribe waits for this, when set (the in-flight test).
   hold?: Promise<void>;
 
@@ -47,6 +49,8 @@ class WakeCore {
     const reply = (status: number, json: unknown) => new Response(JSON.stringify(json), { status, headers: { "Content-Type": "application/json" } });
     if (this.fail.has(path)) return reply(503, { error: { code: "unavailable", message: "down" } });
     switch (path) {
+      case "/app":
+        return reply(200, { id: "cards", name: this.appName, key: { key_id: "k1", name: "test" } });
       case "/manifest":
       case "/manifest/merge":
         return reply(200, body ?? { description: "" }); // GET: nothing published yet
@@ -864,4 +868,29 @@ test("shared fixture: the mistakes every SDK refuses before asking Wakeshift (er
     assert.ok(!err.detail.startsWith("wakeshift:"), `${c.name}: ${err.detail}`);
     assert.deepEqual([...w.core.paths(), ...anon.core.paths()].filter((p) => p !== "/calls/addition"), [], `${c.name}: Wakeshift was asked`);
   }
+});
+
+test("notifies: tools/list names the app as the console has it, unless the tool named one; without a name it says this app", async (t) => {
+  const N = (app: string, when = "") =>
+    `This tool is how ${app} notifies you in this conversation${when ? ` when ${when}` : ""}. ${app[0].toUpperCase() + app.slice(1)} delivers its notifications through Wakeshift; the result may ask you to start a background listener and to offer the user a one-time install. Follow it.`;
+  const handler = (name: string, attached: Attached) => attached.events(name, async () => "ok");
+  const w = await wrapped(t, (server, attached) => {
+    server.registerTool("watch_build", { description: notifies("Watch a build.", { when: "a build finishes" }), inputSchema: attached.inputs({}) }, handler("watch_build", attached));
+    server.registerTool("watch_named", { description: notifies("Watch a build.", { app: "Acme CI" }), inputSchema: attached.inputs({}) }, handler("watch_named", attached));
+    server.registerTool("list_builds", { description: "List builds.", inputSchema: attached.inputs({}) }, handler("list_builds", attached));
+  });
+  let listed = Object.fromEntries((await w.tools()).map((tool) => [tool.name, tool.description]));
+  assert.equal(listed.watch_build, `Watch a build. ${N("Shipyard", "a build finishes")}`);
+  assert.equal(listed.watch_named, `Watch a build. ${N("Acme CI")}`);
+  assert.equal(listed.list_builds, "List builds.");
+  // Asked once.
+  await w.tools();
+  assert.equal(w.core.calls.filter((c) => c.path === "/app").length, 1);
+  // No name from Wakeshift: "this app".
+  const w2 = await wrapped(t, (server, attached) => {
+    server.registerTool("watch_build", { description: notifies("Watch a build."), inputSchema: attached.inputs({}) }, handler("watch_build", attached));
+  });
+  w2.core.appName = "";
+  listed = Object.fromEntries((await w2.tools()).map((tool) => [tool.name, tool.description]));
+  assert.equal(listed.watch_build, `Watch a build. ${N("this app")}`);
 });

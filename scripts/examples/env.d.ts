@@ -13,6 +13,7 @@ declare global {
   // Imports an example leaves out.
   const Wakeshift: typeof SDK.Wakeshift;
   const isCode: typeof SDK.isCode;
+  const notifies: typeof SDK.notifies;
   const McpServer: typeof McpServerClass;
   const z: typeof zod;
 

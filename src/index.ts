@@ -24,6 +24,8 @@ export {
   WakeEvent,
   ArgsError,
   EVENT_TOOL_TEXT,
+  notifies,
+  type NotifiesOptions,
   SUBSCRIBE_TOOL_DESCRIPTION,
   UNSUBSCRIBE_TOOL_DESCRIPTION,
   LIST_TOOL_DESCRIPTION,

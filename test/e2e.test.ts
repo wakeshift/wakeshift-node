@@ -15,6 +15,7 @@ import type { AddressInfo } from "node:net";
 import { createHmac, randomBytes } from "node:crypto";
 import { StreamableHTTPServerTransport } from "./mcp.js";
 import { StreamableHTTPClientTransport } from "./mcp.js";
+import { createMcpHandler as createMcpHandlerV2, McpServer as McpServerV2 } from "@modelcontextprotocol/server";
 import { Wakeshift, isCode, type AgentScope, type Manifest, type Subscription } from "../src/index.js";
 
 const harness = process.env.WAKESHIFT_SDK_HARNESS;
@@ -165,6 +166,42 @@ async function statelessApp(t: { after(fn: () => void): void }, wake: Wakeshift,
   };
   return call;
 }
+
+// First in this file, while the harness's app has no manifest: an app that
+// serves through createMcpHandler (a server per request, so attach runs only
+// once a request comes in) emits at startup, before any agent has
+// connected. The emit's unknown_event sends the manifest (a merge), and the
+// emit goes again and succeeds.
+test("an emit at startup, before any request, against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async () => {
+  const { core, key } = JSON.parse(readFileSync(harness!, "utf8")) as { core: string; key: string };
+  const sent: string[] = [];
+  const recorded = (async (url: string | URL | Request, init?: RequestInit) => {
+    const resp = await fetch(url, init);
+    sent.push(`${init?.method ?? "GET"} ${String(url).replace(core + "/api/apps/v1", "")} ${resp.status}`);
+    return resp;
+  }) as typeof fetch;
+  const wake = new Wakeshift({ key, core, fetch: recorded });
+  const boot = wake.defineEvent("app.booted", {
+    description: "The app started.",
+    args: z.object({}),
+    payload: z.object({ version: z.string() }),
+    text: (p) => `Started ${p.version}`,
+  });
+  // As an app serves: attach runs in the factory, once per request; none
+  // comes in during this test.
+  createMcpHandlerV2(() => {
+    const server = new McpServerV2({ name: "ci-bot", version: "1.0" });
+    wake.attach(server as never);
+    return server;
+  });
+  const out = await boot.emit({}, { version: "1.2.3" });
+  assert.equal(out.matched, 0);
+  assert.deepEqual(sent, ["POST /events/emit 404", "POST /manifest/merge 200", "POST /events/emit 200"]);
+  // From now on Wakeshift knows the event: the next emit is one request.
+  await boot.emit({}, { version: "1.2.4" });
+  assert.equal(sent.length, 4);
+  assert.equal(sent[3], "POST /events/emit 200");
+});
 
 test("the SDK against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async (t) => {
   const { core, key } = JSON.parse(readFileSync(harness!, "utf8")) as { core: string; key: string };

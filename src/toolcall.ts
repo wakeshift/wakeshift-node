@@ -16,6 +16,7 @@
 //       return `You're seated at ${table}.`
 //     }))
 
+import { UNNAMED_APP, unnamedNotifiesParts } from "./events.js";
 import { z } from "zod";
 import * as z3 from "zod/v3";
 import * as z4 from "zod/v4";
@@ -840,7 +841,10 @@ export class Attached<C = any> {
       (h: Handler): Handler =>
       async (request, extra) => {
         const out = await h(request, extra);
-        if (out && Array.isArray(out.tools)) this.amendTools(out.tools);
+        if (out && Array.isArray(out.tools)) {
+          this.amendTools(out.tools);
+          await this.nameApp(out.tools);
+        }
         return out;
       };
     const h = handlers.get("tools/list");
@@ -848,6 +852,28 @@ export class Attached<C = any> {
     const set = handlers.set.bind(handlers);
     handlers.set = (method: string, h: Handler) => set(method, method === "tools/list" ? wrap(h) : h);
   }
+
+  /**
+   * notifies(description) with no app named says "this app": tools/list
+   * names the app instead, as the console has it (GET /app, asked once). A
+   * name Wakeshift doesn't give leaves "this app".
+   */
+  private async nameApp(tools: unknown[]): Promise<void> {
+    const [first, second] = unnamedNotifiesParts();
+    const has = (t: unknown) => {
+      const d = (t as { description?: unknown } | null)?.description;
+      return typeof d === "string" && d.includes(first) && d.includes(second);
+    };
+    if (!tools.some(has)) return;
+    const name = (await this.at.wake.app().catch(() => null))?.name?.trim();
+    if (!name) return;
+    const [named1, named2] = [first.replace(UNNAMED_APP, name), second.replace("This app", name.charAt(0).toUpperCase() + name.slice(1))];
+    for (let i = 0; i < tools.length; i++) {
+      const t = tools[i] as { description: string };
+      if (has(t)) tools[i] = { ...t, description: t.description.replace(first, named1).replace(second, named2) };
+    }
+  }
+
 
   private amendTools(tools: unknown[]): void {
     for (let i = 0; i < tools.length; i++) {
