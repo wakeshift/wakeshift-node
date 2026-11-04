@@ -68,6 +68,9 @@ test("the wait tool and the wire format are every SDK's (test/mcp-tasks-wire.jso
   assert.equal(golden.extension, TASKS_EXTENSION);
   assert.equal(golden.hold_seconds, TASK_HOLD_SECONDS);
   assert.deepEqual(golden.wait_tool, JSON.parse(JSON.stringify(WAIT_TOOL_DEFINITION)));
+  // Its annotations are the ones every SDK gives it (test/tool-annotations.json).
+  const annotations = JSON.parse(readFileSync(new URL("../../test/tool-annotations.json", import.meta.url), "utf8"));
+  assert.deepEqual(golden.wait_tool.annotations, annotations[WAIT_TOOL]);
 
   const answers = new Map<string, any>();
   const { wake, reqs } = fakeCore((path) => answers.get(path));

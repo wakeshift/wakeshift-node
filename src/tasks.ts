@@ -36,6 +36,34 @@ export const TASK_ID_PREFIX = "wkt1_";
 /** How long Wakeshift holds a tasks/get for a working task, in seconds. */
 export const TASK_HOLD_SECONDS = 20;
 
+/**
+ * @internal The MCP annotations of attach's own tools and the wait tool: a
+ * title and all four hints, so app stores (ChatGPT's) and clients see each
+ * stated rather than the spec's defaults (destructive, open world). Every SDK
+ * gives the same: test/tool-annotations.json.
+ */
+export const TOOL_ANNOTATIONS = {
+  // Idempotent: the core keeps one subscription per conversation, event and
+  // arguments, so a second call renews that one ("renewed") rather than
+  // making another.
+  subscribe_events: { title: "Subscribe to events", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  // Not destructive (MCP: "may perform destructive updates"): it ends only the
+  // caller's own subscriptions, and ending one is reversible. The
+  // conversation's own come back with subscribe_events; one ended by id may
+  // deliver to a webhook or be polled, which whoever made it can make again.
+  // The record is marked ended, not deleted. Idempotent: a second call ends
+  // nothing and says so (not_subscribed, no_such_id), without an error.
+  unsubscribe_events: { title: "Unsubscribe from events", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  // Only reads: clients that approve read-only tools without asking (Codex,
+  // by default) don't ask.
+  list_subscriptions: { title: "List subscriptions", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  // Not read-only or idempotent: each call confirms (acks) the messages the
+  // previous wait handed over and starts a new wait in its place, so a second
+  // call differs from the first. Not destructive: it confirms only messages
+  // already given to this conversation, and drops none.
+  wakeshift_wait: { title: "Wait for messages", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+} as const;
+
 /** The wait tool as tools/list lists it. */
 export const WAIT_TOOL_DEFINITION = {
   name: WAIT_TOOL,
@@ -49,6 +77,7 @@ export const WAIT_TOOL_DEFINITION = {
     },
     additionalProperties: false,
   },
+  annotations: TOOL_ANNOTATIONS.wakeshift_wait,
 } as const;
 
 export { TASKS_EXTENSION, takesTasks };

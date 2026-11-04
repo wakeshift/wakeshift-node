@@ -18,6 +18,7 @@ import {
   type BuiltinTool,
 } from "../src/index.js";
 import { speaksEvents, toolChoice, type AttachOptions } from "../src/events.js";
+import { TOOL_ANNOTATIONS } from "../src/tasks.js";
 
 const seed = Buffer.alloc(32, 9).toString("base64url");
 const KEY = `wst_test_chat_${seed}`;
@@ -293,10 +294,11 @@ test("attach: bridged clients get subscribe_events; every client gets unsubscrib
   assert.ok(Object.keys(sub.inputSchema.properties ?? {}).includes("session_key"));
   assert.equal(byName.get("unsubscribe_events")!.description, UNSUBSCRIBE_TOOL_DESCRIPTION);
   assert.equal(byName.get("list_subscriptions")!.description, LIST_TOOL_DESCRIPTION);
-  // Only list_subscriptions only reads, and says so.
+  // Each with every SDK's annotations (test/tool-annotations.json): only
+  // list_subscriptions only reads, and says so.
+  const annotations = goldenFile("tool-annotations.json");
+  for (const [name, t] of byName) assert.deepEqual(t.annotations, annotations[name], name);
   assert.equal(byName.get("list_subscriptions")!.annotations?.readOnlyHint, true);
-  assert.notEqual(byName.get("subscribe_events")!.annotations?.readOnlyHint, true);
-  assert.notEqual(byName.get("unsubscribe_events")!.annotations?.readOnlyHint, true);
 
   const r = await client.callTool({ name: "subscribe_events", arguments: { event: "chat.message", arguments: { channel: "eng" }, harness: "claude-code" } });
   assert.equal(text(r), 'Subscribed to chat.message {"channel":"eng"}.\n\nStart the Monitor tool now.');
@@ -700,6 +702,10 @@ function inputShape(s: any): any {
   );
   return { properties, ...(s.required ? { required: s.required } : {}) };
 }
+
+test("the built-in tools' annotations are every SDK's (test/tool-annotations.json)", () => {
+  assert.deepEqual(sorted(JSON.parse(JSON.stringify(TOOL_ANNOTATIONS))), goldenFile("tool-annotations.json"));
+});
 
 test("the event tools' wording is the Go SDK's (test/event-tools.json)", () => {
   assert.deepEqual(sorted({ ...EVENT_TOOL_TEXT }), goldenFile("event-tools.json"));

@@ -7,6 +7,7 @@
 // release.
 
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { Server, createMcpHandler } from "@modelcontextprotocol/server";
 import { z } from "zod";
@@ -157,6 +158,11 @@ test("mastra: tools/list has the app's tools, Wakeshift's own, and the wait tool
   assert.equal(listed.result.tools.find((t: any) => t.name === "ping").description, "Ping");
   const sub = listed.result.tools.find((t: any) => t.name === "subscribe_events");
   assert.deepEqual(sub.inputSchema.properties.event.enum, ["chat.message"]);
+  // Wakeshift's own tools and the wait tool carry every SDK's annotations.
+  const annotations = JSON.parse(readFileSync(new URL("../../test/tool-annotations.json", import.meta.url), "utf8"));
+  for (const name of Object.keys(annotations)) {
+    assert.deepEqual(listed.result.tools.find((t: any) => t.name === name).annotations, annotations[name], name);
+  }
   assert.equal(listed.result.cacheScope, "private");
 
   // A client that speaks MCP Events subscribes natively: no subscribe_events, no wait tool.

@@ -4,6 +4,7 @@
 // (ts-xmcp), pinned and on its newest release.
 
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { z } from "zod";
 import { Wakeshift } from "../src/index.js";
@@ -56,7 +57,11 @@ test("xmcp: attach's own tools are tool files: schema, metadata and handler", as
   assert.equal(sub.metadata.name, "subscribe_events");
   assert.match(sub.metadata.description, /chat\.message\(channel\): A new message in a channel/);
   assert.deepEqual(Object.keys(sub.schema).sort(), ["arguments", "conversation_id", "event", "harness", "session_key"]);
-  assert.deepEqual(attached.tool("list_subscriptions").metadata.annotations, { readOnlyHint: true, idempotentHint: true });
+  // Every SDK's annotations (test/tool-annotations.json); xmcp serves no wait tool.
+  const annotations = JSON.parse(readFileSync(new URL("../../test/tool-annotations.json", import.meta.url), "utf8"));
+  for (const name of ["subscribe_events", "unsubscribe_events", "list_subscriptions"] as const) {
+    assert.deepEqual(attached.tool(name).metadata.annotations, annotations[name], name);
+  }
 
   const res = await sub.handler({ event: "chat.message", arguments: { channel: "eng" } }, extra({ "x-codex-turn-metadata": { thread_id: "th_1" } }));
   assert.match(res.content[0].type === "text" ? res.content[0].text : "", /^Subscribed to chat\.message/);

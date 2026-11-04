@@ -29,7 +29,7 @@ import {
 import { toolCallOf, userAgentOf, type Emitted, type PublishUrl, type Recipient, type Via, type Wakeshift } from "./wakeshift.js";
 import { Attached, wakeInputsFor, type EventsOptions } from "./toolcall.js";
 import { serveStateless } from "./discover.js";
-import { serveTasks } from "./tasks.js";
+import { serveTasks, TOOL_ANNOTATIONS } from "./tasks.js";
 
 /** Who is subscribing: what authorize decides on. */
 export interface Subscriber {
@@ -886,6 +886,7 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
     {
       description: `${EVENT_TOOL_TEXT.subscribe_description}${EVENT_TOOL_TEXT.events_heading}${listed}${more}`,
       inputSchema: { event: z.enum(names).describe(EVENT_TOOL_TEXT.event_argument), arguments: argsInput, ...toolArgs },
+      annotations: { ...TOOL_ANNOTATIONS.subscribe_events },
     },
     async (input, raw) => {
       const { event, arguments: rawArgs, ...rest } = input as { event: string; arguments?: Record<string, unknown> };
@@ -926,6 +927,7 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
         id: z.string().optional().describe(EVENT_TOOL_TEXT.id_argument),
         ...toolArgs,
       },
+      annotations: { ...TOOL_ANNOTATIONS.unsubscribe_events },
     },
     async (input, raw) => {
       const { event, arguments: rawArgs, id, ...rest } = input as { event?: string; arguments?: Record<string, unknown>; id?: string };
@@ -951,12 +953,10 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
       }
     },
   );
-  // list_subscriptions only reads: marked so (readOnlyHint), clients that
-  // approve read-only tools without asking (Codex, by default) don't ask; and
-  // idempotent, as in every SDK (test/events-list.json).
+  // Annotated as in every SDK (TOOL_ANNOTATIONS, test/tool-annotations.json).
   register(
     "list_subscriptions",
-    { description: EVENT_TOOL_TEXT.list_description, inputSchema: { ...toolArgs }, annotations: { readOnlyHint: true, idempotentHint: true } },
+    { description: EVENT_TOOL_TEXT.list_description, inputSchema: { ...toolArgs }, annotations: { ...TOOL_ANNOTATIONS.list_subscriptions } },
     async (_input, raw) => {
       const user = identityOf(raw)?.user;
       if (!user) return fail(fill("list_no_user"));
