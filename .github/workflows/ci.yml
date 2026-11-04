@@ -34,3 +34,24 @@ jobs:
       # where they live, in Wakeshift's own repository.
       - run: WAKESHIFT_EXAMPLES_README_ONLY=1 npm test
       - run: npm pack --dry-run
+
+  # The examples (examples/trigger-dev, examples/inngest), with Trigger.dev,
+  # Inngest and Wakeshift mocked. They install @wakeshift/sdk from npm.
+  examples:
+    name: Examples (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 26]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Type-check and test
+        run: |
+          for d in examples/trigger-dev examples/inngest; do
+            (cd "$d" && npm ci --ignore-scripts --no-fund --no-audit && npm run typecheck && npm test) || exit 1
+          done

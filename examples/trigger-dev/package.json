@@ -1,0 +1,29 @@
+{
+  "name": "wakeshift-example-trigger-dev",
+  "version": "1.0.0",
+  "description": "Wake the agent that started a Trigger.dev task when the task finishes, with Wakeshift.",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --env-file=.env src/server.ts",
+    "dev:trigger": "trigger dev",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-test-module-mocks --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/node": "2.1.2",
+    "@modelcontextprotocol/server": "2.4.0",
+    "@trigger.dev/sdk": "4.8.3",
+    "@wakeshift/sdk": "0.10.2",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "trigger.dev": "4.8.3",
+    "typescript": "7.0.2"
+  }
+}

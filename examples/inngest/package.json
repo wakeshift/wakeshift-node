@@ -1,0 +1,32 @@
+{
+  "name": "wakeshift-example-inngest",
+  "version": "1.0.0",
+  "description": "Wake the agent that started an Inngest function when the function finishes, with Wakeshift.",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --env-file=.env src/server.ts",
+    "dev:inngest": "npx --yes --ignore-scripts=false inngest-cli@1.49.0 dev --no-discovery -u http://localhost:3000/api/inngest",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/node": "2.1.2",
+    "@modelcontextprotocol/server": "2.4.0",
+    "@wakeshift/sdk": "0.10.2",
+    "inngest": "4.26.2",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@inngest/test": "1.0.0",
+    "@types/node": "22.20.5",
+    "typescript": "7.0.2"
+  },
+  "overrides": {
+    "zod": "$zod"
+  }
+}
