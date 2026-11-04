@@ -313,20 +313,25 @@ export interface CallAddition {
 
 type Content = CallToolResult["content"][number];
 
-// takeTrailer takes a beacon line off the end of the result's text
-// (dropping its block if nothing else is in it), returning it ("" if
-// there's none).
-function takeTrailer(content: Content[]): string {
-  const last = content.at(-1);
-  if (!last || last.type !== "text") return "";
-  const text = last.text.replace(/[ \t\r\n]+$/, "");
-  const i = text.lastIndexOf("\n");
-  const line = i >= 0 ? text.slice(i + 1) : text;
-  if (!line.startsWith(BEACON_LINE_PREFIX) || !line.endsWith(")")) return "";
-  const rest = i >= 0 ? text.slice(0, i).replace(/[ \t\r\n]+$/, "") : "";
-  if (rest === "") content.pop();
-  else content[content.length - 1] = { ...last, text: rest };
-  return line;
+// dropTrailers takes every beacon line off the end of the result's last
+// text (dropping its block if nothing else is in it). Only Wakeshift's own
+// trailer may end a wrapped tool's text: a hook acts on the beacon there,
+// and one in the app's text may be someone else's, relayed (a chat message
+// carrying a beacon minted for another session).
+function dropTrailers(content: Content[]): void {
+  for (;;) {
+    let i = content.length - 1;
+    while (i >= 0 && content[i]!.type !== "text") i--;
+    if (i < 0) return;
+    const block = content[i] as Extract<Content, { type: "text" }>;
+    const text = block.text.replace(/[ \t\r\n]+$/, "");
+    const j = text.lastIndexOf("\n");
+    const line = j >= 0 ? text.slice(j + 1) : text;
+    if (!line.startsWith(BEACON_LINE_PREFIX) || !line.endsWith(")")) return;
+    const rest = j >= 0 ? text.slice(0, j).replace(/[ \t\r\n]+$/, "") : "";
+    if (rest === "") content.splice(i, 1);
+    else content[i] = { ...block, text: rest };
+  }
 }
 
 /** The structuredContent field a wrapped tool's structured result carries Wakeshift's block in (the same in every SDK). */
@@ -352,8 +357,10 @@ export function withWakeshiftField(schema: unknown): unknown {
 /**
  * @internal Adds the call's block to a wrapped handler's result: Wakeshift's
  * text as a block after the app's content, then a text-carried beacon last,
- * and _meta; a string result stays one text block. A result that already
- * carries a beacon keeps it, last, and gets no second one. A structured
+ * and _meta; a string result stays one text block. Beacon lines ending the
+ * app's own text are dropped (dropTrailers), whether or not there's a block
+ * to add. A result whose own _meta carries a connector beacon gets no second
+ * one, in _meta or its text. A structured
  * result (structuredContent an object) gets the block's text in its
  * wakeshift field too. test/wrapped-block.json is the shape, shared with
  * the other SDKs.
@@ -364,13 +371,11 @@ export function mergeBlock(result: WrappedResult, add: CallAddition): CallToolRe
   const out: CallToolResult = { ...base, content: [...(base.content ?? [])] };
   const text = (add.text ?? "").trim();
   const metaBeacon = !!out._meta && CONNECTOR_META_KEY in out._meta;
-  const existing = takeTrailer(out.content);
+  dropTrailers(out.content);
   if (text) out.content.push({ type: "text", text });
-  const has = metaBeacon || existing !== "";
-  if (existing) out.content.push({ type: "text", text: existing });
-  else if (!has && add.trailer) out.content.push({ type: "text", text: add.trailer });
+  if (!metaBeacon && add.trailer) out.content.push({ type: "text", text: add.trailer });
   for (const [k, v] of Object.entries(add.meta ?? {})) {
-    if (k === CONNECTOR_META_KEY && has) continue;
+    if (k === CONNECTOR_META_KEY && metaBeacon) continue;
     out._meta = { ...(out._meta ?? {}), [k]: v };
   }
   if (isString) {
@@ -689,6 +694,15 @@ export class CallScope<C> implements ToolCall<C> {
   }
 }
 
+// isInputRequired is whether a handler's result asks the client for input
+// first (resultType input_required, or input requests), as the MCP SDK
+// 2.x's isInputRequiredResult and go-sdk's NeedsInput read it.
+function isInputRequired(result: WrappedResult): boolean {
+  if (!result || typeof result !== "object") return false;
+  const r = result as { resultType?: unknown; inputRequests?: unknown };
+  return r.resultType === "input_required" || (!!r.inputRequests && typeof r.inputRequests === "object" && Object.keys(r.inputRequests).length > 0);
+}
+
 function recognizedOf(a: Partial<Recognized> | undefined): Recognized {
   return { harness: a?.harness ?? null, via: a?.via ?? null, claimed: a?.claimed ?? null };
 }
@@ -909,6 +923,14 @@ export class Attached<C = any> {
       await call.rollback();
       return result as unknown as CallToolResult;
     }
+    // A result that asks the client for input (protocol 2026-07-28's
+    // input_required) isn't final: the client calls again with the answers,
+    // and the handler subscribes again then. Nothing it subscribed stays,
+    // and it gets no block (content beside inputRequests is refused).
+    if (isInputRequired(result)) {
+      await call.rollback();
+      return result as CallToolResult;
+    }
     if ((typeof result === "object" && result.isError) || host.req(extra).signal?.aborted || !(await host.validOutput(outputSchema, result))) {
       await call.rollback();
       return typeof result === "string" ? { content: [{ type: "text", text: result }] } : result;
@@ -993,7 +1015,8 @@ export class Attached<C = any> {
   /**
    * notifies(description) with no app named says "this app": tools/list
    * names the app instead, as the console has it (GET /app, asked once). A
-   * name Wakeshift doesn't give leaves "this app".
+   * name Wakeshift doesn't give, or doesn't give in time (wake.appName),
+   * leaves "this app".
    */
   private async nameApp(tools: unknown[]): Promise<void> {
     const [first, second] = unnamedNotifiesParts();
@@ -1002,7 +1025,7 @@ export class Attached<C = any> {
       return typeof d === "string" && d.includes(first) && d.includes(second);
     };
     if (!tools.some(has)) return;
-    const name = (await this.at.wake.app().catch(() => null))?.name?.trim();
+    const name = await this.at.wake.appName();
     if (!name) return;
     const [named1, named2] = [first.replace(UNNAMED_APP, name), second.replace("This app", name.charAt(0).toUpperCase() + name.slice(1))];
     for (let i = 0; i < tools.length; i++) {

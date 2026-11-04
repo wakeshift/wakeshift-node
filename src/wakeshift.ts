@@ -11,6 +11,13 @@ import { takesTasks } from "./discover.js";
 /** Wakeshift's production core, the default for every key but an older wst_test_ one. Override with `core` or WAKESHIFT_CORE. */
 export const DEFAULT_CORE = "https://app.wakeshift.ai";
 
+/**
+ * @internal How long tools/list waits for the app's name (GET /app) before
+ * saying "this app" (waitMs), and how long after a failed or unanswered
+ * fetch it doesn't ask again (retryMs). Tests shorten them.
+ */
+export const nameFetch = { waitMs: 3_000, retryMs: 60_000 };
+
 /** The tool argument an agent passes its session key in (a result gives it one). */
 export const SESSION_ARG = "session_key";
 
@@ -325,6 +332,34 @@ export class Wakeshift {
         throw err;
       });
     return this.appInfo;
+  }
+
+  // When the name fetch for tools/list last failed or went unanswered (ms).
+  private nameFailedAt: number | null = null;
+
+  /**
+   * @internal The app's name for tools/list (app()'s), or "" when Wakeshift
+   * doesn't answer within nameFetch.waitMs: tools/list doesn't wait longer
+   * for it, and after a failure doesn't ask again for nameFetch.retryMs, so a
+   * slow or failing Wakeshift neither stalls nor multiplies tools/list.
+   */
+  async appName(): Promise<string> {
+    if (this.nameFailedAt !== null && Date.now() - this.nameFailedAt < nameFetch.retryMs) return "";
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), nameFetch.waitMs);
+      timer.unref?.();
+    });
+    try {
+      const info = await Promise.race([this.app(), late]);
+      if (info) return info.name.trim();
+    } catch {
+      // as unanswered
+    } finally {
+      clearTimeout(timer);
+    }
+    this.nameFailedAt = Date.now();
+    return "";
   }
 
   /** @internal The app's ID if it's known yet (the key names it, or app() has answered), else null. */

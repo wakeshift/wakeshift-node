@@ -15,6 +15,7 @@ import { StreamableHTTPServerTransport } from "./mcp.js";
 import { McpError, type CallToolResult } from "./mcp.js";
 import { z } from "zod";
 import { CallEnded, IdReusedError, notifies, Wakeshift, WakeshiftError, isCode, type Attached, type Subscription, type ToolCall } from "../src/index.js";
+import { nameFetch } from "../src/wakeshift.js";
 import { CONVERSATION_META, mergeBlock, namesConversation, undeclaredSubscribe, withWakeshiftField, type CallAddition } from "../src/toolcall.js";
 import { withSubscribes } from "../src/events.js";
 
@@ -43,6 +44,8 @@ class WakeCore {
   appName = "Shipyard";
   // A subscribe waits for this, when set (the in-flight test).
   hold?: Promise<void>;
+  // GET /app waits for this, when set (the slow-name test).
+  appHold?: Promise<void>;
 
   fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     const path = String(url).replace("http://core.test/api/apps/v1", "");
@@ -52,6 +55,7 @@ class WakeCore {
     if (this.fail.has(path)) return reply(503, { error: { code: "unavailable", message: "down" } });
     switch (path) {
       case "/app":
+        if (this.appHold) await this.appHold;
         return reply(200, { id: "cards", name: this.appName, key: { key_id: "k1", name: "test" } });
       case "/manifest":
       case "/manifest/merge":
@@ -908,6 +912,55 @@ test("notifies: tools/list names the app as the console has it, unless the tool 
   w2.core.appName = "";
   listed = Object.fromEntries((await w2.tools()).map((tool) => [tool.name, tool.description]));
   assert.equal(listed.watch_build, `Watch a build. ${N("this app")}`);
+});
+
+test("a result that asks the client for input (input_required) isn't final: what it subscribed is rolled back, and it gets no block", async (t) => {
+  const w = await wrapped(t, (server, attached, ev) => {
+    server.registerTool("confirm_join", { inputSchema: attached.inputs({ table: z.string() }) }, attached.events("confirm_join", { subscribes: [ev.news] }, async ({ table }, call) => {
+      await call.subscribe(ev.news, { table });
+      return { content: [], resultType: "input_required", inputRequests: { confirm: { method: "elicitation/create", params: { message: `Join ${table}?` } } } } as unknown as CallToolResult;
+    }));
+  });
+  await w.call("ada", "confirm_join", { table: "oak", session_key: "wsc_s1" });
+  assert.deepEqual(w.core.paths(), ["/event-subscriptions", "/event-subscriptions/unsubscribe"]);
+  assert.equal(w.core.bodies("/event-subscriptions/unsubscribe")[0].reason, "rolled_back");
+});
+
+test("notifies: tools/list waits only so long for the app's name, and doesn't ask again soon after a failure", async (t) => {
+  const saved = { ...nameFetch };
+  Object.assign(nameFetch, { waitMs: 100, retryMs: 60_000 });
+  t.after(() => void Object.assign(nameFetch, saved));
+  const N = "This tool is how this app notifies you in this conversation.";
+  const register: Register = (server, attached) =>
+    server.registerTool("watch", { description: notifies("Watch."), inputSchema: attached.inputs({}) }, attached.events("watch", async () => "ok"));
+  const appCalls = (w: { core: WakeCore }) => w.core.calls.filter((c) => c.path === "/app").length;
+
+  // Wakeshift doesn't answer: tools/list says "this app" after waitMs, then
+  // doesn't wait (or ask) again within retryMs.
+  const slow = await wrapped(t, register);
+  let release!: () => void;
+  slow.core.appHold = new Promise<void>((r) => (release = r));
+  t.after(() => release());
+  for (let i = 0; i < 3; i++) {
+    const t0 = Date.now();
+    const listed = (await slow.tools()).find((tool) => tool.name === "watch");
+    assert.ok(listed.description.includes(N), listed.description);
+    assert.ok(Date.now() - t0 < 2_000, `tools/list #${i} took ${Date.now() - t0}ms`);
+  }
+  assert.equal(appCalls(slow), 1);
+
+  // Wakeshift fails: asked once within retryMs.
+  const failing = await wrapped(t, register);
+  failing.core.fail.add("/app");
+  await failing.tools();
+  await failing.tools();
+  assert.equal(appCalls(failing), 1);
+  // After retryMs, asked again, and named once it answers.
+  nameFetch.retryMs = 0;
+  failing.core.fail.delete("/app");
+  const listed = (await failing.tools()).find((tool) => tool.name === "watch");
+  assert.ok(listed.description.includes("This tool is how Shipyard notifies you"), listed.description);
+  assert.equal(appCalls(failing), 2);
 });
 
 test("shared fixture: a tool that declares its events, as tools/list describes it (subscribes.json)", () => {
