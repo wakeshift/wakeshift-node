@@ -120,6 +120,10 @@ test("xmcp: attachXmcp needs events, and gives only the tools it names", () => {
   assert.ok(attached.tool("list_subscriptions"));
   assert.throws(() => attached.tool("subscribe_events"), /leave out subscribe_events/);
   assert.throws(() => attached.tool("nope" as any), /attach's own tools are/);
+  // The object form: each on unless disabled.
+  const own = attachXmcp(wake, { tools: { subscribe: { enabled: false }, unsubscribe: { enabled: false } } });
+  assert.ok(own.tool("list_subscriptions"));
+  assert.throws(() => own.tool("subscribe_events"), /leave out subscribe_events/);
 });
 
 test("xmcp: a subscribing tool's metadata says how the app notifies, from its events' descriptions; an undeclared subscribe warns once", async () => {

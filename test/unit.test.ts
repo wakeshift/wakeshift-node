@@ -204,7 +204,7 @@ test("a call packs only what's there: strings, trimmed claims, no empty fields",
   assert.deepEqual(packCall({ clientName: "x", meta: {}, harness: "", conversation: "  ", tool: "" }), { client: "x" });
   // attach's own tools read Wakeshift's arguments from theirs: strings only, not empty ones.
   const extra = { _meta: { "claudecode/toolUseId": "toolu_1" }, requestInfo: { headers: { "user-agent": "opencode/1.18.7" } } };
-  assert.deepEqual(toolCallOf(extra, "", "ada", { session_key: "wsc_x", harness: "cursor", conversation_id: "c1" }, "subscribe_events"), {
+  assert.deepEqual(toolCallOf(extra, "", "ada", { session_key: "wsc_x", harness: "cursor", conversation_id: "c1" }, "subscribe_events", false), {
     client: "",
     user: "ada",
     meta: extra._meta,
@@ -214,7 +214,7 @@ test("a call packs only what's there: strings, trimmed claims, no empty fields",
     conversation: "c1",
     tool: "subscribe_events",
   });
-  assert.deepEqual(toolCallOf(undefined, "x", undefined, { session_key: 7, harness: "", conversation_id: "  " }, "list_subscriptions"), { client: "x", tool: "list_subscriptions" });
+  assert.deepEqual(toolCallOf(undefined, "x", undefined, { session_key: 7, harness: "", conversation_id: "  " }, "list_subscriptions", false), { client: "x", tool: "list_subscriptions" });
 });
 
 test("Wakeshift's arguments: session_key, harness and conversation_id, optional strings the agent is told how to fill", () => {

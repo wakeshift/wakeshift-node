@@ -802,7 +802,7 @@ test("polling and the wait task against a real core", { skip: !harness && "set W
   const build = ciBuild(wake);
   const send = await rawRpc(() => {
     const server = new McpServer({ name: "ci-bot", version: "1.0" });
-    const attached = wake.attach(server, { identify: () => ({ user: "poller" }) });
+    const attached = wake.attach(server, { identify: () => ({ user: "poller" }), tools: { wait: { enabled: true } } });
     server.registerTool(
       "watch",
       { inputSchema: attached.inputs({ repo: z.string() }) },
@@ -860,4 +860,38 @@ test("polling and the wait task against a real core", { skip: !harness && "set W
   for (let i = 0; got.result?.status === "working" && i < 3; i++) got = await rpc("tasks/get", { taskId }, "claude-code", tasks);
   assert.equal(got.result?.status, "completed", `tasks/get: ${JSON.stringify(got)}`);
   assert.match(JSON.stringify(got.result), /tasked build/);
+
+  // Without wait (attach's default), the same Claude Code, whose requests
+  // take tasks, sees no wait tool, and Wakeshift tells it about the plugin,
+  // with the Monitor as the fallback: nothing names wakeshift_wait.
+  const sendOff = await rawRpc(() => {
+    const server = new McpServer({ name: "ci-bot", version: "1.0" });
+    const attached = wake.attach(server, { identify: () => ({ user: "no-wait" }) });
+    server.registerTool(
+      "watch",
+      { inputSchema: attached.inputs({ repo: z.string() }) },
+      attached.events("watch", async ({ repo }, call) => {
+        await call.subscribe(build, { repo });
+        return `Watching ${repo}.`;
+      }),
+    );
+    return server;
+  });
+  const rpcOff = (method: string, params: Record<string, unknown>): Promise<any> =>
+    sendOff(method, {
+      ...params,
+      _meta: {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": { name: "claude-code", version: "1.0" },
+        "io.modelcontextprotocol/clientCapabilities": tasks,
+      },
+    });
+  const offList = await rpcOff("tools/list", {});
+  assert.ok(offList.result && !offList.result.tools.some((x: any) => x.name === "wakeshift_wait"), JSON.stringify(offList));
+  const offWatched = await rpcOff("tools/call", { name: "watch", arguments: { repo: "untasked" } });
+  assert.ok(offWatched.result, JSON.stringify(offWatched));
+  const offSaid = text(offWatched.result);
+  assert.ok(!offSaid.includes("wakeshift_wait"), offSaid);
+  assert.match(offSaid, /Monitor/, offSaid);
+  assert.match(offSaid, /Notify me in every session/, offSaid);
 });

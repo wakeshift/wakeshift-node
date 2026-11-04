@@ -96,7 +96,7 @@ test("2.x on 2026-07-28: a wrapped tool's call reaches Wakeshift as from 1.x, an
   let seen: ServerContext | undefined;
   const rpc = serve(() => {
     const server = new McpServer({ name: "chat", version: "1" });
-    const attached = wake.attach(server, { identify: (ctx) => ({ user: ctx.http?.authInfo?.clientId }) });
+    const attached = wake.attach(server, { identify: (ctx) => ({ user: ctx.http?.authInfo?.clientId }), tools: { wait: { enabled: true } } });
     server.registerTool(
       "watch",
       { description: "Watch a channel", inputSchema: attached.inputs(z.object({ channel: z.string() })), outputSchema: z.object({ channel: z.string() }) },
@@ -261,15 +261,23 @@ test("2.x: attach warns, once, on a server too old to route tasks/get", () => {
   const warnings: string[] = [];
   const wake = new Wakeshift({ key: `wst_test_chat_${seed}`, core: "http://core.test", onWarning: (m) => warnings.push(m) });
   chatApp(wake);
-  wake.attach(new McpServer({ name: "chat", version: "1" }));
+  wake.attach(new McpServer({ name: "chat", version: "1" }), { tools: { wait: { enabled: true } } });
   assert.deepEqual(warnings, [], "the installed 2.x routes them");
   for (let i = 0; i < 2; i++) {
     const old = new McpServer({ name: "chat", version: "1" });
     // What 2.0 to 2.2 lack: the Set of methods registered with a schema,
     // which 2.3.0's era gate lets through (stubbed, so registering still works).
     (old.server as unknown as Record<string, unknown>)._customSchemaRequestMethods = { add() {}, delete() {}, has: () => false };
-    wake.attach(old);
+    wake.attach(old, { tools: { wait: { enabled: true } } });
   }
+  // Without the wait tool there's nothing to route, so nothing to say.
+  const quiet: string[] = [];
+  const off = new Wakeshift({ key: `wst_test_chat_${seed}`, core: "http://core.test", onWarning: (m) => quiet.push(m) });
+  chatApp(off);
+  const old = new McpServer({ name: "chat", version: "1" });
+  (old.server as unknown as Record<string, unknown>)._customSchemaRequestMethods = { add() {}, delete() {}, has: () => false };
+  off.attach(old);
+  assert.deepEqual(quiet, []);
   assert.equal(warnings.length, 1, warnings.join("\n"));
   assert.match(warnings[0], /@modelcontextprotocol\/server is older than 2\.3\.0/);
   assert.match(warnings[0], /Upgrade @modelcontextprotocol\/server to 2\.3\.0 or later/);

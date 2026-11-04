@@ -32,7 +32,7 @@ const turn = wake.defineEvent("game.turn", { description: "Your move", args: z.o
 
 function app(): McpServer {
   const server = new McpServer({ name: "cards", version: "1.0.0" });
-  const attached = wake.attach(server, { identify: (ctx: ServerContext) => ({ user: ctx.http?.authInfo?.clientId ?? "u1" }) });
+  const attached = wake.attach(server, { identify: (ctx: ServerContext) => ({ user: ctx.http?.authInfo?.clientId ?? "u1" }), tools: { wait: { enabled: true } } });
   server.registerTool(
     "join",
     { inputSchema: attached.inputs(z.object({ table: z.string() })) },

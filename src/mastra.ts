@@ -39,7 +39,7 @@ import type * as z3 from "zod/v3";
 import type * as z4 from "zod/v4";
 import type { ToolCallExtra } from "./mcp.js";
 import type { ZodRawShapeCompat } from "./zod.js";
-import { attachHost, checkAttach, type AttachOptions, type BuiltinTool, type Identity } from "./events.js";
+import { attachHost, checkAttach, type AttachOptions, type AttachTools, type BuiltinTool, type Identity } from "./events.js";
 import { lowServerHost, toolsOnlyHost, v2Req, type Handler } from "./host.js";
 import { Attached, CallEnded, type AnyWakeEvent, type CallScope, type ToolCall, type ToolEventsOptions, type WakeArgs, type WakeInputs, type WakeInputsV3, type WakeInputsV4, type WakeKey, type WakeOutputShape, type WakeOutputV3, type WakeOutputV4 } from "./toolcall.js";
 import type { Wakeshift } from "./wakeshift.js";
@@ -309,4 +309,4 @@ export function attachMastra(wake: Wakeshift, opts: MastraAttachOptions = {}): M
   return new MastraAttached(wake, opts);
 }
 
-export { CallEnded, type BuiltinTool, type Identity, type ToolCall, type WakeArgs };
+export { CallEnded, type AttachTools, type BuiltinTool, type Identity, type ToolCall, type WakeArgs };

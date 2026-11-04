@@ -17,7 +17,7 @@ import {
   WakeshiftError,
   type BuiltinTool,
 } from "../src/index.js";
-import { speaksEvents } from "../src/events.js";
+import { speaksEvents, toolChoice, type AttachOptions } from "../src/events.js";
 
 const seed = Buffer.alloc(32, 9).toString("base64url");
 const KEY = `wst_test_chat_${seed}`;
@@ -39,7 +39,8 @@ function fakeCore(replies: Record<string, (body: any) => { status?: number; json
     const r = replies[path]?.(body) ?? { json: {} };
     return new Response(JSON.stringify(r.json), { status: r.status ?? 200, headers: { "Content-Type": "application/json" } });
   }) as typeof fetch;
-  return { reqs, wake: new Wakeshift({ key: KEY, core: "http://core.test", fetch: fakeFetch }) };
+  const warnings: string[] = [];
+  return { reqs, warnings, wake: new Wakeshift({ key: KEY, core: "http://core.test", fetch: fakeFetch, onWarning: (m) => warnings.push(m) }) };
 }
 
 function chatEvent(wake: Wakeshift) {
@@ -547,23 +548,48 @@ test("an authorize that throws refuses, on both paths, and the app hears why", a
   assert.equal(reqs.filter((u) => u.includes("subscribe")).length, 0, "nothing reached the core");
 });
 
-test("attach's tools option picks which of its own tools it adds: all three by default, the ones named, or none", async () => {
+test("attach's tools option picks which of its own tools it adds: all three by default, each { enabled }, or (deprecated) the ones a list names", async () => {
   assert.deepEqual([...BUILTIN_TOOLS], ["subscribe_events", "unsubscribe_events", "list_subscriptions"]);
-  const listed = async (tools?: readonly BuiltinTool[]) => {
-    const { wake } = fakeCore();
+  const listed = async (tools?: AttachOptions["tools"]) => {
+    const { wake, warnings } = fakeCore();
     chatEvent(wake);
     const server = new McpServer({ name: "chat", version: "1.0.0" });
     server.registerTool("ping", { inputSchema: {} }, async () => ({ content: [] }));
     wake.attach(server, { identify: () => ({ user: "u1" }), tools });
     const client = await connect(server, "claude-code");
-    return (await client.listTools()).tools.map((t) => t.name).sort();
+    return { names: (await client.listTools()).tools.map((t) => t.name).sort(), warnings };
   };
-  assert.deepEqual(await listed(), ["list_subscriptions", "ping", "subscribe_events", "unsubscribe_events"]);
-  assert.deepEqual(await listed(["list_subscriptions", "unsubscribe_events"]), ["list_subscriptions", "ping", "unsubscribe_events"]);
-  assert.deepEqual(await listed([]), ["ping"]);
+  const all = ["list_subscriptions", "ping", "subscribe_events", "unsubscribe_events"];
+  // The object form: each on unless disabled; no warning.
+  for (const tools of [undefined, {}, { subscribe: {} }, { list: { enabled: true } }, { wait: { enabled: false } }]) {
+    const { names, warnings } = await listed(tools);
+    assert.deepEqual(names, all, JSON.stringify(tools));
+    assert.deepEqual(warnings, [], JSON.stringify(tools));
+  }
+  assert.deepEqual((await listed({ subscribe: { enabled: false } })).names, ["list_subscriptions", "ping", "unsubscribe_events"]);
+  assert.deepEqual((await listed({ subscribe: { enabled: false }, list: { enabled: false }, unsubscribe: { enabled: false } })).names, ["ping"]);
+  // The list form, deprecated: the tools it names, and a warning, once.
+  const named = await listed(["list_subscriptions", "unsubscribe_events"]);
+  assert.deepEqual(named.names, ["list_subscriptions", "ping", "unsubscribe_events"]);
+  assert.equal(named.warnings.length, 1);
+  assert.match(named.warnings[0], /tools as a list of names is deprecated/);
+  assert.deepEqual((await listed([])).names, ["ping"]);
   const { wake } = fakeCore();
   chatEvent(wake);
-  assert.throws(() => wake.attach(new McpServer({ name: "x", version: "1.0.0" }), { tools: ["subscribe" as BuiltinTool] }), /"subscribe"/);
+  const server = () => new McpServer({ name: "x", version: "1.0.0" });
+  assert.throws(() => wake.attach(server(), { tools: ["subscribe" as BuiltinTool] }), /"subscribe"/);
+  assert.throws(() => wake.attach(server(), { tools: { subscribe_events: { enabled: false } } as any }), /tools has "subscribe_events"/);
+  assert.throws(() => wake.attach(server(), { tools: { wait: true } as any }), /tools\.wait is an object/);
+  assert.throws(() => wake.attach(server(), { tools: { wait: { enabled: "yes" } } as any }), /tools\.wait\.enabled is true or false/);
+  assert.throws(() => wake.attach(server(), { tools: { wait: { holdSeconds: 5 } } as any }), /tools\.wait has "holdSeconds"/);
+});
+
+test("toolChoice: the object form and the deprecated list form, and the wait tool only when enabled", () => {
+  assert.deepEqual(toolChoice(undefined), { builtin: new Set(BUILTIN_TOOLS), wait: false });
+  assert.deepEqual(toolChoice({ wait: { enabled: true } }), { builtin: new Set(BUILTIN_TOOLS), wait: true });
+  assert.deepEqual(toolChoice({ list: { enabled: false } }), { builtin: new Set(["subscribe_events", "unsubscribe_events"]), wait: false });
+  // A list never turns the wait tool on.
+  assert.deepEqual(toolChoice(["subscribe_events"]), { builtin: new Set(["subscribe_events"]), wait: false });
 });
 
 test("attach needs events, and must come before connecting", async () => {

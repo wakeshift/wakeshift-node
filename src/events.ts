@@ -457,20 +457,98 @@ export interface AttachOptions<C = any> {
    */
   identify?(extra: C): Identity | undefined;
   /**
-   * Which of attach's own tools it adds (BUILTIN_TOOLS): subscribe_events,
-   * unsubscribe_events and list_subscriptions. Default: all three; `[]`
-   * adds none. Leave out unsubscribe_events or list_subscriptions only if
-   * your own tools let a person see and stop their subscriptions.
+   * Which of attach's own tools it adds, each `{ enabled }` (AttachTools):
+   * `subscribe` (subscribe_events), `list` (list_subscriptions) and
+   * `unsubscribe` (unsubscribe_events), on unless disabled, and `wait`
+   * (wakeshift_wait, Claude Code's wait tool), off unless enabled:
+   * `tools: { wait: { enabled: true } }`. Disable `list` or `unsubscribe`
+   * only if your own tools let a person see and stop their subscriptions.
+   *
+   * Deprecated: a list of names (BUILTIN_TOOLS) still works for now, adding
+   * only the tools it names, and never the wait tool.
    */
-  tools?: readonly BuiltinTool[];
+  tools?: AttachTools | readonly BuiltinTool[];
   /** The event features' options: events.native overrides native detection for wrapped tools (attached.events). */
   events?: EventsOptions<C>;
 }
 
-/** The tools attach adds, unless AttachOptions.tools names fewer. */
+/** The tools attach adds by default (deprecated as AttachOptions.tools' list form). */
 export const BUILTIN_TOOLS = ["subscribe_events", "unsubscribe_events", "list_subscriptions"] as const;
-/** One of attach's own tools. */
+/** One of attach's own tools, by name (AttachOptions.tools' deprecated list form). */
 export type BuiltinTool = (typeof BUILTIN_TOOLS)[number];
+
+/** One of attach's own tools' options (AttachTools). */
+export interface ToolOptions {
+  /** Whether attach adds it. Default: on, except the wait tool. */
+  enabled?: boolean;
+}
+
+/**
+ * The wait tool's options (AttachTools.wait): Wakeshift's wait tool,
+ * wakeshift_wait, Claude Code's wake path with nothing installed, where
+ * its client takes MCP tasks (protocol 2026-07-28, on a stateless server).
+ * Off by default: Claude Code is then woken by its plugin or, after a no, a
+ * background Monitor, as every other server's is. On, a waiting
+ * conversation's Claude Code holds a request to this server (tasks/get,
+ * about 20 seconds) and sends the next about a second later, for as long as
+ * it waits: on a serverless host, give the function a timeout of at least
+ * 30 seconds, and expect one held invocation per waiting conversation.
+ */
+export interface WaitToolOptions extends ToolOptions {}
+
+/** Which of attach's own tools it adds (AttachOptions.tools). */
+export interface AttachTools {
+  /** wakeshift_wait, Claude Code's wait tool: off unless enabled. */
+  wait?: WaitToolOptions;
+  /** subscribe_events, for clients that don't speak MCP Events: on unless disabled. */
+  subscribe?: ToolOptions;
+  /** list_subscriptions: on unless disabled. */
+  list?: ToolOptions;
+  /** unsubscribe_events: on unless disabled. */
+  unsubscribe?: ToolOptions;
+}
+
+/** @internal Which of attach's own tools to add, from AttachOptions.tools. */
+export interface ToolChoice {
+  builtin: Set<BuiltinTool>;
+  wait: boolean;
+}
+
+const TOOL_KEYS = { subscribe: "subscribe_events", list: "list_subscriptions", unsubscribe: "unsubscribe_events" } as const;
+
+/**
+ * @internal AttachOptions.tools as the tools to add: each `{ enabled }` of
+ * the object form, or the names of the deprecated list form (never the
+ * wait tool). Throws on a key, name or value it doesn't know.
+ */
+export function toolChoice(tools: AttachOptions<any>["tools"], what = "attach"): ToolChoice {
+  if (tools === undefined) return { builtin: new Set(BUILTIN_TOOLS), wait: false };
+  if (Array.isArray(tools)) {
+    for (const t of tools) {
+      if (!(BUILTIN_TOOLS as readonly string[]).includes(t)) throw new Error(`wakeshift: ${what}'s tools names "${t}": its own tools are ${BUILTIN_TOOLS.join(", ")}`);
+    }
+    return { builtin: new Set(tools as readonly BuiltinTool[]), wait: false };
+  }
+  if (!tools || typeof tools !== "object") throw new Error(`wakeshift: ${what}'s tools is { wait, subscribe, list, unsubscribe }, each { enabled }`);
+  const o = tools as AttachTools;
+  for (const [k, v] of Object.entries(o)) {
+    if (k !== "wait" && !(k in TOOL_KEYS)) throw new Error(`wakeshift: ${what}'s tools has "${k}": its own tools are wait, subscribe, list and unsubscribe`);
+    if (v === undefined) continue;
+    if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error(`wakeshift: ${what}'s tools.${k} is an object, { enabled }`);
+    for (const [ok, ov] of Object.entries(v)) {
+      if (ok !== "enabled") throw new Error(`wakeshift: ${what}'s tools.${k} has "${ok}": its options are { enabled }`);
+      if (ov !== undefined && typeof ov !== "boolean") throw new Error(`wakeshift: ${what}'s tools.${k}.enabled is true or false`);
+    }
+  }
+  const builtin = new Set<BuiltinTool>();
+  for (const [k, name] of Object.entries(TOOL_KEYS)) if (o[k as keyof typeof TOOL_KEYS]?.enabled !== false) builtin.add(name);
+  return { builtin, wait: o.wait?.enabled === true };
+}
+
+/** @internal The warning for AttachOptions.tools' deprecated list form. */
+export function toolsListWarning(what = "attach"): string {
+  return `wakeshift: ${what}'s tools as a list of names is deprecated: pass { subscribe, list, unsubscribe }, each { enabled } (and wait: { enabled: true } for Claude Code's wait tool)`;
+}
 
 // What a client says about itself on initialize (2.x: or the request's
 // envelope), or a request's _meta; else the name identify gave (identified).
@@ -644,17 +722,20 @@ export function attachEvents<C>(wake: Wakeshift, server: McpServerLike, events: 
   return attachHost(wake, hostOf(server), events, opts);
 }
 
-/** @internal What attach refuses before it touches a server: no events, or an own tool it doesn't have. */
+/** @internal What attach refuses before it touches a server: no events, or tools it doesn't know. */
 export function checkAttach(events: WakeEvent[], opts: AttachOptions<any>, what = "attach"): void {
   if (events.length === 0) throw new Error(`wakeshift: ${what} needs at least one event (wake.defineEvent) defined first`);
-  for (const t of opts.tools ?? []) {
-    if (!(BUILTIN_TOOLS as readonly string[]).includes(t)) throw new Error(`wakeshift: ${what}'s tools names "${t}": its own tools are ${BUILTIN_TOOLS.join(", ")}`);
-  }
+  toolChoice(opts.tools, what);
 }
 
 /** @internal attach on a Host: an McpServer's, or a framework adapter's (mastra.ts, xmcp.ts). */
 export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], opts: AttachOptions<C> = {}): Attached<C> {
-  const tools = new Set<BuiltinTool>(opts.tools ?? BUILTIN_TOOLS);
+  const choice = toolChoice(opts.tools);
+  if (Array.isArray(opts.tools)) wake.warnOnce("tools-list", toolsListWarning());
+  const tools = choice.builtin;
+  // The wait tool, only if the app turns it on and the MCP SDK's request
+  // handlers can be reached (tasks.ts): otherwise no call says it takes tasks.
+  const wait = choice.wait && !!host.handlers();
   // raw is the MCP SDK's own request context (1.x's extra, 2.x's ctx): what identify gets.
   const identityOf = (raw: unknown): Identity | undefined => opts.identify?.(raw as C) ?? undefined;
   // Who's calling: the user, and the client's name (the request's, else identify's).
@@ -669,6 +750,7 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
     clientOf: (meta, identified) => clientInfoName(host, meta, identified),
     events: opts.events ?? {},
     warnOnce: (key, message) => wake.warnOnce(key, message),
+    wait,
   });
   const byName = new Map(events.map((e) => [e.name, e]));
   try {
@@ -681,7 +763,7 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
     // events and the built-in tools still work, but not what wraps the SDK's own methods.
     wake.warnOnce(
       "handlers",
-      "wakeshift: this MCP SDK keeps its request handlers where Wakeshift can't reach them, so wakeshift_wait, the 2026-07-28 tools/list changes and wrapped tools' output schemas are off: check for a newer @wakeshift/sdk",
+      `wakeshift: this MCP SDK keeps its request handlers where Wakeshift can't reach them, so ${choice.wait ? "wakeshift_wait, " : ""}the 2026-07-28 tools/list changes and wrapped tools' output schemas are off: check for a newer @wakeshift/sdk`,
     );
   }
   // Clients that speak only protocol 2026-07-28 (OpenClaw): on the MCP SDK
@@ -689,8 +771,8 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
   // (discover.ts); on 2.x, its own.
   serveStateless(host, { bridgedOnly: ["subscribe_events"] });
   // Clients that take MCP tasks there (Claude Code): Wakeshift's wait tool,
-  // answered with a task (tasks.ts).
-  serveTasks(wake, host, callerOf);
+  // answered with a task (tasks.ts), if the app turns it on (wait).
+  if (wait) serveTasks(wake, host, callerOf);
   // tools/list: a wrapped tool's output schema names wakeshift, which its
   // structured results carry (toolcall.ts).
   attached.amendToolsList();
@@ -822,7 +904,7 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
       }
       try {
         const out = await wake.requestApp<{ event_subscription: { id: string; created: boolean }; addition: ToolAddition; agent?: unknown }>("POST", "/event-subscriptions", {
-          call: toolCallOf(host.req(raw), client, user, rest, "subscribe_events"),
+          call: toolCallOf(host.req(raw), client, user, rest, "subscribe_events", wait),
           name: ev.name,
           arguments: args,
         });
@@ -858,7 +940,7 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
         if (!ev) return fail(fill("need"));
         const args = ev.parseArgs(rawArgs ?? {});
         const out = await wake.requestApp<{ ended: boolean; addition?: ToolAddition }>("POST", "/event-subscriptions/unsubscribe", {
-          call: toolCallOf(host.req(raw), client, user, rest, "unsubscribe_events"),
+          call: toolCallOf(host.req(raw), client, user, rest, "unsubscribe_events", wait),
           name: ev.name,
           arguments: args,
         });

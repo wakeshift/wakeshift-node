@@ -38,6 +38,9 @@ export {
   MAX_STATUS_SUBSCRIPTIONS,
   type EventTypeManifest,
   type AttachOptions,
+  type AttachTools,
+  type ToolOptions,
+  type WaitToolOptions,
   type Identity,
   type Subscriber,
 } from "./events.js";

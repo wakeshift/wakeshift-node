@@ -39,7 +39,7 @@
 
 import type { AuthInfo, CallToolResult } from "./mcp.js";
 import type { ZodRawShapeCompat } from "./zod.js";
-import { BUILTIN_TOOLS, attachHost, checkAttach, withSubscribes, type BuiltinTool, type Identity } from "./events.js";
+import { BUILTIN_TOOLS, attachHost, checkAttach, withSubscribes, type AttachTools, type BuiltinTool, type Identity } from "./events.js";
 import { toolsOnlyHost, v1Req, type Req } from "./host.js";
 import { WAKESHIFT_FIELD, type AnyWakeEvent, type Attached, type ToolCall, type ToolEventsOptions, type WakeArgs, type WakeInputs, type WakeKey, type WrappedResult } from "./toolcall.js";
 import type { Wakeshift } from "./wakeshift.js";
@@ -66,8 +66,12 @@ export interface XmcpAttachOptions {
    * have no user, so personal events and list_subscriptions refuse.
    */
   identify?(extra: XmcpExtra): Identity | undefined;
-  /** Which of attach's own tools attached.tool gives (default: all three). */
-  tools?: readonly BuiltinTool[];
+  /**
+   * Which of attach's own tools attached.tool gives, each `{ enabled }`
+   * (default: all three). xmcp can't serve the wait tool. Deprecated: a
+   * list of names.
+   */
+  tools?: Omit<AttachTools, "wait"> | readonly BuiltinTool[];
 }
 
 /** One of attach's own tools as an xmcp tool file exports it. */
@@ -199,4 +203,4 @@ export function attachXmcp(wake: Wakeshift, opts: XmcpAttachOptions = {}): XmcpA
   return new XmcpAttached(attached, own);
 }
 
-export { BUILTIN_TOOLS, type BuiltinTool, type Identity, type ToolCall, type WakeArgs, type WrappedResult };
+export { BUILTIN_TOOLS, type AttachTools, type BuiltinTool, type Identity, type ToolCall, type WakeArgs, type WrappedResult };

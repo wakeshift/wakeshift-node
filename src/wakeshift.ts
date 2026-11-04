@@ -239,7 +239,7 @@ export function packCall(c: {
  * others): its _meta and User-Agent, the client's name, the user, and
  * session_key, harness and conversation_id from its arguments.
  */
-export function toolCallOf(extra: Req | ToolExtra | undefined, client: string, user: string | undefined, args: Record<string, unknown>, tool: string): Call {
+export function toolCallOf(extra: Req | ToolExtra | undefined, client: string, user: string | undefined, args: Record<string, unknown>, tool: string, wait: boolean): Call {
   const req = v1Req(extra); // a request already read passes through
   return packCall({
     meta: req.meta,
@@ -250,7 +250,7 @@ export function toolCallOf(extra: Req | ToolExtra | undefined, client: string, u
     harness: str(args, HARNESS_ARG),
     conversation: str(args, CONVERSATION_ARG),
     tool,
-    tasks: takesTasks(req.meta, req),
+    tasks: wait && takesTasks(req.meta, req),
   });
 }
 

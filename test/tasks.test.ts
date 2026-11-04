@@ -33,11 +33,12 @@ function fakeCore(reply: (path: string, body: any) => any = () => ({})) {
 }
 
 // app is the golden file's app: one event, identify naming u1, and a
-// wrapped tool, join, that subscribes nothing.
-function app(wake: Wakeshift, define = true) {
+// wrapped tool, join, that subscribes nothing. The wait tool is on unless
+// wait is false (attach's default is off).
+function app(wake: Wakeshift, define = true, wait = true) {
   if (define) wake.defineEvent("chat.message", { description: "A new message", args: z.object({ channel: z.string() }), payload: z.object({ text: z.string() }), text: (m) => m.text });
   const server = new McpServer({ name: "chat", version: "1.0.0" });
-  const attached = wake.attach(server, { identify: () => ({ user: "u1" }) });
+  const attached = wake.attach(server, { identify: () => ({ user: "u1" }), ...(wait ? { tools: { wait: { enabled: true } } } : {}) });
   server.registerTool("join", { description: "Join", inputSchema: attached.inputs({}) }, attached.events("join", async () => "joined"));
   return server;
 }
@@ -54,10 +55,10 @@ function withoutServerInfo(r: any): any {
 
 // appMaker makes the app's server, the event defined once: called once
 // (MCP SDK 1.x, test/mcp.ts's rawRpc) or per request (2.x, as it serves).
-function appMaker(wake: Wakeshift): () => McpServer {
+function appMaker(wake: Wakeshift, wait = true): () => McpServer {
   let first = true;
   return () => {
-    const server = app(wake, first);
+    const server = app(wake, first, wait);
     first = false;
     return server;
   };
@@ -110,6 +111,32 @@ test("the wait tool and the wire format are every SDK's (test/mcp-tasks-wire.jso
       assert.deepEqual(withoutServerInfo(res.result), c.result, `${c.name}: the result`);
     }
   }
+});
+
+// Off by default: nothing of the task path, and no call says its client
+// takes tasks, so Wakeshift gives Claude Code its plugin, or the Monitor.
+test("without wait, attach serves no wait tool, offers no tasks extension, takes no task request and never sets call.tasks", async () => {
+  const { wake, reqs } = fakeCore((path) => (path === "/calls/session" ? { session: { handle: "wsc_1" }, addition: { text: "x" } } : {}));
+  const rpc = await rawRpc(appMaker(wake, false));
+  const meta = golden.lists[0].meta;
+  const d = (await rpc("server/discover", { _meta: meta })).result;
+  assert.equal(d.capabilities?.extensions?.[TASKS_EXTENSION], undefined, "server/discover doesn't offer the tasks extension");
+  const tools = (await rpc("tools/list", { _meta: meta })).result.tools.map((t: any) => t.name);
+  assert.ok(!tools.includes(WAIT_TOOL), tools.join(", "));
+  const called = await rpc("tools/call", { name: WAIT_TOOL, arguments: { session_key: "wsc_k" }, _meta: meta });
+  assert.ok(called.error || called.result?.isError, "a call to wakeshift_wait isn't answered as the wait");
+  for (const m of ["tasks/get", "tasks/cancel"]) {
+    const res = await rpc(m, { taskId: "wkt1_x", _meta: meta });
+    assert.ok(res.error, `${m}: ${JSON.stringify(res)}`);
+  }
+  assert.ok(!reqs.some((r) => r.path.startsWith("/calls/task")), reqs.map((r) => r.path).join(", "));
+  reqs.length = 0;
+  await rpc("tools/call", { name: "join", arguments: {}, _meta: meta });
+  await rpc("tools/call", { name: "list_subscriptions", arguments: {}, _meta: meta });
+  await rpc("tools/call", { name: "subscribe_events", arguments: { event: "chat.message", arguments: { channel: "c" } }, _meta: meta });
+  const calls = reqs.map((r) => r.body?.call).filter(Boolean);
+  assert.ok(calls.length > 0, reqs.map((r) => r.path).join(", "));
+  for (const c of calls) assert.equal(c.tasks, undefined, JSON.stringify(c));
 });
 
 test("takesTasks: 2026-07-28 with the tasks extension in the request's own capabilities", () => {
@@ -181,7 +208,7 @@ test("tools registered after attach: the wait tool and the lists' cache fields a
   wake.defineEvent("chat.message", { description: "x", args: z.object({ channel: z.string() }), payload: z.object({ t: z.string() }), text: () => "x" });
   const rpc = await rawRpc(() => {
     const server = new McpServer({ name: "chat", version: "1.0.0" });
-    const attached = wake.attach(server, { tools: [] });
+    const attached = wake.attach(server, { tools: { subscribe: { enabled: false }, list: { enabled: false }, unsubscribe: { enabled: false }, wait: { enabled: true } } });
     server.registerTool("join", { description: "Join", inputSchema: attached.inputs({}) }, attached.events("join", async () => "joined"));
     return server;
   });

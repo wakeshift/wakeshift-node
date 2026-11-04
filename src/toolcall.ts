@@ -441,6 +441,8 @@ export interface AttachContext {
   clientOf(meta: Record<string, unknown> | undefined, identified?: string): string;
   events: EventsOptions<any>;
   warnOnce(key: string, message: string): void;
+  /** attach serves the wait tool (AttachOptions.wait): only then does a call say its client takes tasks. */
+  wait?: boolean;
 }
 
 /** @internal One tools/call of a wrapped tool: what its handler subscribed, for the block and the rollback. */
@@ -502,7 +504,7 @@ export class CallScope<C> implements ToolCall<C> {
       harness: this.args.harness,
       conversation: this.args.conversation,
       tool: this.tool,
-      tasks: takesTasks(meta, req),
+      tasks: !!this.at.wait && takesTasks(meta, req),
     });
   }
 

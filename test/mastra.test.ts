@@ -125,7 +125,7 @@ function watchApp(answers: Record<string, (body: any) => unknown> = {}, ownEvent
     ...answers,
   });
   const message = chatApp(core.wake);
-  const attached = attachMastra(core.wake, { identify: (ctx) => ({ user: ctx.http?.authInfo?.clientId }) });
+  const attached = attachMastra(core.wake, { identify: (ctx) => ({ user: ctx.http?.authInfo?.clientId }), tools: { wait: { enabled: true } } });
   let failNext = false;
   const watch: MastraTool = {
     description: "Watch a channel",
