@@ -62,6 +62,25 @@ declare global {
   };
   function retryLater(id: string): unknown;
 
+  // The product pages' (site/pages) apps: a crawl that finishes later, a
+  // deploy, and an email whose reply comes from a person.
+  function startCrawl(url: string): Promise<string>;
+  const crawlFinished: SDK.WakeEvent<any, any>;
+  const crawl: string;
+  const deployLive: SDK.WakeEvent<any, any>;
+  const deploy: string;
+  const emailSchema: zod.ZodObject<{ to: zod.ZodString; subject: zod.ZodString; text: zod.ZodString }>;
+  function send(email: { to: string; subject: string; text: string }): Promise<string>;
+  const replied: SDK.WakeEvent<any, any>;
+  const thread: string;
+  // The user who sent the email, as the app's sign-in names them.
+  const sender: string;
+  // A video render that finishes later, which only its owner may watch.
+  function startRender(scene: string): Promise<string>;
+  function ownsRender(user: string | undefined, render: string): boolean;
+  const renderFinished: SDK.WakeEvent<any, any>;
+  const render: string;
+
   // A webhook handler (GitHub's workflow_run).
   const req: IncomingMessage;
   const body: any;

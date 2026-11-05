@@ -1,5 +1,5 @@
 // Type-checks every TypeScript example people copy against this SDK: the
-// ```ts blocks in site/docs, site/llms/agents.md (/AGENTS.md) and this README, the landing page's sample
+// ```ts blocks in site/docs, the product pages (site/pages), site/llms/agents.md (/AGENTS.md) and this README, the landing page's sample
 // (site/templates/landing.html) and the console's "Try it" snippet
 // (web/src/pages/app/Overview.tsx). Each example becomes a module: its
 // imports at the top, the rest in an async function, so fragments (a
@@ -34,8 +34,10 @@ function fromMarkdown(file) {
 const readmeOnly = process.env.WAKESHIFT_EXAMPLES_README_ONLY === "1";
 fromMarkdown(join(sdk, "README.md"));
 if (!readmeOnly) {
-  const docs = join(repo, "site/docs");
-  for (const f of readdirSync(docs).filter((f) => f.endsWith(".md")).sort()) fromMarkdown(join(docs, f));
+  for (const dir of ["site/docs", "site/pages"]) {
+    const docs = join(repo, dir);
+    for (const f of readdirSync(docs).filter((f) => f.endsWith(".md")).sort()) fromMarkdown(join(docs, f));
+  }
   // /AGENTS.md, the instructions for coding agents the site serves.
   fromMarkdown(join(repo, "site/llms/agents.md"));
 }

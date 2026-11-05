@@ -759,7 +759,7 @@ test("shared fixture: an emit's recipients and its answer (emit-recipients.json)
     status_of: { subscriptions: { user: string; subscription: string }[]; wire: unknown; refused: { user: string; subscription: string }[][]; refused_code: string };
   };
   const core = new WakeCore();
-  const wake = new Wakeshift({ key: KEY, core: "http://core.test", fetch: core.fetch });
+  const wake = new Wakeshift({ key: KEY, core: "http://core.test", fetch: core.fetch, onWarning: () => {} });
   const { turn, news } = defineEvents(wake);
   for (const c of f.cases) {
     core.reset();
@@ -770,7 +770,8 @@ test("shared fixture: an emit's recipients and its answer (emit-recipients.json)
   }
   for (const r of f.responses) {
     core.emitReply = r.response;
-    assert.deepEqual(await turn.emit({ table: "oak" }, { text: "go" }, { to: "u1" }), r.emitted, r.name);
+    const { textTrimmed, ...rest } = await turn.emit({ table: "oak" }, { text: "go" }, { to: "u1" });
+    assert.deepEqual({ ...rest, text_trimmed: textTrimmed ?? false }, r.emitted, r.name);
   }
   // An id used for a different emit: IdReusedError, a WakeshiftError.
   core.emitStatus = f.id_reused.status;
@@ -806,6 +807,28 @@ test("shared fixture: an emit's recipients and its answer (emit-recipients.json)
     await assert.rejects(turn.statusOf(subs), (e: unknown) => isCode(e, f.status_of.refused_code), JSON.stringify(subs));
   }
   assert.deepEqual(core.paths(), []);
+});
+
+// Wakeshift trims a text over 1000 bytes rather than refusing it: the SDK
+// sends the text as rendered, however long, says textTrimmed, and warns
+// once per event.
+test("a trimmed text: textTrimmed, and one warning per event", async () => {
+  const core = new WakeCore();
+  const warnings: string[] = [];
+  const wake = new Wakeshift({ key: KEY, core: "http://core.test", fetch: core.fetch, onWarning: (m) => warnings.push(m) });
+  const { turn, news } = defineEvents(wake);
+  const long = "x".repeat(5000);
+  core.emitReply = { matched: 1, duplicate: false, unmatched: [], ended: [], text_trimmed: true };
+  for (let i = 0; i < 3; i++) assert.equal((await turn.emit({ table: "oak" }, { text: long }, { to: "u1" })).textTrimmed, true);
+  assert.equal(core.bodies("/events/emit")[0].text, long);
+  assert.equal(warnings.length, 1, warnings.join("\n"));
+  assert.match(warnings[0], /game\.turn's text was over 1000 bytes/);
+  assert.equal((await news.emit({ table: "oak" }, { text: long })).textTrimmed, true);
+  assert.equal(warnings.length, 2);
+  assert.match(warnings[1], /table\.news/);
+  core.emitReply = { matched: 1, duplicate: false, unmatched: [], ended: [] };
+  assert.equal("textTrimmed" in (await turn.emit({ table: "oak" }, { text: "go" }, { to: "u1" })), false);
+  assert.equal(warnings.length, 2);
 });
 
 test("shared fixture: the mistakes every SDK refuses before asking Wakeshift (errors.json client_checks)", async (t) => {

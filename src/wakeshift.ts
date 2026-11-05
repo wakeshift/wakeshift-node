@@ -136,6 +136,17 @@ export interface Emitted {
   unmatched: (string | Recipient)[];
   /** Subscription recipients no longer live (or not that user's). */
   ended: (string | Recipient)[];
+  /**
+   * true: the text was over 1000 bytes, so Wakeshift trimmed it to 1000
+   * (ending with "…") and sent the occurrence. onWarning hears it once per
+   * event. Left out otherwise.
+   */
+  textTrimmed?: boolean;
+}
+
+/** @internal The warning when Wakeshift trimmed an event's text (once per event). */
+export function textTrimmedWarning(event: string): string {
+  return `wakeshift: ${event}'s text was over 1000 bytes, so Wakeshift trimmed it: keep text to a short headline and put the details in the payload`;
 }
 
 // recipientsOf reads an emit's unmatched or ended list: "user",
@@ -585,7 +596,7 @@ export class Wakeshift {
     const body: Record<string, unknown> = { name: e.name, arguments: e.arguments, payload: e.payload, text: e.text };
     if (e.id) body.id = e.id;
     if (e.to) body.to = e.to;
-    type Out = { matched: number; duplicate?: boolean; unmatched?: unknown; ended?: unknown };
+    type Out = { matched: number; duplicate?: boolean; unmatched?: unknown; ended?: unknown; text_trimmed?: boolean };
     const seen = this.sends;
     let out: Out;
     try {
@@ -600,7 +611,12 @@ export class Wakeshift {
       if (err instanceof WakeshiftError && err.status === 409 && err.code === "id_reused") throw new IdReusedError(err.detail, { cause: err });
       throw err;
     }
-    return { matched: out.matched, duplicate: !!out.duplicate, unmatched: recipientsOf(out.unmatched), ended: recipientsOf(out.ended) };
+    const emitted: Emitted = { matched: out.matched, duplicate: !!out.duplicate, unmatched: recipientsOf(out.unmatched), ended: recipientsOf(out.ended) };
+    if (out.text_trimmed === true) {
+      emitted.textTrimmed = true;
+      this.warnOnce("text-trimmed:" + e.name, textTrimmedWarning(e.name));
+    }
+    return emitted;
   }
 
   /**
