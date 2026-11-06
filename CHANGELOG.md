@@ -2,7 +2,7 @@
 
 What changed in each release of `@wakeshift/sdk`. 0.4.0 is the first published release: to start with it, read the [README](README.md). Its notes below, and the earlier releases', are for apps that ran the preview builds.
 
-## 0.11.0 (unreleased)
+## 0.11.0 (2026-11-06)
 
 One release across the three SDKs (TypeScript 0.11.0, Python 0.10.0, Go v0.10.0), simpler and safer by default. Read **Who may subscribe** first: it's the one change that alters what your server serves.
 
