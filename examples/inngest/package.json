@@ -27,6 +27,7 @@
     "typescript": "7.0.2"
   },
   "overrides": {
-    "zod": "$zod"
+    "zod": "$zod",
+    "gaxios": "^7.1.4"
   }
 }
