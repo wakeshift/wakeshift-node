@@ -18,7 +18,7 @@
     "@modelcontextprotocol/node": "2.1.2",
     "@modelcontextprotocol/server": "2.4.0",
     "@trigger.dev/sdk": "4.8.3",
-    "@wakeshift/sdk": "0.10.2",
+    "@wakeshift/sdk": "^0.11.0",
     "zod": "4.6.7"
   },
   "devDependencies": {

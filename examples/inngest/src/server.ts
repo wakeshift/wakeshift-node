@@ -11,13 +11,14 @@ function newServer() {
   const server = new McpServer({ name: "reports", version: "1.0.0" })
   const attached = wake.attach(server)
 
-  server.registerTool(
+  attached.registerTool(
     "start_report",
     {
       description: "Start a research report on a topic. It runs in the background and takes about a minute.",
-      inputSchema: attached.inputs(z.object({ topic: z.string().describe("What the report is about") })),
+      inputSchema: z.object({ topic: z.string().describe("What the report is about") }),
+      subscribes: [reportFinished],
     },
-    attached.events("start_report", { subscribes: [reportFinished] }, async ({ topic }, call) => {
+    async ({ topic }, ctx, call) => {
       const report = randomUUID()
       // Subscribe first, so the report can't finish before anyone listens.
       await call.subscribe(reportFinished, { report }, { reason: `Report on ${topic}` })
@@ -30,16 +31,17 @@ function newServer() {
         throw err
       }
       return `Started report ${report} on "${topic}". You'll be notified here when it's ready.`
-    }),
+    },
   )
 
-  server.registerTool(
+  attached.registerTool(
     "watch_report",
     {
       description: "Watch a report that's already running, from this conversation.",
-      inputSchema: attached.inputs(z.object({ report: z.string().describe("The report's ID, as start_report returned it") })),
+      inputSchema: z.object({ report: z.string().describe("The report's ID, as start_report returned it") }),
+      subscribes: [reportFinished],
     },
-    attached.events("watch_report", { subscribes: [reportFinished] }, async ({ report }, call) => {
+    async ({ report }, ctx, call) => {
       if (!reports.has(report)) return { isError: true, content: [{ type: "text", text: `No report ${report}.` }] }
       // Subscribe, then check: a report that finishes in between still wakes this conversation.
       await call.subscribe(reportFinished, { report }, { reason: `Watching report ${report}` })
@@ -47,7 +49,7 @@ function newServer() {
       if (!state || state === "running") return `Watching report ${report}. You'll be notified here when it's ready.`
       await call.unsubscribe(reportFinished, { report })
       return `Report ${report} already finished: ${state.status === "ready" ? `${state.summary} ${state.url}` : state.error}`
-    }),
+    },
   )
 
   return server
