@@ -1,6 +1,6 @@
 {
   "name": "@wakeshift/sdk",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "Wakeshift lets an MCP server wake the AI agents that use it. The TypeScript SDK: define events, serve them as MCP Events, and emit them.",
   "license": "Apache-2.0",
   "author": "Clawvisor Inc. <support@wakeshift.ai>",
@@ -118,7 +118,7 @@
     "@modelcontextprotocol/sdk": "^1.32.1",
     "@modelcontextprotocol/server": "^2.4.0",
     "@types/node": "^22.20.5",
-    "esbuild": "^0.25.12",
+    "esbuild": "^0.28.2",
     "expect-type": "^1.4.0",
     "typescript": "^7.0.2",
     "zod": "^4.6.7"

@@ -104,7 +104,7 @@ test("@wakeshift/sdk/testing exports the test client, the stand-in call and with
 test("the package: sideEffects false, a default condition and ./package.json on every entry, no xmcp, Node 22.12 (or 20.19)", () => {
   const pkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
   assert.equal(pkg.sideEffects, false);
-  assert.equal(pkg.version, "0.11.0");
+  assert.equal(pkg.version, "0.11.1");
   assert.equal(pkg.engines.node, "^20.19.0 || >=22.12.0", "the versions with require(esm) on by default");
   assert.equal(pkg.exports["./package.json"], "./package.json");
   for (const [name, e] of Object.entries<any>(pkg.exports)) if (name !== "./package.json") assert.equal(e.default, e.import, name);

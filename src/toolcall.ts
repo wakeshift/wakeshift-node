@@ -353,7 +353,9 @@ export interface ToolCallBase<C = unknown> {
    * Finds or starts the calling conversation's session without subscribing
    * it (it doesn't make it wakeable). null, with no request to Wakeshift,
    * when nothing names the conversation: no session_key, no conversation_id
-   * and no conversation in the call's _meta (a Codex thread).
+   * and no conversation in the call's _meta (a Codex thread). Without a
+   * user (identify's), only the session_key names it: a conversation ID
+   * alone is null too.
    */
   resolveSession(): Promise<string | null>;
 }
@@ -948,8 +950,12 @@ export class CallScope<C> {
       this.checkCaller();
       if (this.pending && this.session) return this.session;
       const wire = this.wire();
-      // Nothing names the conversation: the core would only start a new one.
-      if (!wire.session && !wire.conversation && !namesConversation(wire.meta) && !metaString(wire.meta, "threadId")) return null;
+      // Without a session key, only a user's (or an agent token's) call
+      // finds its conversation by the ID its harness reports (a Codex
+      // thread): Wakeshift never finds a session by that ID alone, so for
+      // anything else it would only start a new one.
+      const named = !!wire.conversation || namesConversation(wire.meta) || !!metaString(wire.meta, "threadId");
+      if (!wire.session && !(named && (wire.user || wire.agent_token))) return null;
       const out = await this.at.wake.requestApp<{ session: string; pending: string; agent?: Partial<Recognized> }>("POST", "/calls/session", { call: wire }, { signal: this.signal });
       this.pending = out.pending;
       this.#session = out.session;

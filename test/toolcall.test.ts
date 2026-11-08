@@ -414,6 +414,47 @@ test("resolveSession is null, with no request, when nothing names the conversati
   }
 });
 
+test("resolveSession without a user finds the conversation only by its session_key: a harness's conversation ID alone is null, with no request", async (t) => {
+  // Channel3's unwatch_product: a tool that subscribes to nothing, called by
+  // Codex with only its thread in _meta (no identify user).
+  const got: (string | null)[] = [];
+  const w = await wrapped(t, (server, attached, ev) => {
+    attached.registerTool("unwatch", { inputSchema: {} }, async (_args, _ctx, call) => {
+      await call.unsubscribe(ev.news, { table: "oak" });
+      got.push(await call.resolveSession());
+      return "ok";
+    });
+  }, { identify: false });
+  const f = JSON.parse(readFileSync(new URL("../../test/conversation-meta.json", import.meta.url), "utf8")) as { keys: string[] };
+  const nested = (key: string): Record<string, unknown> => {
+    const parts = key.split(".");
+    let v: unknown = "c1";
+    for (const p of parts.slice(1).reverse()) v = { [p]: v };
+    return { [parts[0]!]: v };
+  };
+  const unnamed: { args: Record<string, unknown>; meta?: Record<string, unknown>; ua?: string }[] = [
+    { args: {} },
+    { args: { conversation_id: "bc-1234" } },
+    { args: {}, meta: { threadId: "t0" }, ua: "codex-mcp-client/0.130.0" },
+    ...f.keys.map((k) => ({ args: {}, meta: nested(k), ua: k.startsWith("x-codex") ? "codex-mcp-client/0.130.0" : undefined })),
+  ];
+  for (const c of unnamed) {
+    w.core.reset();
+    got.length = 0;
+    await w.call("", "unwatch", c.args, { meta: c.meta, ua: c.ua });
+    assert.deepEqual(got, [null], JSON.stringify(c));
+    assert.ok(!w.core.paths().includes("/calls/session"), "no session_key and no user: no request " + JSON.stringify(c));
+  }
+  // The session_key finds it, with the thread or without.
+  for (const meta of [undefined, nested("x-codex-turn-metadata.thread_id")]) {
+    w.core.reset();
+    got.length = 0;
+    await w.call("", "unwatch", { session_key: "wsc_s1" }, { meta, ua: "codex-mcp-client/0.130.0" });
+    assert.deepEqual(got, ["wsc_resolved"]);
+    assert.ok(w.core.paths().includes("/calls/session"));
+  }
+});
+
 test("rollback is decided from the final result: each failure ends what the call created, and only that, with no block", async (t) => {
   const both = async (call: ToolCall, ev: Events) => {
     await call.subscribe(ev.news, { table: "old" }); // renewed: not ended
