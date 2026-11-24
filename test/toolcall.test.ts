@@ -20,6 +20,7 @@ import { captureLog, quiet, warningsInto } from "./logs.js";
 
 const warningsFixture = JSON.parse(readFileSync(new URL("../../test/warnings.json", import.meta.url), "utf8"));
 import { nameFetch } from "../src/wakeshift.js";
+import { Breaker, callBreaker } from "../src/breaker.js";
 import { CONVERSATION_META, mergeBlock, namesConversation, withWakeshiftField, type CallAddition } from "../src/toolcall.js";
 import { withSubscribes } from "../src/events.js";
 
@@ -45,7 +46,13 @@ class WakeCore {
   // A path that hangs until the request is aborted (a timeout), fails to
   // connect, or answers 401 (a refused key).
   broken = new Map<string, "hang" | "unreachable" | 401>();
+  // A path that answers this status, with a Wakeshift error.
+  status = new Map<string, number>();
   native: any[] = [];
+  // What a subscribe answers for wakes (undefined: an older core, which leaves it out).
+  wakes: boolean | undefined = true;
+  // What a subscribe answers for call_limit (undefined: left out, a program whose limit isn't known).
+  callLimit: unknown = undefined;
   unsubscribeReply: any = { ended: true };
   emitStatus = 200;
   emitReply: any = { matched: 2, duplicate: false, unmatched: ["u3", { native: "u4" }], ended: [{ user: "u2", subscription: "s2" }] };
@@ -55,6 +62,8 @@ class WakeCore {
   hold?: Promise<void>;
   // GET /app waits for this, when set (the slow-name test).
   appHold?: Promise<void>;
+  // The manifest's merge waits for this, when set (the slow-manifest test).
+  manifestHold?: Promise<void>;
 
   fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     const path = String(url).replace("https://core.test/api/apps/v1", "");
@@ -62,10 +71,13 @@ class WakeCore {
     if (path !== "/manifest" && path !== "/manifest/merge") this.calls.push({ path, body });
     const reply = (status: number, json: unknown) => new Response(JSON.stringify(json), { status, headers: { "Content-Type": "application/json" } });
     if (this.fail.has(path)) return reply(503, { error: { code: "unavailable", message: "down" } });
+    const status = this.status.get(path);
+    if (status !== undefined) return reply(status, { error: { code: "refused", message: "no" } });
     const broken = this.broken.get(path);
     if (broken === "hang") return new Promise<Response>((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)));
     if (broken === "unreachable") throw new TypeError("fetch failed");
     if (broken === 401) return reply(401, { error: { code: "unauthenticated", message: "key revoked" } });
+    if (path === "/manifest/merge" && this.manifestHold) await this.manifestHold;
     switch (path) {
       case "/app":
         if (this.appHold) await this.appHold;
@@ -84,6 +96,8 @@ class WakeCore {
           session: "wsc_s1",
           agent: { harness: "claude-code", via: "user_agent" },
           pending: body.pending || "pa_first",
+          ...(this.wakes === undefined ? {} : { wakes: this.wakes }),
+          ...(this.callLimit === undefined ? {} : { call_limit: this.callLimit }),
         });
       }
       case "/calls/session":
@@ -415,7 +429,7 @@ test("resolveSession is null, with no request, when nothing names the conversati
 });
 
 test("resolveSession without a user finds the conversation only by its session_key: a harness's conversation ID alone is null, with no request", async (t) => {
-  // Channel3's unwatch_product: a tool that subscribes to nothing, called by
+  // An unwatch_product tool: a tool that subscribes to nothing, called by
   // Codex with only its thread in _meta (no identify user).
   const got: (string | null)[] = [];
   const w = await wrapped(t, (server, attached, ev) => {
@@ -1315,4 +1329,385 @@ test("call.subscribe's replay and once reach Wakeshift as every SDK sends them (
     assert.ok(!JSON.stringify(w.core.bodies("/event-subscriptions")).includes("context-canary"), tc.name);
     assert.ok(!("context" in body), tc.name);
   }
+});
+
+// ── The in-call budget and breaker ─────────────
+// What a tool call asks Wakeshift has its own short budget (callTimeouts),
+// is never retried, and is skipped while the breaker is open, so a hanging
+// core can't hold a vendor's tool call past the agent's own cutoff.
+
+// watching is a tool that subscribes and goes on without wakes when call.subscribe throws.
+function watching(caught: unknown[]): Register {
+  return (server, attached, ev) => {
+    attached.registerTool("watch", { inputSchema: {}, subscribes: [ev.news] }, async (_a, _ctx, call) => {
+      try {
+        await call.subscribe(ev.news, { table: "oak" });
+      } catch (err) {
+        caught.push(err);
+      }
+      return "Watching.";
+    });
+  };
+}
+const WATCHING = { content: [{ type: "text", text: "Watching." }] };
+
+test("callTimeouts: defaults 5000 and 1000; anything but numbers over 0 is a config error", () => {
+  for (const bad of [null, 5, { subscribeMs: 0 }, { blockMs: -1 }, { blockMs: "1" }, { subscribeMs: Infinity }, { subscribe: 5 }]) {
+    assert.throws(() => new Wakeshift({ key: KEY, core: "https://core.test", callTimeouts: bad as any }), (e: unknown) => isCode(e, "config"), JSON.stringify(bad));
+  }
+  const w = new Wakeshift({ key: KEY, core: "https://core.test", callTimeouts: { blockMs: 250 } });
+  assert.deepEqual((w as any).callTimeouts, { subscribeMs: 5000, blockMs: 250 });
+  assert.deepEqual((new Wakeshift({ key: KEY, core: "https://core.test" }) as any).callTimeouts, { subscribeMs: 5000, blockMs: 1000 });
+});
+
+test("a hanging core: the subscribe gives up at callTimeouts.subscribeMs, not timeoutMs, and the tool's result goes out unchanged", async (t) => {
+  const caught: unknown[] = [];
+  const w = await wrapped(t, watching(caught), { wake: { callTimeouts: { subscribeMs: 150 }, logger: quiet } });
+  w.core.broken.set("/event-subscriptions", "hang");
+  const start = Date.now();
+  const res = await w.call("ada", "watch", {});
+  const took = Date.now() - start;
+  assert.deepEqual(res.result, WATCHING);
+  assert.ok(took < 2_000, `took ${took} ms`);
+  assert.equal(caught.length, 1);
+  assert.ok(isCode(caught[0], "timeout"), String(caught[0]));
+  assert.deepEqual(w.core.paths(), ["/event-subscriptions"]);
+});
+
+test("a hanging manifest send counts against the subscribe's budget, and opens the breaker like any failure", async (t) => {
+  const caught: unknown[] = [];
+  const w = await wrapped(t, watching(caught), { wake: { callTimeouts: { subscribeMs: 100 }, timeoutMs: 3_000, logger: quiet } });
+  w.core.broken.set("/manifest/merge", "hang");
+  const start = Date.now();
+  for (let i = 0; i < callBreaker.failures + 1; i++) assert.deepEqual((await w.call("ada", "watch", {})).result, WATCHING);
+  assert.ok(Date.now() - start < 2_000, `took ${Date.now() - start} ms`);
+  assert.ok(caught.slice(0, callBreaker.failures).every((e) => isCode(e, "timeout")));
+  const last = caught[callBreaker.failures] as Error;
+  assert.ok(isCode(last, "unreachable") && /skipped/.test(last.message), String(last));
+  assert.deepEqual(w.core.bodies("/event-subscriptions"), []);
+});
+
+test("a cold first native call: the manifest send it waits for gets the subscribe budget, not blockMs, so its line still goes out", async (t) => {
+  // A native call makes no subscribe request, so on a fresh process its
+  // addition is the first request to wait for the manifest.
+  const seen: { after?: boolean } = {};
+  const w = await wrapped(t, wakesTool(seen), { native: () => true, wake: { callTimeouts: { subscribeMs: 2_000, blockMs: 100 }, logger: quiet } });
+  w.core.manifestHold = new Promise<void>((r) => setTimeout(r, 300));
+  const start = Date.now();
+  const res = await w.call("ada", "watch", {});
+  assert.ok(Date.now() - start < 2_000, `took ${Date.now() - start} ms`);
+  assert.equal(seen.after, true);
+  assert.deepEqual(w.core.paths(), ["/calls/addition"]);
+  assert.equal(w.core.bodies("/calls/addition")[0].native.length, 1);
+  assert.ok(texts(res).some((x) => x.includes(WOKEN)), texts(res).join("\n"));
+});
+
+test("a native call's manifest wait is bounded by the subscribe budget: a hanging send costs at most subscribeMs + blockMs", async (t) => {
+  const log = captureLog();
+  const seen: { after?: boolean } = {};
+  const w = await wrapped(t, wakesTool(seen), { native: () => true, wake: { callTimeouts: { subscribeMs: 200, blockMs: 100 }, timeoutMs: 5_000, logger: log.logger } });
+  w.core.broken.set("/manifest/merge", "hang");
+  const start = Date.now();
+  const res = await w.call("ada", "watch", {});
+  const took = Date.now() - start;
+  assert.ok(took < 1_000, `took ${took} ms`);
+  assert.match(texts(res)[0]!, /^Started/);
+  assert.deepEqual(w.core.paths(), []);
+  assert.ok(log.codes().includes("native_unavailable"), log.codes().join(","));
+});
+
+test("a call that gave up on a slow manifest send sends nothing once the send finishes", async (t) => {
+  const caught: unknown[] = [];
+  const w = await wrapped(t, watching(caught), { wake: { callTimeouts: { subscribeMs: 100 }, logger: quiet } });
+  let release!: () => void;
+  w.core.manifestHold = new Promise<void>((r) => (release = r));
+  assert.deepEqual((await w.call("ada", "watch", {})).result, WATCHING);
+  assert.ok(isCode(caught[0], "timeout"), String(caught[0]));
+  release();
+  await new Promise((r) => setTimeout(r, 200));
+  assert.deepEqual(w.core.bodies("/event-subscriptions"), []);
+});
+
+test("a hanging core: the addition gives up at callTimeouts.blockMs; the result is unchanged and the subscription rolled back", async (t) => {
+  const log = captureLog();
+  const w = await wrapped(
+    t,
+    (server, attached, ev) => {
+      attached.registerTool("watch", { inputSchema: {}, subscribes: [ev.news] }, async (_a, _ctx, call) => {
+        await call.subscribe(ev.news, { table: "oak" });
+        return "Watching.";
+      });
+    },
+    { wake: { callTimeouts: { blockMs: 150 }, logger: log.logger } },
+  );
+  w.core.broken.set("/calls/addition", "hang");
+  const start = Date.now();
+  const res = await w.call("ada", "watch", {});
+  const took = Date.now() - start;
+  assert.deepEqual(res.result, WATCHING);
+  assert.ok(took < 2_000, `took ${took} ms`);
+  assert.deepEqual(w.core.paths(), ["/event-subscriptions", "/calls/addition", "/event-subscriptions/unsubscribe"]);
+  assert.equal(w.core.bodies("/event-subscriptions/unsubscribe")[0].reason, "rolled_back");
+  assert.deepEqual(log.codes("warn"), ["block_failed"]);
+  assert.equal(log.lines.find((l) => l.fields.code === "block_failed")!.fields.error_type, "APIConnectionError");
+});
+
+test("a request inside a tool call isn't retried; an emit outside one still is", async (t) => {
+  const caught: unknown[] = [];
+  const w = await wrapped(t, watching(caught), { wake: { maxRetries: 1, logger: quiet } });
+  w.core.broken.set("/event-subscriptions", "unreachable");
+  assert.deepEqual((await w.call("ada", "watch", {})).result, WATCHING);
+  assert.equal(w.core.bodies("/event-subscriptions").length, 1);
+  assert.ok(isCode(caught[0], "unreachable"));
+  w.core.broken.set("/events/emit", "unreachable");
+  await assert.rejects(w.ev.news.emit({ table: "oak" }, { text: "hi" }), (e: unknown) => isCode(e, "unreachable"));
+  assert.equal(w.core.bodies("/events/emit").length, 2);
+});
+
+test("the breaker: 5 in-call failures in a row open it; while open nothing is sent; after the cool-down one probe goes, and its success closes it", async (t) => {
+  const log = captureLog();
+  const caught: unknown[] = [];
+  const w = await wrapped(t, watching(caught), { wake: { logger: log.logger } });
+  let now = 1_000_000;
+  w.wake.breaker.now = () => now;
+  w.core.fail.add("/event-subscriptions");
+  for (let i = 0; i < callBreaker.failures; i++) assert.deepEqual((await w.call("ada", "watch", {})).result, WATCHING);
+  assert.equal(w.core.bodies("/event-subscriptions").length, 5);
+  assert.deepEqual(log.codes(), []);
+
+  // Open: the next calls send nothing, and call.subscribe throws unreachable at once.
+  w.core.reset();
+  const start = Date.now();
+  for (let i = 0; i < 3; i++) assert.deepEqual((await w.call("ada", "watch", {})).result, WATCHING);
+  assert.ok(Date.now() - start < 1_000);
+  assert.deepEqual(w.core.paths(), []);
+  const skipped = caught[caught.length - 1] as Error;
+  assert.ok(isCode(skipped, "unreachable"));
+  assert.match(
+    skipped.message,
+    /^wakeshift: can't reach Wakeshift at https:\/\/core\.test \(skipped: 5 requests in a row failed inside tool calls, so they pause for 30 seconds\)\. .* https:\/\/wakeshift\.ai\/docs\/errors#unreachable$/,
+  );
+  const lines = log.lines.filter((l) => l.fields.code === "core_unavailable");
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0]!.level, "warn");
+  assert.equal(lines[0]!.fields.count, 1);
+  assert.ok(lines[0]!.message.includes(warningsFixture.codes.find((c: any) => c.code === "core_unavailable").fix), lines[0]!.message);
+
+  // Still failing after the cool-down: the probe fails, and it opens again.
+  now += callBreaker.coolDownMs;
+  await w.call("ada", "watch", {});
+  await w.call("ada", "watch", {});
+  assert.deepEqual(w.core.paths(), ["/event-subscriptions"]);
+
+  // Answering again: the probe goes, succeeds, and closes it.
+  now += callBreaker.coolDownMs;
+  w.core.fail.delete("/event-subscriptions");
+  w.core.reset();
+  const ok = await w.call("ada", "watch", {});
+  assert.deepEqual(texts(ok), [["Watching.", WOKEN, TRAILER].join("\n\n")]);
+  await w.call("ada", "watch", {});
+  assert.deepEqual(w.core.paths(), ["/event-subscriptions", "/calls/addition", "/event-subscriptions", "/calls/addition"]);
+});
+
+// call.wakes: whether the tool may skip its own polling or waiting.
+function wakesTool(seen: { before?: boolean; after?: boolean; error?: unknown }, opts: { unsubscribe?: boolean } = {}): Register {
+  return (server, attached, ev) => {
+    attached.registerTool("watch", { inputSchema: {}, subscribes: [ev.news] }, async (_a, _ctx, call) => {
+      seen.before = call.wakes;
+      try {
+        await call.subscribe(ev.news, { table: "oak" });
+        if (opts.unsubscribe) await call.unsubscribe(ev.news, { table: "oak" });
+      } catch (err) {
+        seen.error = err;
+      }
+      seen.after = call.wakes;
+      return call.wakes ? "Started; you'll be woken." : "Done, after waiting as without Wakeshift.";
+    });
+  };
+}
+
+for (const [name, setUp, want] of [
+  ["the core says it wakes the conversation", (_c: WakeCore) => {}, true],
+  ["the core says it can't (an unwakeable program)", (c: WakeCore) => (c.wakes = false), false],
+  ["an older core that doesn't say", (c: WakeCore) => (c.wakes = undefined), false],
+  ["the subscribe fails (503)", (c: WakeCore) => c.fail.add("/event-subscriptions"), false],
+  ["the subscribe times out", (c: WakeCore) => c.broken.set("/event-subscriptions", "hang"), false],
+] as const) {
+  test(`call.wakes: ${name} → ${want}`, async (t) => {
+    const seen: { before?: boolean; after?: boolean; error?: unknown } = {};
+    const w = await wrapped(t, wakesTool(seen), { wake: { callTimeouts: { subscribeMs: 100 }, logger: quiet } });
+    setUp(w.core);
+    const res = await w.call("ada", "watch", {});
+    assert.equal(seen.before, false);
+    assert.equal(seen.after, want, String(seen.error));
+    assert.match(texts(res)[0]!, want ? /^Started/ : /^Done/);
+  });
+}
+
+test("call.wakes: false while the user's notify choice is pending, though the subscription holds; true on a later call once the wake is confirmed", async (t) => {
+  const seen: { before?: boolean; after?: boolean; error?: unknown } = {};
+  const w = await wrapped(t, wakesTool(seen), { wake: { logger: quiet } });
+  // Claude Code's first call: the result asks the user how to be notified, so the core answers wakes: false.
+  w.core.wakes = false;
+  const asked = await w.call("ada", "watch", {});
+  assert.equal(seen.after, false, String(seen.error));
+  assert.match(texts(asked)[0]!, /^Done/, "the tool keeps its own wait");
+  // The user picked; the listener runs: the core answers wakes: true.
+  w.core.wakes = true;
+  const confirmed = await w.call("ada", "watch", {});
+  assert.equal(seen.after, true, String(seen.error));
+  assert.match(texts(confirmed)[0]!, /^Started/);
+});
+
+// call.callLimit and call.shouldSkipWait: a tool asked for a 300 s wait skips it
+// only when the conversation is woken and the program cuts the call off sooner.
+function skipTool(seen: { limit?: number | undefined; skip?: boolean; before?: number | undefined }): Register {
+  return (server, attached, ev) => {
+    attached.registerTool("render", { inputSchema: {}, subscribes: [ev.news] }, async (_a, _ctx, call) => {
+      seen.before = call.callLimit;
+      await call.subscribe(ev.news, { table: "oak" }).catch(() => undefined);
+      seen.limit = call.callLimit;
+      seen.skip = call.shouldSkipWait(300);
+      return seen.skip ? "Started; you'll be woken." : "Done, after the wait.";
+    });
+  };
+}
+
+for (const [name, setUp, limit, skip] of [
+  ["Claude Code's 60 s, woken", (c: WakeCore) => (c.callLimit = 60), 60, true],
+  ["Codex's 300 s, woken: a 300 s wait doesn't fit", (c: WakeCore) => (c.callLimit = 300), 300, true],
+  ["a longer limit than the wait", (c: WakeCore) => (c.callLimit = 600), 600, false],
+  ["the user's notify choice pending (wakes false)", (c: WakeCore) => ((c.callLimit = 60), (c.wakes = false)), 60, false],
+  ["a limit that isn't known (left out)", (_c: WakeCore) => {}, undefined, false],
+  ["a core that answers something else", (c: WakeCore) => (c.callLimit = "60"), undefined, false],
+  ["the subscribe fails", (c: WakeCore) => ((c.callLimit = 60), c.fail.add("/event-subscriptions")), undefined, false],
+] as const) {
+  test(`call.callLimit and shouldSkipWait: ${name}`, async (t) => {
+    const seen: { limit?: number | undefined; skip?: boolean; before?: number | undefined } = {};
+    const w = await wrapped(t, skipTool(seen), { wake: { callTimeouts: { subscribeMs: 100 }, logger: quiet } });
+    setUp(w.core);
+    await w.call("ada", "render", {});
+    assert.equal(seen.before, undefined, "undefined before a subscribe");
+    assert.equal(seen.limit, limit);
+    assert.equal(seen.skip, skip);
+  });
+}
+
+test("call.wakes: any subscribe of the call that failed makes it false, even after one that succeeded", async (t) => {
+  const seen: { first?: boolean; after?: boolean } = {};
+  const w = await wrapped(
+    t,
+    (server, attached, ev) => {
+      attached.registerTool("both", { inputSchema: {}, subscribes: [ev.news, ev.turn] }, async (_a, _ctx, call) => {
+        await call.subscribe(ev.news, { table: "oak" });
+        seen.first = call.wakes;
+        try {
+          await call.subscribe(ev.turn, { table: "oak" });
+        } catch {
+          // go on without wakes
+        }
+        seen.after = call.wakes;
+        return "ok";
+      });
+    },
+    { wake: { logger: quiet } },
+  );
+  let n = 0;
+  const inner = w.core.fetch;
+  w.core.fetch = (async (url: any, init?: any) => {
+    if (String(url).endsWith("/event-subscriptions") && ++n === 2) return new Response(JSON.stringify({ error: { code: "unavailable", message: "down" } }), { status: 503, headers: { "Content-Type": "application/json" } });
+    return inner(url, init);
+  }) as typeof fetch;
+  (w.wake as any).fetchOpt = w.core.fetch;
+  await w.call("ada", "both", {});
+  assert.deepEqual(seen, { first: true, after: false });
+});
+
+test("call.wakes for a native caller (a ChatGPT Work chat on the web): true when the result offers it a line, false when unavailable", async (t) => {
+  const offered: { after?: boolean } = {};
+  const n = await wrapped(t, wakesTool(offered), { native: () => true, wake: { logger: quiet } });
+  const res = await n.call("ada", "watch", {});
+  assert.equal(offered.after, true);
+  assert.match(texts(res)[0]!, /^Started/);
+  // No user: a public event can't be offered natively (no_user).
+  const none: { after?: boolean } = {};
+  const u = await wrapped(t, wakesTool(none), { native: () => true, identify: false, wake: { logger: quiet } });
+  await u.call("", "watch", {});
+  assert.equal(none.after, false);
+  // Unsubscribed again in the call: nothing offered.
+  const gone: { after?: boolean } = {};
+  const g = await wrapped(t, wakesTool(gone, { unsubscribe: true }), { native: () => true, wake: { logger: quiet } });
+  await g.call("ada", "watch", {});
+  assert.equal(gone.after, false);
+});
+
+test("call.wakes: false once the call unsubscribed what it subscribed, while the breaker is open, and on a disabled client", async (t) => {
+  const seen: { before?: boolean; after?: boolean; error?: unknown } = {};
+  const w = await wrapped(t, wakesTool(seen, { unsubscribe: true }), { wake: { logger: quiet } });
+  await w.call("ada", "watch", {});
+  assert.equal(seen.after, false);
+
+  const open: { after?: boolean; error?: unknown } = {};
+  const b = await wrapped(t, wakesTool(open), { wake: { logger: quiet } });
+  b.core.fail.add("/event-subscriptions");
+  for (let i = 0; i < callBreaker.failures; i++) await b.call("ada", "watch", {});
+  b.core.fail.delete("/event-subscriptions");
+  await b.call("ada", "watch", {});
+  assert.ok(isCode(open.error, "unreachable"));
+  assert.equal(open.after, false);
+
+  const off: { after?: boolean } = {};
+  const d = await wrapped(t, wakesTool(off), { wake: { key: "", logger: quiet } });
+  await d.call("ada", "watch", {});
+  assert.equal(off.after, false);
+});
+
+test("the breaker: once open, a request admitted before it opened neither closes it nor extends the cool-down", () => {
+  const b = new Breaker();
+  let now = 1_000;
+  b.now = () => now;
+  const admitted = Array.from({ length: callBreaker.failures + 2 }, () => b.admit());
+  assert.ok(admitted.every((a) => a === "go"));
+  for (let i = 0; i < callBreaker.failures; i++) b.done("go", "failed");
+  now += 1_000;
+  b.done("go", "ok"); // late success
+  b.done("go", "failed"); // late failure
+  assert.equal(b.admit(), "skip");
+  now = 1_000 + callBreaker.coolDownMs;
+  assert.equal(b.admit(), "probe");
+});
+
+test("the breaker: 4xx answers don't trip it, and it doesn't hold back emits", async (t) => {
+  const caught: unknown[] = [];
+  const w = await wrapped(t, watching(caught), { wake: { logger: quiet } });
+  w.core.status.set("/event-subscriptions", 403);
+  for (let i = 0; i < 8; i++) await w.call("ada", "watch", {});
+  assert.equal(w.core.bodies("/event-subscriptions").length, 8);
+  assert.ok(caught.every((e) => isCode(e, "refused")));
+
+  // Opened by 5xx, it still lets an emit through.
+  w.core.status.delete("/event-subscriptions");
+  w.core.fail.add("/event-subscriptions");
+  for (let i = 0; i < callBreaker.failures; i++) await w.call("ada", "watch", {});
+  w.core.reset();
+  await w.call("ada", "watch", {});
+  assert.deepEqual(w.core.paths(), []);
+  const out = await w.ev.news.emit({ table: "oak" }, { text: "hi" });
+  assert.equal(out.matched, 2);
+  assert.deepEqual(w.core.paths(), ["/events/emit"]);
+});
+
+test("warnings.json situations core_unavailable: seven calls against a failing subscribe log core_unavailable once", async (t) => {
+  const log = captureLog();
+  const caught: unknown[] = [];
+  const w = await wrapped(t, watching(caught), { wake: { logger: log.logger } });
+  w.core.fail.add("/event-subscriptions");
+  for (let i = 0; i < 7; i++) assert.deepEqual((await w.call("ada", "watch", {})).result, WATCHING);
+  assert.equal(w.core.bodies("/event-subscriptions").length, 5);
+  const situation = warningsFixture.situations.cases.find((c: any) => c.op === "core_unavailable");
+  const got = log.lines.filter((l) => l.level !== "debug" && l.level !== "info").map((l) => l.fields);
+  assert.equal(got.length, situation.logs.length, JSON.stringify(got));
+  situation.logs.forEach((want: Record<string, unknown>, i: number) => {
+    for (const [k, v] of Object.entries(want)) assert.equal((got[i] as Record<string, unknown>)[k], v, k);
+  });
 });

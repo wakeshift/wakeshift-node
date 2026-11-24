@@ -63,6 +63,12 @@ const FIVE_MINUTES: Policy = { kind: "rate_limited", windowMs: 300_000 };
 // SDK's own degraded modes, which no other SDK has.
 const CODES: Record<string, { level: Level; fix: string; policy: Policy }> = {
   no_key: { level: "debug", fix: "Set WAKESHIFT_KEY to turn Wakeshift on.", policy: ONCE },
+  client_request_refused: { level: "warn", fix: "Nothing to change; the request wasn't shown, and the result kept Wakeshift's usual text.", policy: { kind: "once", per: ["reason"] } },
+  client_request_report_failed: {
+    level: "warn",
+    fix: "Nothing to change if it's rare; the result went out with the answer's text. Check that this server can reach Wakeshift.",
+    policy: FIVE_MINUTES,
+  },
   no_identify: { level: "debug", fix: "Add identify to tie subscriptions to signed-in users, and requireUser to refuse anonymous callers.", policy: ONCE },
   no_events: { level: "warn", fix: "Define events with defineEvent before attach.", policy: ONCE },
   text_trimmed: { level: "warn", fix: "Keep text to a short headline and put the details in the payload.", policy: { kind: "once", per: ["event"] } },
@@ -91,6 +97,11 @@ const CODES: Record<string, { level: Level; fix: string; policy: Policy }> = {
   watch_stopped: { level: "info", fix: "Nothing to change: the check's error was marked final, so the watch stopped as asked.", policy: FIVE_MINUTES },
   watch_timeout: { level: "info", fix: "Raise the watch's timeout if the work can take longer.", policy: { kind: "once", per: ["event"] } },
   key_refused: { level: "error", fix: "Check WAKESHIFT_KEY: the key was revoked, or belongs to another console.", policy: FIVE_MINUTES },
+  manifest_refused: {
+    level: "error",
+    fix: "Fix the event definitions the message names; until then Wakeshift serves none of this app's events (no push, vouchers or subscribes).",
+    policy: FIVE_MINUTES,
+  },
   subscribe_in_flight: { level: "warn", fix: "Await subscribe, unsubscribe and resolveSession before the tool returns.", policy: { kind: "once", per: ["tool"] } },
   mcp_patch_unavailable: { level: "warn", fix: "Upgrade @modelcontextprotocol/sdk to 1.23 or later.", policy: ONCE },
   monitor_line_long: {
@@ -100,11 +111,22 @@ const CODES: Record<string, { level: Level; fix: string; policy: Policy }> = {
   },
   config: { level: "error", fix: "Fix the configuration the message names; the same error was thrown.", policy: { kind: "each" } },
   block_failed: { level: "warn", fix: "Nothing to change; the tool's result went out as the tool gave it, without Wakeshift's addition.", policy: FIVE_MINUTES },
+  core_unavailable: { level: "warn", fix: "Nothing to change; tool calls go on without Wakeshift (no wakes, results unchanged) until it answers again.", policy: FIVE_MINUTES },
   // This SDK's own.
   tasks_unrouted: { level: "warn", fix: "Upgrade @modelcontextprotocol/server to 2.3.0 or later.", policy: ONCE },
   handlers_unreachable: { level: "warn", fix: "Check for a newer @wakeshift/sdk.", policy: ONCE },
   not_a_tool_result: { level: "warn", fix: "Answer a tool that subscribes in one call, not with a task or an input request.", policy: { kind: "once", per: ["tool"] } },
   mastra_attach_failed: { level: "warn", fix: "Check for an @wakeshift/sdk that supports this @mastra/mcp.", policy: ONCE },
+  // MCP Events push (events/stream): this SDK's until the Python and Go SDKs serve it.
+  push_upstream_failed: { level: "warn", fix: "Nothing to change if it's rare: the client reconnects with its cursor. Check that this server can reach Wakeshift.", policy: FIVE_MINUTES },
+  push_max_stream: { level: "debug", fix: "Set attach's push.maxStreamMs to change it.", policy: ONCE },
+  push_recheck_failed: {
+    level: "warn",
+    fix: "Check identify and authorize: while they fail, an open stream goes on until its last successful check is 15 minutes old (three checks, if longer).",
+    policy: FIVE_MINUTES,
+  },
+  push_open_check_failed: { level: "warn", fix: "Check identify and authorize: the client retries, and its stream opens once they answer.", policy: FIVE_MINUTES },
+  push_recheck_stale: { level: "warn", fix: "Check identify and authorize: the client reconnects with its cursor, and retries while they fail.", policy: FIVE_MINUTES },
 };
 
 const RANK: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40, off: 100 };

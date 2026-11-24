@@ -4,6 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { z } from "zod";
 import { expectTypeOf } from "expect-type";
+import { readFileSync } from "node:fs";
 import { McpServer, Client, InMemoryTransport } from "./mcp.js";
 import { Wakeshift, isWakeshiftError, type ToolCall } from "../src/index.js";
 import { createTestClient, createToolCall, withCall } from "../src/testing.js";
@@ -303,4 +304,69 @@ test("types: Duration takes any string at compile time (a bad one throws when us
   await assert.rejects(call.subscribe(crawl, { job: "j1" }, { replay: bad }), (e: unknown) => isWakeshiftError(e, "bad_arguments") && /a number and s, m, h or d/.test((e as Error).message));
   expectTypeOf<import("../src/index.js").ToolCallSubscribe>().toHaveProperty("subscribe");
   expectTypeOf<import("../src/index.js").SubscribeOptions>().toHaveProperty("context");
+});
+
+test("createToolCall: wakes is true once a subscribe holds a subscription (a native one too); wakes: false and a failed subscribe test the fallback", async () => {
+  const wake = createTestClient();
+  const crawl = wake.defineEvent("crawl.finished", { description: "A crawl finished", args: z.object({ job: z.string() }), payload: z.object({ pages: z.number() }) });
+  const call = createToolCall({ user: "u1" });
+  assert.equal(call.wakes, false);
+  await call.subscribe(crawl, { job: "j1" });
+  assert.equal(call.wakes, true);
+  await call.unsubscribe(crawl, { job: "j1" });
+  assert.equal(call.wakes, false);
+  const unwakeable = createToolCall({ user: "u1", wakes: false });
+  await unwakeable.subscribe(crawl, { job: "j1" });
+  assert.equal(unwakeable.wakes, false);
+  const native = createToolCall({ user: "u1", native: true });
+  await native.subscribe(crawl, { job: "j1" });
+  assert.equal(native.wakes, true);
+  await native.unsubscribe(crawl, { job: "j1" });
+  assert.equal(native.wakes, false);
+  const failing = createToolCall({ user: "u1" });
+  failing.failNext("subscribe", "unreachable");
+  await assert.rejects(failing.subscribe(crawl, { job: "j1" }));
+  assert.equal(failing.wakes, false);
+});
+
+test("createTestClient({ wakes: false }): a real server's tool calls get call.wakes false, to test the fallback end to end", async () => {
+  for (const [opts, want] of [[{}, true], [{ wakes: true }, true], [{ wakes: false }, false]] as const) {
+    const wake = createTestClient(opts);
+    const crawl = wake.defineEvent("crawl.finished", { description: "A crawl finished", args: z.object({ job: z.string() }), payload: z.object({ pages: z.number() }) });
+    const server = new McpServer({ name: "crawler", version: "1" });
+    wake.attach(server).registerTool("start_crawl", { inputSchema: { job: z.string() }, subscribes: [crawl] }, async ({ job }, _ctx, call) => {
+      await call.subscribe(crawl, { job });
+      return `wakes=${call.wakes}`;
+    });
+    const client = await connect(server);
+    const r: any = await client.callTool({ name: "start_crawl", arguments: { job: "j1" } });
+    assert.match(r.content[0].text, new RegExp(`wakes=${want}`), JSON.stringify(opts));
+    assert.equal(wake.subscriptions.length, 1, "subscribed either way");
+  }
+});
+
+// skip-wait.json: call.shouldSkipWait on a stand-in made with wakes and callLimit, after one subscribe.
+const skipWait = JSON.parse(readFileSync(new URL("../../test/skip-wait.json", import.meta.url), "utf8")) as {
+  cases: { name: string; wakes: boolean; call_limit: number | null; seconds: number | null; skip: boolean }[];
+};
+for (const c of skipWait.cases) {
+  test(`skip-wait.json: ${c.name}`, async () => {
+    const wake = createTestClient();
+    const crawl = wake.defineEvent("crawl.finished", { description: "A crawl finished", args: z.object({ job: z.string() }), payload: z.object({ pages: z.number() }) });
+    const call = createToolCall({ user: "u1", wakes: c.wakes, callLimit: c.call_limit ?? undefined });
+    assert.equal(call.callLimit, undefined, "undefined before a subscribe");
+    await call.subscribe(crawl, { job: "j1" });
+    assert.equal(call.callLimit, c.call_limit ?? undefined);
+    assert.equal(call.shouldSkipWait(c.seconds ?? undefined), c.skip);
+  });
+}
+
+test("createToolCall: a native call has no callLimit, so it never skips a wait", async () => {
+  const wake = createTestClient();
+  const crawl = wake.defineEvent("crawl.finished", { description: "A crawl finished", args: z.object({ job: z.string() }), payload: z.object({ pages: z.number() }) });
+  const call = createToolCall({ user: "u1", native: true, callLimit: 60 });
+  await call.subscribe(crawl, { job: "j1" });
+  assert.equal(call.wakes, true);
+  assert.equal(call.callLimit, undefined);
+  assert.equal(call.shouldSkipWait(300), false);
 });

@@ -13,11 +13,14 @@
 //   wake.failNext("subscribe", "unreachable")  // the next subscribe fails, as when Wakeshift is down
 //   await wake.redeem(voucher, webhookUrl)     // ChatGPT subscribing with the voucher a tool handed it
 //   await wake.close()                         // waits for watch checks in flight and their emits, then stops
+//
+// The test client serves MCP Events push too: a client's events/stream to a
+// server attached with it gets active, then an event for each matching emit.
 
 import { randomBytes } from "node:crypto";
 import { Wakeshift, type Recognized, type Recipient } from "./wakeshift.js";
 import { APIConnectionError, APIError, UsageError } from "./errors.js";
-import { made, runWithTestCall, subscribeBody, type AnyEvent, type EventArgs, type SubscribeOptions, type Subscription } from "./toolcall.js";
+import { callLimitOf, made, runWithTestCall, skipsWait, subscribeBody, type AnyEvent, type EventArgs, type SubscribeOptions, type Subscription } from "./toolcall.js";
 import { subscribeNatively } from "./events.js";
 import { rememberVouchers } from "./voucherctx.js";
 import { drainWatches, onSubscribeSettled } from "./watch.js";
@@ -117,6 +120,16 @@ interface MintedVoucher {
   sub?: TestSubscription;
 }
 
+// One push stream the fake core holds open.
+interface PushStream {
+  sub: TestSubscription;
+  timer?: ReturnType<typeof setInterval>;
+  write(frame: Record<string, unknown>): void;
+  deliver(occurrence: Record<string, unknown>): void;
+  close(): void;
+  end(): void;
+}
+
 const FAILURE_PATHS: Record<"subscribe" | "unsubscribe", string> = { subscribe: "/event-subscriptions", unsubscribe: "/event-subscriptions/unsubscribe" };
 
 function checkFailure(op: unknown, error: unknown): void {
@@ -134,6 +147,13 @@ function failureError(error: TestFailure): APIError {
 export interface TestClientOptions {
   /** The app's name, as the console would give it (the subscribes sentence uses it). Default "Test app". */
   app?: string;
+  /**
+   * Whether the fake Wakeshift confirms it can wake the conversations its
+   * subscribes name: call.wakes on the tool calls of a server attached with
+   * this client. Default true; false tests your tool's fallback (its own
+   * polling or waiting, as without Wakeshift) through a real server.
+   */
+  wakes?: boolean;
   logger?: Logger;
   logLevel?: LogLevel;
 }
@@ -156,6 +176,8 @@ class FakeCore {
   readonly vouchers = new Map<string, MintedVoucher>();
   /** Whether an event is tools-only (only the app's tools subscribe to it): set by the TestClient. */
   toolsOnly: (event: string) => boolean = () => false;
+  /** What a subscribe answers for wakes (TestClientOptions.wakes). */
+  wakes = true;
 
   constructor(private readonly app: string) {}
 
@@ -179,6 +201,8 @@ class FakeCore {
     this.ids.clear();
     this.fails.clear();
     this.vouchers.clear();
+    this.closeStreams();
+    this.pushSubs.clear();
   }
 
   fetch = (async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -193,9 +217,108 @@ class FakeCore {
       if (fail === "unreachable") throw new TypeError("fetch failed (the test client's failNext)");
       return new Response(JSON.stringify({ error: { code: "unauthenticated", message: "the app key was refused (the test client's failNext)" } }), { status: 401, headers: { "Content-Type": "application/json" } });
     }
+    if (path === "/events/stream" && method === "POST") return this.stream(body, init?.signal ?? undefined);
     const [status, json] = this.answer(method, path, body);
     return new Response(JSON.stringify(json), { status, headers: { "Content-Type": "application/json" } });
   }) as typeof fetch;
+
+  // ── Push (events/stream) ──────────────────────────────────────────────
+  // The upstream as Wakeshift serves it: NDJSON frames, active first, an
+  // event for each matching emit, heartbeats at the grant, and close when
+  // the test client closes. Cursors are the fake's own (c2.test.<sub>.<seq>).
+
+  private readonly streams = new Set<PushStream>();
+  private readonly pushSubs = new Map<string, { sub: TestSubscription; seq: number }>();
+
+  private stream(b: any, signal: AbortSignal | undefined): Response {
+    const json = (status: number, v: unknown) => new Response(JSON.stringify(v), { status, headers: { "Content-Type": "application/json" } });
+    let voucherSub: MintedVoucher | undefined;
+    if (typeof b.voucher === "string") {
+      const v = this.vouchers.get(b.voucher);
+      const refused = json(403, { error: { code: "bad_voucher", message: BAD_VOUCHER } });
+      if (!v || v.event !== b.name || compact(v.args) !== compact(b.arguments ?? {})) return refused;
+      if (v.user && v.user !== b.call?.user) return refused;
+      if (v.sub && (b.cursor == null || !this.pushSubs.has(String(b.cursor).split(".")[2] ?? ""))) return refused;
+      voucherSub = v;
+    } else if (this.toolsOnly(b.name)) {
+      return json(403, { error: { code: "tools_only", message: `${b.name} can be subscribed only through this app's tools` } });
+    }
+    const grant = Math.min(45_000, Math.max(10_000, typeof b.heartbeat_ms === "number" ? b.heartbeat_ms : 30_000));
+    const id = typeof b.cursor === "string" ? (b.cursor.split(".")[2] ?? "") : "";
+    let held = this.pushSubs.get(id);
+    let created = false;
+    let truncated = false;
+    if (!held) {
+      // A null cursor (or one whose subscription is gone): a new subscription.
+      truncated = b.cursor != null;
+      created = true;
+      const sub: TestSubscription = voucherSub
+        ? { id: `sub_test_${++this.n}`, event: b.name, args: b.arguments ?? {}, tool: voucherSub.tool, user: voucherSub.user, once: voucherSub.once, via: "tool" }
+        : { id: `sub_test_${++this.n}`, event: b.name, args: b.arguments ?? {}, tool: undefined, user: b.call?.user, once: false, via: "native" };
+      held = { sub, seq: 0 };
+      this.pushSubs.set(sub.id, held);
+      this.subscriptions.push(sub);
+      if (voucherSub) voucherSub.sub = sub;
+    }
+    const h = held;
+    const cursor = () => `c2.test.${h.sub.id}.${h.seq}`;
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const encoder = new TextEncoder();
+    const s: PushStream = {
+      sub: h.sub,
+      write: (frame) => {
+        try {
+          controller.enqueue(encoder.encode(JSON.stringify(frame) + "\n"));
+        } catch {
+          // closed already
+        }
+      },
+      deliver: (occurrence) => {
+        h.seq++;
+        s.write({ type: "event", occurrence: { ...occurrence, cursor: cursor() } });
+      },
+      close: () => {
+        s.write({ type: "close" });
+        s.end();
+      },
+      end: () => {
+        clearInterval(s.timer);
+        this.streams.delete(s);
+        try {
+          controller.close();
+        } catch {
+          // closed already
+        }
+      },
+    };
+    const body = new ReadableStream<Uint8Array>({
+      start: (c) => {
+        controller = c;
+      },
+      cancel: () => s.end(),
+    });
+    this.streams.add(s);
+    s.write({ type: "active", cursor: cursor(), truncated, heartbeat_ms: grant, created, ...(voucherSub ? { via: "tool:" + voucherSub.tool, tool: voucherSub.tool } : {}) });
+    s.timer = setInterval(() => s.write({ type: "heartbeat", cursor: cursor() }), grant);
+    (s.timer as { unref?: () => void }).unref?.();
+    signal?.addEventListener("abort", () => s.end(), { once: true });
+    return new Response(body, { status: 200, headers: { "Content-Type": "application/x-ndjson" } });
+  }
+
+  /** An emit, to the push streams it matches. */
+  private push(e: TestEmit): void {
+    const tos = e.to === undefined ? undefined : (Array.isArray(e.to) ? e.to : [e.to]).map((r) => (typeof r === "string" ? r : "user" in r ? r.user : r.native));
+    for (const s of this.streams) {
+      if (key(s.sub.event, s.sub.args) !== key(e.event, e.args)) continue;
+      if (tos && !tos.includes(s.sub.user ?? "")) continue;
+      s.deliver({ eventId: `evt_test_${++this.n}`, name: e.event, timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"), data: e.payload, _meta: { "ai.wakeshift/text": e.text } });
+    }
+  }
+
+  /** Ends every push stream as Wakeshift does on a deploy: close, and the clients reconnect. */
+  closeStreams(): void {
+    for (const s of [...this.streams]) s.close();
+  }
 
   private subscribe(event: string, args: Record<string, unknown>, s: Omit<TestSubscription, "id" | "event" | "args">): { sub: TestSubscription; created: boolean } {
     const k = key(event, args) + "\u0000" + (s.via === "native" ? "native:" + (s.user ?? "") : "conversation");
@@ -235,8 +358,8 @@ class FakeCore {
         return [200, { id: "test-app", name: this.app, key: { key_id: "test", name: "test" } }];
       case "/manifest":
       case "/manifest/merge":
-        // A core that hands out subscribe vouchers.
-        return [200, method === "GET" ? { description: "" } : { ...b, features: ["subscribe_vouchers"] }];
+        // A core that hands out subscribe vouchers and serves push.
+        return [200, method === "GET" ? { description: "" } : { ...b, features: ["subscribe_vouchers", "push"] }];
       case "/events/emit": {
         const e: TestEmit = { event: b.name, args: b.arguments ?? {}, payload: b.payload, text: b.text };
         if (b.id) e.id = b.id;
@@ -250,6 +373,7 @@ class FakeCore {
         }
         if (b.id) this.ids.set(b.id, content);
         this.emits.push(e);
+        this.push(e);
         const matched = [...this.live.values()].filter((s) => s.event === b.name && key(s.event, s.args) === key(b.name, b.arguments)).length;
         return [200, { matched }];
       }
@@ -263,6 +387,7 @@ class FakeCore {
             session: TEST_SESSION,
             pending: b.pending || "pa_test",
             agent: { harness: RECOGNIZED.harness, via: RECOGNIZED.via },
+            wakes: this.wakes,
             addition: { text: "(Wakeshift test client: the conversation's wake instructions go here.)" },
           },
         ];
@@ -323,6 +448,16 @@ class FakeCore {
         const { created } = b.cursor ? { created: false } : this.subscribe(b.name, b.arguments ?? {}, { tool: undefined, user: b.call?.user, once: false, via: "native" });
         return [200, { events: [], cursor: "c0", truncated: false, has_more: false, next_poll_ms: 10_000, created }];
       }
+      case "/events/stream/end": {
+        // An explicit cancel (stdio) ends the stream's subscription.
+        const id = typeof b.cursor === "string" ? (b.cursor.split(".")[2] ?? "") : "";
+        const held = this.pushSubs.get(id);
+        if (!held) return [200, { ended: false }];
+        this.pushSubs.delete(id);
+        for (const s of [...this.streams]) if (s.sub === held.sub) s.end();
+        this.unsubscribes.push({ event: held.sub.event, args: held.sub.args, ended: true });
+        return [200, { ended: true }];
+      }
       case "/users/forget":
         return [200, { forgotten: false }];
     }
@@ -342,6 +477,7 @@ const CORES = new WeakMap<TestClient, FakeCore>();
 export class TestClient extends Wakeshift {
   constructor(opts: TestClientOptions = {}) {
     const core = new FakeCore(opts.app ?? "Test app");
+    core.wakes = opts.wakes ?? true;
     super({ key: TEST_KEY, core: TEST_CORE, fetch: core.fetch, logger: opts.logger, logLevel: opts.logLevel, maxRetries: 0 });
     const events = (this as unknown as { events: Map<string, AnyEvent> }).events;
     core.toolsOnly = (name) => events.get(name)?.access === "tools";
@@ -394,6 +530,8 @@ export class TestClient extends Wakeshift {
    */
   async close(): Promise<void> {
     await drainWatches(this);
+    // Open push streams end as on a deploy (close): their clients get the final result.
+    CORES.get(this)!.closeStreams();
     await super.close();
   }
 
@@ -446,6 +584,19 @@ export interface TestToolCallOptions<C> {
    * client.redeem subscribes with, the subscribe's context remembered.
    */
   client?: TestClient;
+  /**
+   * Whether Wakeshift can wake the conversation: call.wakes is this once a
+   * subscribe holds a subscription. Default true; false tests your tool's
+   * fallback (its own polling or waiting, as without Wakeshift).
+   */
+  wakes?: boolean;
+  /**
+   * The program's per-call limit in seconds a subscribe sets (call.callLimit),
+   * as Wakeshift gives it for Claude Code (60) or Codex (300). Default
+   * undefined, as for a program whose limit isn't known; a native call never
+   * has one.
+   */
+  callLimit?: number;
 }
 
 /** One subscribe or unsubscribe a stand-in call received. */
@@ -485,8 +636,30 @@ export class TestToolCall<C = unknown> {
   private readonly fails = new Map<string, TestFailure>();
   private finished = false;
   private n = 0;
+  private readonly wakePath: boolean;
+
+  /** As on a real call: true once a subscribe holds a subscription (a native call: once one answered native), unless the call was made with wakes: false. */
+  get wakes(): boolean {
+    return this.wakePath && !this.subscribeFailed && (this.native ? this.nativeHeld.size > 0 : this.live.size > 0);
+  }
+  private readonly nativeHeld = new Set<string>();
+  private subscribeFailed = false;
+  private readonly limit: number | undefined;
+  #callLimit: number | undefined;
+
+  /** As on a real call: the callLimit option once a subscribe made or renewed a subscription; undefined before, and for a native call. */
+  get callLimit(): number | undefined {
+    return this.#callLimit;
+  }
+
+  /** As on a real call: true only when wakes is true and seconds reaches callLimit. */
+  shouldSkipWait(seconds: number | undefined): boolean {
+    return skipsWait(this.wakes, this.#callLimit, seconds);
+  }
 
   constructor(opts: TestToolCallOptions<C> = {}) {
+    this.wakePath = opts.wakes ?? true;
+    this.limit = callLimitOf(opts.callLimit);
     this.tool = opts.tool ?? "test_tool";
     this.user = opts.user;
     this.native = !!opts.native;
@@ -513,7 +686,12 @@ export class TestToolCall<C = unknown> {
     if (this.events && !this.events.includes(event)) throw new UsageError("undeclared_subscribe", `${this.tool} subscribed to ${event.name}, which isn't in its subscribes`);
     const parsed = event.parseArgs(args) as Record<string, unknown>;
     subscribeBody(opts);
-    this.failure("subscribe");
+    try {
+      this.failure("subscribe");
+    } catch (err) {
+      this.subscribeFailed = true; // as on a real call: any failed subscribe makes wakes false
+      throw err;
+    }
     this.subscriptions.push({ event: event.name, args: parsed, options: { ...opts } });
     if (this.native) {
       if (this.client && event.access === "tools") {
@@ -523,6 +701,7 @@ export class TestToolCall<C = unknown> {
         rememberVouchers(this.client, voucherLine(event.name, parsed, voucher), [{ name: event.name, arguments: parsed, context: opts.context }]);
         this.vouchers.push({ event: event.name, args: parsed, voucher });
       }
+      this.nativeHeld.add(key(event.name, parsed));
       return { state: "native", user: this.user ?? "", recognized: RECOGNIZED };
     }
     if (event.personal && !this.user) throw new UsageError("bad_arguments", `${event.name} is personal: call.subscribe needs a user (attach's identify), who the subscription belongs to`);
@@ -535,6 +714,7 @@ export class TestToolCall<C = unknown> {
     else if (c) c.context = opts.context;
     this.session = TEST_SESSION;
     this.recognized = RECOGNIZED;
+    this.#callLimit = this.limit;
     return made(known ? "renewed" : "created", id, this.user ?? "", TEST_SESSION, RECOGNIZED);
   }
 
@@ -543,6 +723,7 @@ export class TestToolCall<C = unknown> {
     this.failure("unsubscribe");
     this.unsubscribes.push({ event: event.name, args: parsed, options: {} });
     this.created.delete(key(event.name, parsed));
+    this.nativeHeld.delete(key(event.name, parsed));
     return this.live.delete(key(event.name, parsed));
   }
 

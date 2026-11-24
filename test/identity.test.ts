@@ -1,4 +1,4 @@
-// Identity and authorization (design §2.8, §2.9, §8 PR 7): identify may be
+// Identity and authorization: identify may be
 // async, runs lazily at most once per request, and refuses Wakeshift's part
 // of the request (and nothing else) when it throws, fails or hangs, or,
 // with requireUser, gives no user; authorize refuses the same way. The

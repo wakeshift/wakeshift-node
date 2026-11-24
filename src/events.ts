@@ -9,7 +9,7 @@
 
 import { RpcError, type AuthInfo, type CallToolResult, type LowServerLike, type McpServerLike, type ToolCallExtra } from "./mcp.js";
 import { isSchema, isZ4Schema, objectFromShape, safeParse, toJsonSchema, type AnySchema, type SchemaInput, type SchemaOutput, type ZodRawShapeCompat } from "./zod.js";
-import { capabilitiesError, hostOf, type Host } from "./host.js";
+import { capabilitiesError, hostOf, is2026, wrapMethod, type Host, type Req } from "./host.js";
 import { APIConnectionError, APIError, UsageError, detailOf, errorType, type Issue } from "./errors.js";
 import {
   DELIVERY,
@@ -20,12 +20,23 @@ import {
   TOP_LEVEL_KEY,
   NAME_HEADER,
   RESULT_TYPE,
-  bridgedClient,
+  NAMED_METHODS,
+  EVENTS_METHODS,
+  METHOD_HEADER,
+  VERSION_HEADER,
+  PUSH,
+  STREAM_REFUSAL,
+  nameHeaderRefusal,
+  paramHeaderRefusal,
+  paramHeadersOf,
+  transportHeaderRefusal,
+  nativeClient,
+  pushClient,
   codesFor,
   dialectOf,
-  headerValue,
   type Codes,
   type Dialect,
+  type ParamHeader,
 } from "./spec.js";
 import { agentToken, publishUrlOf, toolCallOf, transportSessionOf, userAgentOf, type Agent, type Emitted, type PublishUrl, type Recipient, type Via, type Wakeshift } from "./wakeshift.js";
 import { Attachment, ToolLayer, checkSubscribes, loadCallStore, nativeOf, wakeInputsFor, type AnyEvent } from "./toolcall.js";
@@ -35,6 +46,7 @@ import { optionalModules } from "./optional.js";
 import { serveTasks, TOOL_ANNOTATIONS } from "./tasks.js";
 import { takeVoucherContext } from "./voucherctx.js";
 import { runOnSubscribe, startWatch, type Subscribed, type Watch, type WatchCheck, type WatchOptions } from "./watch.js";
+import { answeringStream, checkFailed, pushConfig, pushResponse, relayPush, transportStreams, watchCancels, type PushOptions } from "./push.js";
 
 /**
  * Who is subscribing: what authorize decides on. Never decide on client or
@@ -222,7 +234,7 @@ export function textBytes(text: string): number {
   return new TextEncoder().encode(JSON.stringify(text)).length - 2;
 }
 
-/** @internal The event argument a native client passes a subscribe voucher in (docs/subscribe-vouchers.md §4.4): reserved, and taken out before anything reads the arguments. */
+/** @internal The event argument a native client passes a subscribe voucher in: reserved, and taken out before anything reads the arguments. */
 export const VOUCHER_ARG = "wakeshift_voucher";
 
 /**
@@ -369,6 +381,8 @@ export class WakeEvent<N extends string = string, A extends AnySchema = AnySchem
   /** @internal */ readonly argsSchema: AnySchema;
   /** @internal */ readonly payloadSchema: AnySchema;
   /** @internal */ readonly manifest: EventTypeManifest;
+  /** @internal The arguments its x-mcp-header annotations mirror into Mcp-Param headers (spec.ts paramHeadersOf). */
+  readonly paramHeaders: readonly ParamHeader[];
   private readonly opts: EventOptions<A, P, Personal>;
 
   /** @internal Use wake.defineEvent. */
@@ -407,8 +421,12 @@ export class WakeEvent<N extends string = string, A extends AnySchema = AnySchem
     const payload = jsonSchemaOf(this.payloadSchema, true);
     if (args.type !== "object") throw new UsageError("config", `event ${name}: args is a zod object`);
     if (payload.type !== "object") throw new UsageError("config", `event ${name}: payload is a zod object`);
+    // An invalid x-mcp-header makes a spec client drop the event type (SEP-3415).
+    const annotated = paramHeadersOf(args);
+    if (annotated.problem !== undefined) throw new UsageError("config", `event ${name}: arguments: ${annotated.problem}`);
+    this.paramHeaders = annotated.headers;
     const props = (args.properties ?? {}) as Record<string, { type?: string }>;
-    // A native client writes a subscribe voucher there (docs/subscribe-vouchers.md §4.4).
+    // A native client writes a subscribe voucher there.
     if (Object.prototype.hasOwnProperty.call(props, VOUCHER_ARG)) throw new UsageError("config", `event ${name}: ${VOUCHER_ARG} is Wakeshift's: a native client passes a subscribe voucher in it. Name the argument something else`);
     const required = new Set<string>(args.required ?? []);
     const payloadProps = (payload.properties ?? {}) as Record<string, unknown>;
@@ -447,7 +465,7 @@ export class WakeEvent<N extends string = string, A extends AnySchema = AnySchem
       ...(this.personal ? { personal: true } : {}),
       ...(this.deleteOnDelivery ? { delete_on_delivery: true } : {}),
       // Who may subscribe, which the core enforces too: "tools" unless the
-      // event says otherwise (design §3).
+      // event says otherwise.
       subscribe: this.open ? "any" : "tools",
     };
   }
@@ -493,14 +511,23 @@ export class WakeEvent<N extends string = string, A extends AnySchema = AnySchem
 
   /** @internal Whether this subscriber may subscribe with these arguments. */
   async allows(subscriber: Subscriber, args: SchemaOutput<A>): Promise<boolean> {
+    // An authorize that fails or hangs refuses, the same way on every path.
+    return (await this.check(subscriber, args)) === true;
+  }
+
+  /**
+   * @internal authorize's answer: true, false, or "error" when it threw,
+   * failed or took too long (logged as authorize_failed, with the error's
+   * type, never its message). An open push stream keeps going on "error".
+   */
+  async check(subscriber: Subscriber, args: SchemaOutput<A>, refusing = true): Promise<boolean | "error"> {
     if (!this.opts.authorize) return true;
     try {
       return (await withTimeout(Promise.resolve().then(() => this.opts.authorize!(subscriber, args)), limits.authorizeMs)) === true;
     } catch (err) {
-      // An authorize that fails or hangs refuses, the same way on every
-      // path; the app hears its error's type, never its message.
-      this.wake.log.log("authorize_failed", `authorize for ${this.name} threw, failed or took too long, so the subscription was refused`, { event: this.name, error_type: errorType(err) });
-      return false;
+      const what = refusing ? "so the subscription was refused" : "so the open stream goes on until the next check";
+      this.wake.log.log("authorize_failed", `authorize for ${this.name} threw, failed or took too long, ${what}`, { event: this.name, error_type: errorType(err) });
+      return "error";
     }
   }
 
@@ -510,7 +537,7 @@ export class WakeEvent<N extends string = string, A extends AnySchema = AnySchem
    * vouchers), its arguments gain the required wakeshift_voucher, described
    * with the app's name.
    */
-  definition(voucherApp?: string): Record<string, unknown> {
+  definition(voucherApp?: string, push = false): Record<string, unknown> {
     let inputSchema = this.manifest.arguments;
     if (voucherApp !== undefined) {
       const properties = { ...(inputSchema.properties ?? {}), [VOUCHER_ARG]: { type: "string", description: fill("voucher_argument", { app: voucherApp || UNNAMED_APP }) } };
@@ -520,8 +547,9 @@ export class WakeEvent<N extends string = string, A extends AnySchema = AnySchem
       name: this.name,
       description: this.description,
       // A tools-only event is never polled (events/poll refuses it, voucher
-      // or not): only a webhook subscription with a voucher reaches it.
-      delivery: this.open ? [...DELIVERY] : ["webhook"],
+      // or not): only a webhook subscription or a push stream with a voucher
+      // reaches it. push: push is served for this request.
+      delivery: [...(this.open ? DELIVERY : ["webhook"]), ...(push ? [PUSH] : [])],
       inputSchema,
       payloadSchema: this.manifest.payload,
     };
@@ -797,7 +825,7 @@ export interface AttachOptions<C = any> {
    */
   builtinTools?: BuiltinTools | false;
   /**
-   * House agents only: whether a call comes from a client that subscribes
+   * For the app's own first-party agents only: whether a call comes from a client that subscribes
    * to the app's events itself (MCP Events), for callers the SDK can't
    * recognize. false leaves it to the SDK's own checks.
    */
@@ -818,6 +846,34 @@ export interface AttachOptions<C = any> {
    *   wake.attach(server, { wrap: (tool) => (tool.startsWith("run_") ? [runFinished] : undefined) })
    */
   wrap?: Record<string, readonly AnyEvent[]> | ((tool: string) => readonly AnyEvent[] | undefined);
+  /**
+   * MCP Events push (events/stream), served where Wakeshift offers it and
+   * the transport streams its responses (not the MCP SDK's JSON-response
+   * mode). false turns it off, for a host that can't hold a response open
+   * or drops notifications sent before the result. Or tune it for the host:
+   * `push: { maxStreamMs, maxHeartbeatMs }`. maxStreamMs ends each stream
+   * gracefully before the host's request duration cap, and the client
+   * reconnects with its cursor; on Vercel, AWS Lambda and Cloud Run it
+   * defaults under their caps (280 seconds, 14 minutes, 55 minutes).
+   * maxHeartbeatMs asks for heartbeats at least that often, under a load
+   * balancer's idle timeout; Wakeshift sends them every 10 to 45 seconds.
+   * reauthorizeMs is how often an open stream runs identify and the event's
+   * authorize again (default 5 minutes, between 1 and 50): a refusal ends
+   * the stream.
+   */
+  push?: PushOptions;
+  /**
+   * Client requests (default on): during a subscribing call, Wakeshift may
+   * describe one request for this SDK to make of the MCP client, an
+   * elicitation form (Codex's install offer in its own dialog), which the
+   * SDK runs only within fixed bounds and only where the transport carries
+   * a server-to-client request during the call: stdio, or streamable HTTP
+   * with sessions. false turns it off: results keep Wakeshift's usual text.
+   * Off it should be for a server behind something that won't hold an SSE
+   * response for up to two minutes, or that can't route the client's answer
+   * back to the process holding the call.
+   */
+  clientRequests?: boolean;
 }
 
 /** Which of Wakeshift's own tools attach adds: subscribe, list and unsubscribe on unless false; wait off unless true. */
@@ -865,22 +921,21 @@ export function toolChoice(builtinTools: BuiltinTools | false | undefined, what 
   return { builtin, wait: builtinTools?.wait === true };
 }
 
-// What a client says about itself on initialize (2.x: or the request's
-// envelope), or a request's _meta; else the name identify gave (identified).
+// What a client says about itself: the request's _meta clientInfo (every
+// 2026-07-28 request), else its initialize (2.x: or the request's
+// envelope); else the name identify gave (identified). Request first, as in
+// the Go SDK.
 function clientInfoName(host: Host, meta: Record<string, unknown> | undefined, identified?: string): string {
-  const fromInit = host.clientName();
-  if (fromInit) return fromInit;
   const info = meta?.["io.modelcontextprotocol/clientInfo"] as { name?: unknown } | undefined;
   if (typeof info?.name === "string" && info.name) return info.name;
+  const fromInit = host.clientName();
+  if (fromInit) return fromInit;
   return identified ?? "";
 }
 
-/** A client that speaks MCP Events: it declared the extension, or it's one known to (ChatGPT); never a harness Wakeshift wakes itself (BRIDGED_CLIENTS). */
-/** @internal */
-export function speaksEvents(capabilities: Record<string, unknown> | undefined, clientName: string): boolean {
-  if (bridgedClient(clientName, "")) return false;
-  const ext = (capabilities?.extensions as Record<string, unknown> | undefined)?.[EXTENSION_KEY];
-  return !!ext || clientName.toLowerCase() === "openai-mcp";
+/** @internal A session's client that speaks MCP Events, from its initialize (its name and capabilities): spec.ts nativeClient, the one rule. */
+export function speaksEvents(capabilities: Record<string, unknown> | undefined, clientName: string, servesPush = false): boolean {
+  return nativeClient(clientName, "", undefined, capabilities?.extensions, servesPush);
 }
 
 // The fixed wording of the tools attach adds and of the refusals of a
@@ -908,7 +963,7 @@ export const EVENT_TOOL_TEXT = {
   native_refused: "you may not subscribe to {event} with these arguments",
   native_bad_voucher: "this voucher can't subscribe to {event}: it was used, it expired, or it's for other arguments",
   native_tools_only: "{event} can be subscribed only through this app's tools, or with the voucher one of them handed you",
-  native_tools_only_poll: "{event} can't be polled: it's subscribed to only through this app's tools, with a webhook",
+  native_tools_only_poll: "{event} can't be polled: it's subscribed to only through this app's tools, with a webhook or by push",
   native_unknown_event: "this app offers no event named {event}",
   need: "Pass the event and its arguments, or a subscription's id from list_subscriptions.",
   no_such_id: "No subscription of yours has the id {id}: it may have ended already.",
@@ -1047,7 +1102,7 @@ function checkV1(wake: Wakeshift): void {
 }
 
 /** @internal What attach refuses before it touches a server: no events, or tools it doesn't know. */
-const ATTACH_OPTIONS = ["identify", "requireUser", "wrap", "builtinTools", "isNativeClient"];
+const ATTACH_OPTIONS = ["identify", "requireUser", "wrap", "builtinTools", "isNativeClient", "push", "clientRequests"];
 
 /** @internal What attach refuses before it touches a server: unknown options or values. With no events it logs no_events. */
 export function checkAttach(wake: Wakeshift, events: WakeEvent[], opts: AttachOptions<any>, what = "attach", allowed = ATTACH_OPTIONS): void {
@@ -1059,7 +1114,9 @@ export function checkAttach(wake: Wakeshift, events: WakeEvent[], opts: AttachOp
     if (opts[k] !== undefined && typeof opts[k] !== "function") throw new UsageError("config", `${what}'s ${k} is a function`);
   }
   if (opts.requireUser !== undefined && typeof opts.requireUser !== "boolean") throw new UsageError("config", `${what}'s requireUser is true or false`);
+  if (opts.clientRequests !== undefined && typeof opts.clientRequests !== "boolean") throw new UsageError("config", `${what}'s clientRequests is true or false`);
   toolChoice(opts.builtinTools, what, allowed.includes("isNativeClient"));
+  if (allowed.includes("push")) pushConfig(wake, opts.push, {}, what);
   if (events.length === 0) wake.log.log("no_events", `${what} came before any defineEvent, so there's nothing to subscribe to`);
   const wrap = opts.wrap;
   if (wrap !== undefined && typeof wrap !== "function" && (!wrap || typeof wrap !== "object" || Array.isArray(wrap))) {
@@ -1101,6 +1158,21 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
     const client = clientInfoName(host, raw ? host.req(raw).meta : undefined, c.ok ? c.client : undefined);
     return c.ok ? { user: c.user, client, agentToken: c.agentToken } : { user: undefined, client, refused: c.reason };
   };
+  // Push (events/stream): served where the core reports it, the transport
+  // streams its responses, the request can carry notifications, and the app
+  // hasn't turned it off (the listing rule).
+  // pushNow reads the core's last answer without asking (a client's
+  // detection); pushServed asks first.
+  const push = pushConfig(wake, opts.push);
+  let eventsServed = false;
+  const streamsFor = (raw: unknown): boolean => {
+    if (!transportStreams(host)) return false;
+    if (raw === undefined) return true;
+    const req = host.req(raw);
+    return typeof req.notify === "function" && req.id !== undefined;
+  };
+  const pushNow = (raw?: unknown): boolean => push.on && eventsServed && wake.pushKnown && streamsFor(raw);
+  const pushServed = async (raw: unknown): Promise<boolean> => push.on && eventsServed && streamsFor(raw) && (await wake.pushOffered());
   const layer = new ToolLayer<C>({
     wake,
     host,
@@ -1108,6 +1180,8 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
     clientOf: (meta, identified) => clientInfoName(host, meta, identified),
     native: opts.isNativeClient ? (raw) => opts.isNativeClient!(raw as C) === true : undefined,
     wait,
+    servesPush: (raw) => pushNow(raw),
+    clientRequests: opts.clientRequests !== false,
   });
   // Whether a request comes from a client that subscribes itself (MCP
   // Events): the test call.subscribe uses (toolcall.ts nativeOf).
@@ -1134,7 +1208,7 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
     // Advertised whenever the server has an event: one open to MCP Events
     // clients (personal, authorize or public), or a tools-only one, which a
     // native client subscribes to with the subscribe voucher a tool handed
-    // it, while the core hands them out (docs/subscribe-vouchers.md §4.3).
+    // it, while the core hands them out.
     // The capability is fixed before the core is asked, so it can't wait for
     // that answer: with an old core, events/list lists only open events.
     // For a server whose events are all tools-only it's best-effort: one
@@ -1154,7 +1228,7 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
   // Clients that speak only protocol 2026-07-28 (OpenClaw): on the MCP SDK
   // 1.x, on a stateless transport, server/discover and resultType
   // (discover.ts); on 2.x, its own.
-  serveStateless(host, { bridgedOnly: ["subscribe_events"] });
+  serveStateless(host, { bridgedOnly: ["subscribe_events"], servesPush: (raw) => pushServed(raw) });
   // Clients that take MCP tasks there (Claude Code): Wakeshift's wait tool,
   // answered with a task (tasks.ts), if the app turns it on (wait).
   if (wait) serveTasks(wake, host, callerOf);
@@ -1178,23 +1252,65 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
   // Only the events open to native clients are listed (personal, authorize
   // or public); one only the app's tools subscribe to is refused below.
   const open = events.filter((e) => e.open);
-  if (!theirs) serveNative();
+  // nameRefusal is why a request is refused for its Mcp-Name header (spec.ts
+  // nameHeaderRefusal), or null.
+  const nameRefusal = (req: Req, name: unknown): string | null => nameHeaderRefusal(req.header(NAME_HEADER) || undefined, name);
+  // paramRefusal is why a request is refused for its Mcp-Param headers
+  // (spec.ts paramHeaderRefusal), or null: for a known event whose
+  // arguments carry x-mcp-header annotations, over HTTP only (a client on
+  // another transport sends none). values: a header's fields by its
+  // lowercase name.
+  const paramRefusal = (name: unknown, args: unknown, http: boolean, values: (name: string) => readonly string[] | undefined): string | null => {
+    const ev = typeof name === "string" ? byName.get(name) : undefined;
+    if (!ev || ev.paramHeaders.length === 0 || !http) return null;
+    return paramHeaderRefusal(ev.paramHeaders, args, values);
+  };
+  // A header sent twice reaches here as one field, its values joined with
+  // ", " (the Fetch Headers API, which both MCP SDKs' HTTP transports read
+  // through): it matches only a body value that is that joined text.
+  const reqParamRefusal = (req: Req, name: unknown, args: unknown): string | null => {
+    const headers = req.headers();
+    return paramRefusal(name, args, !!req.http, (k) => (Object.prototype.hasOwnProperty.call(headers, k) ? [headers[k]!] : undefined));
+  };
+  // transportRefusal is why an events/* request over HTTP is refused for the
+  // transport's standard headers (spec.ts transportHeaderRefusal), or null.
+  const transportRefusal = (req: Req, method: string): string | null => {
+    if (!req.http) return null;
+    const h = req.headers();
+    const has = (k: string) => Object.prototype.hasOwnProperty.call(h, k);
+    return transportHeaderRefusal(method, { version: has(VERSION_HEADER) ? h[VERSION_HEADER] : undefined, method: has(METHOD_HEADER) ? h[METHOD_HEADER] : undefined }, req.meta?.["io.modelcontextprotocol/protocolVersion"]);
+  };
+  // With no event, nothing is advertised and nothing answered: the MCP SDK
+  // says -32601, as SEP-3415 has a server that doesn't offer the extension.
+  if (!theirs && events.length > 0) {
+    eventsServed = host.servesEvents;
+    serveNative();
+    headerMismatchAs400((host.server as unknown as { server?: unknown }).server ?? host.server, (name, args, headers) =>
+      paramRefusal(name, args, true, (k) => (headers.has(k) ? [headers.get(k) ?? ""] : undefined)),
+    );
+  }
   function serveNative(): void {
   // A native request (ChatGPT, or a client that declares MCP Events) also
   // gets the tools-only events, with a required wakeshift_voucher, while the
-  // core hands out subscribe vouchers (docs/subscribe-vouchers.md §4.3).
+  // core hands out subscribe vouchers.
   host.setMethod("events/list", async (_params, raw) => {
+    const refused = transportRefusal(host.req(raw), "events/list");
+    if (refused) throw new RpcError(HEADER_MISMATCH, refused);
+    // Asked first: whether push is served decides the delivery modes, and a
+    // client that push wakes is decided by what it declares.
+    const pushed = await pushServed(raw);
     const toolsOnly = events.some((e) => !e.open);
     let app: string | undefined;
     if (toolsOnly && (await nativeRequest(raw)) && (await wake.vouchersOffered())) app = await wake.appName();
     const listed = app === undefined ? open : events;
-    return { resultType: RESULT_TYPE, events: listed.map((e) => (e.open ? e.definition() : e.definition(app))) };
+    return { resultType: RESULT_TYPE, events: listed.map((e) => (e.open ? e.definition(undefined, pushed) : e.definition(app, pushed))) };
   });
-  host.setMethod("events/stream", async (_params, raw) => {
-    const codes = codesFor(dialectOf(clientInfoName(host, undefined), userAgentOf(host.req(raw))));
-    throw new RpcError(codes.unsupported, "push delivery isn't offered: use a webhook (events/subscribe) or poll (events/poll)", { feature: "deliveryMode", value: "stream" });
-  });
-  type NativeMethod = "subscribe" | "unsubscribe" | "poll";
+  // Push (events/stream): refused as events/poll refuses (after the
+  // Mcp-Name check), and with Unsupported, value "push", where push isn't
+  // served; otherwise relayed from Wakeshift's upstream (push.ts).
+  const cancels = watchCancels(host);
+  host.setMethod("events/stream", (p, raw) => native(p, raw, "stream"));
+  type NativeMethod = "subscribe" | "unsubscribe" | "poll" | "stream";
   const native = async (params: Record<string, any>, raw: unknown, m: NativeMethod): Promise<Record<string, unknown>> => {
     const unsubscribe = m === "unsubscribe";
     // The voucher leaves the arguments before anything reads them (parsing,
@@ -1202,16 +1318,18 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
     const taken = takeVoucher(params?.arguments);
     const p: Record<string, any> = { ...params, arguments: taken.args };
     const req = host.req(raw);
+    const refused = transportRefusal(req, `events/${m}`) ?? nameRefusal(req, p.name) ?? reqParamRefusal(req, p.name, p.arguments);
+    if (refused) throw new RpcError(HEADER_MISMATCH, refused);
+    // A request without the event's name is statically invalid (SEP-3415's InvalidParams), not an unknown event.
+    if (typeof p.name !== "string" || p.name === "") throw new RpcError(INVALID_PARAMS, NAME_REQUIRED);
     const meta = (req.meta ?? {}) as Record<string, unknown>;
     const caller = await callerOf(raw);
     const client = caller.client;
     const ua = userAgentOf(req);
-    const dialect = dialectOf(client, ua);
+    const dialect = dialectOf(client, ua, meta);
     const codes = codesFor(dialect);
-    const nameHeader = req.header(NAME_HEADER);
-    if (nameHeader && headerValue(nameHeader) !== p.name) {
-      throw new RpcError(HEADER_MISMATCH, "Header mismatch: Mcp-Name doesn't match params.name");
-    }
+    // Push not served: Unsupported for any event, known or not (test/mcp-events-interop.json stream).
+    if (m === "stream" && !(await pushServed(raw))) throw new RpcError(codes.unsupported, STREAM_REFUSAL, { feature: "deliveryMode", value: "push" });
     const ev = byName.get(p.name);
     if (!ev) throw new RpcError(codes.notFound, fill("native_unknown_event", { event: JSON.stringify(p.name) }), { kind: "event" });
     // Only the app's tools subscribe to it: refused on every poll, cursor or
@@ -1219,9 +1337,19 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
     // one with the subscribe voucher a tool handed out, while the core hands
     // them out. An open event ignores a voucher.
     const voucher = !ev.open && m !== "poll" && taken.voucher !== undefined && (await wake.vouchersOffered()) ? taken.voucher : undefined;
-    if (!unsubscribe && !ev.open && voucher === undefined) throw new RpcError(codes.forbidden, fill(m === "poll" ? "native_tools_only_poll" : "native_tools_only", { event: ev.name }));
-    if (m === "subscribe" && p.delivery?.mode !== "webhook") {
-      throw new RpcError(codes.unsupported, 'delivery.mode must be "webhook": the only delivery offered', { feature: "deliveryMode", value: p.delivery?.mode });
+    // A poll is a delivery mode its events/list entry doesn't offer (Unsupported, value poll); a subscribe without the voucher isn't permitted.
+    if (!unsubscribe && !ev.open && voucher === undefined) {
+      if (m === "poll") throw new RpcError(codes.unsupported, fill("native_tools_only_poll", { event: ev.name }), { feature: "deliveryMode", value: "poll" });
+      throw new RpcError(codes.forbidden, fill("native_tools_only", { event: ev.name }));
+    }
+    if (m === "subscribe") {
+      const mode = p.delivery && typeof p.delivery === "object" ? p.delivery.mode : undefined;
+      if (typeof mode !== "string" || mode === "") throw new RpcError(INVALID_PARAMS, MODE_REQUIRED);
+      if (mode !== "webhook") throw new RpcError(codes.unsupported, 'delivery.mode must be "webhook": the only delivery offered', { feature: "deliveryMode", value: mode });
+    }
+    if (m === "stream") {
+      if (p.cursor != null && typeof p.cursor !== "string") throw new RpcError(INVALID_PARAMS, "cursor is a string, or null");
+      for (const k of ["maxAgeMs", "heartbeatMs"]) if (p[k] != null && !(Number.isInteger(p[k]) && p[k] >= 0)) throw new RpcError(INVALID_PARAMS, `${k} is a whole number of milliseconds, or null`);
     }
     let args: any;
     try {
@@ -1229,6 +1357,10 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
     } catch (err) {
       throw new RpcError(INVALID_PARAMS, detailOf(err));
     }
+    // A stream whose identify failed (an error, not a refusal) gets a
+    // retryable error, not Forbidden: its client reconnects once the app's
+    // check answers again (#1212).
+    if (m === "stream" && caller.refused === "failed") throw checkFailed(wake, ev.name);
     if (caller.refused) throw new RpcError(codes.forbidden, refusedText(caller.refused));
     const user = caller.user;
     // With a voucher, no user is needed: the voucher is the authorization,
@@ -1245,8 +1377,52 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
     };
     // A poll has no subscribe step (each poll can start the subscription),
     // so every poll asks authorize: access is checked again each time.
-    if (!unsubscribe && !(await ev.allows(subscriberOf(user, client, true, req, raw), args))) {
+    // A stream's authorize failing (an error, not a refusal) is retryable, as identify's is.
+    if (m === "stream") {
+      const allowed = await ev.check(subscriberOf(user, client, true, req, raw), args);
+      if (allowed === "error") throw checkFailed(wake, ev.name);
+      if (!allowed) throw new RpcError(codes.forbidden, fill("native_refused", { event: ev.name }));
+    } else if (!unsubscribe && !(await ev.allows(subscriberOf(user, client, true, req, raw), args))) {
       throw new RpcError(codes.forbidden, fill("native_refused", { event: ev.name }));
+    }
+    // Relayed from Wakeshift's upstream (push.ts).
+    if (m === "stream") {
+      return relayPush({
+        wake,
+        event: ev.name,
+        args,
+        call,
+        voucher,
+        cursor: typeof p.cursor === "string" ? p.cursor : null,
+        maxAgeMs: p.maxAgeMs ?? null,
+        heartbeatMs: p.heartbeatMs ?? null,
+        codes,
+        req,
+        host,
+        config: push,
+        cancels,
+        // Every reauthorizeMs while the stream is open: who's calling (identify
+        // again, never the request's cached answer) and authorize. A refusal
+        // ends this stream (terminated, Forbidden); a reconnect asks again and
+        // is refused, as at open. identify or authorize failing keeps it.
+        reauthorize: async () => {
+          if (user !== undefined) {
+            const again = await resolveCaller(wake, opts as AttachOptions<unknown>, raw);
+            if (!again.ok) return again.reason === "anonymous" ? false : "error";
+            if (again.user !== user) return false;
+          }
+          return ev.check(subscriberOf(user, client, true, req, raw), args, false);
+        },
+        onCreated: (frame) => {
+          // A redeemed voucher's subscription is the handing-out tool's.
+          const via = typeof frame.via === "string" ? frame.via : "";
+          const tool = via.startsWith("tool:") ? (typeof frame.tool === "string" && frame.tool) || via.slice("tool:".length) : undefined;
+          if (tool) {
+            const context = voucher !== undefined ? takeVoucherContext(wake, voucher) : undefined;
+            ev.subscribed(context === undefined ? { args, user, via: "tool", tool } : { args, user, via: "tool", tool, context });
+          } else ev.subscribed({ args, user, via: "native", tool: undefined });
+        },
+      });
     }
     if (m === "poll") {
       const body: Record<string, unknown> = { call, name: ev.name, arguments: args };
@@ -1259,7 +1435,7 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
         if (polled.created) ev.subscribed({ args, user, via: "native", tool: undefined });
         return pollResult(polled);
       } catch (err) {
-        throw rpcErrorOf(err, codes, ev.name);
+        throw rpcErrorOf(err, codes, ev.name, "poll");
       }
     }
     const body: Record<string, unknown> = { call, name: ev.name, arguments: args, delivery: p.delivery ?? {}, dialect };
@@ -1279,7 +1455,7 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
       const { result: res } = await subscribeNatively(wake, ev, body, args, user, voucher);
       return res;
     } catch (err) {
-      throw rpcErrorOf(err, codes, ev.name);
+      throw rpcErrorOf(err, codes, ev.name, typeof p.delivery?.mode === "string" ? p.delivery.mode : undefined);
     }
   };
   host.setMethod("events/subscribe", (p, raw) => native(p, raw, "subscribe"));
@@ -1312,7 +1488,7 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
   // open event has none.
   if (open.length > 0) layer.patchListed("subscribe_events", (t) => openArguments(withEventEnum(t, open.map((e) => e.name))));
   else tools.delete("subscribe_events");
-  // The compact tools/list (design §2.12): unsubscribe_events lists only
+  // The compact tools/list: unsubscribe_events lists only
   // session_key, list_subscriptions none. Both still take all three.
   layer.patchListed("unsubscribe_events", (t) => openArguments(withoutArgs(t, ["harness", "conversation_id"])));
   // list_subscriptions lists session_key too: without a user, it lists the
@@ -1442,20 +1618,67 @@ export function attachHost<C>(wake: Wakeshift, host: Host, events: WakeEvent[], 
   // Per-connection negotiation: a client that speaks MCP Events subscribes
   // natively, so it isn't offered subscribe_events (a server made per
   // request never sees initialize, and keeps offering it).
-  host.onInitialized(() => {
+  const decide = () => {
     // Set both ways: a server reconnected to another client decides again.
-    if (speaksEvents(host.clientCapabilities(), host.clientName() ?? "")) subscribeTool?.disable();
+    if (speaksEvents(host.clientCapabilities(), host.clientName() ?? "", pushNow())) subscribeTool?.disable();
     else subscribeTool?.enable();
+  };
+  // A client that push wakes is decided once the core has said whether
+  // it serves push: before the manifest's first answer, tools/list waits for it.
+  let deciding: Promise<void> | undefined;
+  host.onInitialized(() => {
+    decide();
+    if (!subscribeTool || !push.on || !eventsServed || wake.pushKnown || !pushClient(host.clientName() ?? "", "")) return;
+    const d: Promise<void> = wake.pushOffered().then(decide, () => undefined);
+    deciding = d;
+    void d.finally(() => {
+      if (deciding === d) deciding = undefined;
+    });
   });
+  // A legacy-protocol request's session declared MCP Events in its
+  // initialize, and by the one rule its client subscribes itself. Per
+  // request, for a server that restores a session's initialize on a server
+  // made for each request (oninitialized never runs there, so decide
+  // doesn't): its name, if initialize's isn't restored, is identify's,
+  // asked only for a session that declared the extension. 2026-07-28
+  // requests are serveStateless's.
+  const legacyNative = async (raw: unknown): Promise<boolean> => {
+    if (!raw || layer.at.servesEvents === false) return false;
+    const req = host.req(raw);
+    if (is2026(req)) return false;
+    const extensions = host.clientCapabilities()?.extensions;
+    if (!extensions || typeof extensions !== "object" || !(EXTENSION_KEY in extensions)) return false;
+    let identified: string | undefined;
+    if (!clientInfoName(host, req.meta)) {
+      // The same identity the request's tool calls get (cached per request).
+      const c = await identityOf(raw).catch(() => undefined);
+      identified = c?.ok ? c.client : undefined;
+    }
+    // Whether push is served is asked first for a client push wakes, as call.subscribe does.
+    if (pushClient(clientInfoName(host, req.meta, identified), userAgentOf(req))) await pushServed(raw).catch(() => false);
+    // The verdict call.subscribe reaches for the same request (toolcall.ts nativeOf).
+    return nativeOf(layer.at, raw, identified).native;
+  };
+  const handlers = host.handlers();
+  if (handlers && subscribeTool) {
+    wrapMethod(handlers, "tools/list", (inner) =>
+      inner
+        ? async (request: any, raw: any) => {
+            if (deciding) await deciding;
+            const out = await inner(request, raw);
+            if (!out || !Array.isArray(out.tools) || !(await legacyNative(raw))) return out;
+            return { ...out, tools: out.tools.filter((t: any) => t?.name !== BUILTIN_KEYS.subscribe) };
+          }
+        : undefined,
+    );
+  }
 
   return layer;
 }
 
 
-const EVENTS_METHODS = ["events/list", "events/subscribe", "events/unsubscribe", "events/poll", "events/stream"];
-
 // serverServesEvents is whether the server already declares MCP Events: its
-// own capability or extension, or events/* handlers (Appwrite's).
+// own capability or extension, or events/* handlers of its own.
 function serverServesEvents(host: Host): boolean {
   const caps = host.serverCapabilities();
   const ext = (caps?.extensions as Record<string, unknown> | undefined)?.[EXTENSION_KEY];
@@ -1578,6 +1801,135 @@ export function closeWithStdio(wake: Wakeshift, server: unknown): void {
   };
 }
 
+// The most of a request body read to check its headers: the MCP SDK's own
+// limit (a larger one goes on, for the SDK to refuse).
+const MAX_CHECKED_BODY = 4 * 1024 * 1024;
+
+// headerRefusalResponse is the HTTP 400 HeaderMismatch answer for an
+// events/* JSON-RPC request whose transport headers (spec.ts
+// transportHeaderRefusal), Mcp-Name header (nameHeaderRefusal) or
+// Mcp-Param headers (params) are refused, or undefined for anything else.
+function headerRefusalResponse(message: unknown, headers: Headers, params?: ParamCheck): Response | undefined {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return undefined;
+  const m = message as { id?: unknown; method?: unknown; params?: { name?: unknown; arguments?: unknown; _meta?: Record<string, unknown> } };
+  if (m.id === undefined || typeof m.method !== "string" || !EVENTS_METHODS.includes(m.method)) return undefined;
+  const sent = (k: string) => headers.get(k) ?? undefined;
+  const refused =
+    transportHeaderRefusal(m.method, { version: sent(VERSION_HEADER), method: sent(METHOD_HEADER) }, m.params?._meta?.["io.modelcontextprotocol/protocolVersion"]) ??
+    (NAMED_METHODS.includes(m.method)
+      ? (nameHeaderRefusal(headers.get(NAME_HEADER) || undefined, m.params?.name) ?? params?.(m.params?.name, takeVoucher(m.params?.arguments).args, headers) ?? null)
+      : null);
+  if (!refused) return undefined;
+  const body = { jsonrpc: "2.0", id: m.id, error: { code: HEADER_MISMATCH, message: refused } };
+  return new Response(JSON.stringify(body), { status: 400, headers: { "content-type": "application/json" } });
+}
+
+// bodyOf is a web Request's JSON body, read from a clone up to
+// MAX_CHECKED_BODY, or undefined (too large, or not JSON).
+async function bodyOf(req: Request): Promise<unknown> {
+  if (Number(req.headers.get("content-length")) > MAX_CHECKED_BODY || !req.body) return undefined;
+  const reader = req.clone().body!.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_CHECKED_BODY) {
+      await reader.cancel().catch(() => undefined);
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+/** @internal Why a request is refused for its Mcp-Param headers (spec.ts paramHeaderRefusal), or null. */
+export type ParamCheck = (name: unknown, args: unknown, headers: Headers) => string | null;
+
+type WebHandle = (req: Request, options?: { parsedBody?: unknown }, ...rest: unknown[]) => Promise<Response>;
+type MessageHandle = (message: unknown, extra?: { request?: Request }, ...rest: unknown[]) => Promise<Response>;
+
+/**
+ * @internal Answers an events/* request whose transport headers (MCP-Protocol-Version, Mcp-Method), Mcp-Name header or
+ * Mcp-Param headers (params: the event's x-mcp-header annotations) are refused with HTTP 400 and HeaderMismatch, as the
+ * 2026-07-28 transport, SEP-2243 and SEP-3415 require, before the MCP SDK runs a handler (whose errors go out with HTTP
+ * 200). On the MCP SDK's Streamable HTTP transports, by shape: 1.x's web-standard transport (handleRequest; the Node
+ * one runs through it) and 2.x's, and 2.x's per-request transport (handleMessage). It reads the body's method, whatever
+ * Mcp-Method says, so a request whose Mcp-Method names another method is refused too. Anywhere else (stdio, a
+ * Node-style transport such as mcp-proxy's, a batch, a body over 4 MB), the handler's own check refuses in-band. The
+ * server's connect is wrapped on the instance, as closeWithStdio does.
+ */
+/** Whether req is a web-standard Request (its headers have get), not a Node IncomingMessage. */
+function isWebRequest(req: unknown): req is Request {
+  return !!req && typeof (req as { headers?: { get?: unknown } }).headers?.get === "function";
+}
+
+export function headerMismatchAs400(server: unknown, params?: ParamCheck): void {
+  const low = server as { connect?: (t: unknown, ...rest: unknown[]) => Promise<unknown>; transport?: unknown } | null;
+  if (!low || typeof low !== "object" || typeof low.connect !== "function") return;
+  const hooked = new WeakSet<object>();
+  const hook = (t: unknown): void => {
+    if (!t || typeof t !== "object") return;
+    const inner = (t as { _webStandardTransport?: unknown })._webStandardTransport;
+    const target = (inner && typeof inner === "object" ? inner : t) as { handleRequest?: WebHandle; handlePostRequest?: unknown; handleMessage?: MessageHandle };
+    if (hooked.has(target)) return;
+    if (typeof target.handleRequest === "function" && typeof target.handlePostRequest === "function") {
+      hooked.add(target);
+      const handle = target.handleRequest;
+      target.handleRequest = async function (this: unknown, req: Request, options?: { parsedBody?: unknown }, ...rest: unknown[]) {
+        // Only a web-standard transport's (req: Request, options). A
+        // Node-style one with the same method names, (req: IncomingMessage,
+        // res, body) as mcp-proxy bundles for FastMCP (TypeScript), passes
+        // through untouched, every argument kept: its headers are a plain
+        // object, and a mismatched name is refused in-band there.
+        if (isWebRequest(req) && req.method === "POST") {
+          const message = options?.parsedBody ?? (await bodyOf(req));
+          const refused = headerRefusalResponse(message, req.headers, params);
+          if (refused) return refused;
+          // An events/stream: its response without the transport's
+          // keep-alive comments, and its relay ended when the client
+          // cancels it (push.ts pushResponse).
+          const m = message as { method?: unknown; id?: unknown } | undefined;
+          if (m && typeof m === "object" && m.method === "events/stream" && (typeof m.id === "string" || typeof m.id === "number")) {
+            const answering = answeringStream(target, m.id);
+            try {
+              return pushResponse(await handle.call(this, req, options, ...rest), answering);
+            } catch (err) {
+              answering.forget();
+              throw err;
+            }
+          }
+        }
+        return handle.call(this, req, options, ...rest);
+      };
+    } else if (typeof target.handleMessage === "function") {
+      hooked.add(target);
+      const handle = target.handleMessage;
+      target.handleMessage = async function (this: unknown, message: unknown, extra?: { request?: Request }, ...rest: unknown[]) {
+        const req = extra?.request;
+        const headers = isWebRequest(req) ? req.headers : undefined;
+        const refused = headers ? headerRefusalResponse(message, headers, params) : undefined;
+        return refused ?? handle.call(this, message, extra, ...rest);
+      };
+    }
+  };
+  try {
+    hook(low.transport);
+  } catch {
+    // a transport getter that throws: nothing to hook
+  }
+  const connect = low.connect;
+  low.connect = function (this: unknown, t: unknown, ...rest: unknown[]) {
+    hook(t);
+    return connect.call(this, t, ...rest);
+  };
+}
+
 /** @internal Why identify refused Wakeshift's part of a request: it failed, or requireUser and no user. */
 export type Refusal = "failed" | "anonymous";
 
@@ -1640,6 +1992,12 @@ function withAddition(base: string, a: ToolAddition, structured: Record<string, 
   return out;
 }
 
+/** @internal InvalidParams for an events/* request without the event's name (test/mcp-events-wire.json next.refused). */
+export const NAME_REQUIRED = "params.name is required: the name of the event";
+
+/** @internal InvalidParams for an events/subscribe without delivery.mode. */
+export const MODE_REQUIRED = 'delivery.mode is required: "webhook", the only delivery offered';
+
 /** @internal What Wakeshift answers a poll (test/mcp-events-wire.json). */
 export interface CorePoll {
   events?: Record<string, unknown>[];
@@ -1667,26 +2025,28 @@ export function pollResult(out: CorePoll): Record<string, unknown> {
 // client's dialect's codes. A conversation that isn't the caller's is
 // Forbidden, whether it exists or not.
 /** @internal */
-export function rpcErrorOf(err: unknown, codes: Codes, event = ""): RpcError {
+export function rpcErrorOf(err: unknown, codes: Codes, event = "", mode?: string): RpcError {
   if (err instanceof RpcError) return err;
   if (!(err instanceof APIError) || err instanceof APIConnectionError) return new RpcError(INTERNAL_ERROR, "Wakeshift couldn't be reached");
   switch (err.code) {
     case "bad_voucher":
-      // One answer, whatever the reason (docs/subscribe-vouchers.md §6.2).
+      // One answer, whatever the reason.
       return new RpcError(codes.forbidden, fill("native_bad_voucher", { event }));
     case "callback_failed":
-      return new RpcError(codes.callbackEndpoint, err.coreMessage, { reason: err.reason ?? "" });
+      // The core's hint (an unreachable callback: what the client can use instead), as it is.
+      return new RpcError(codes.callbackEndpoint, err.coreMessage, { reason: err.reason ?? "", ...(err.coreHint ? { hint: err.coreHint } : {}) });
     case "unknown_event":
       return new RpcError(codes.notFound, err.coreMessage, { kind: "event" });
     case "unsupported":
-      return new RpcError(codes.unsupported, err.coreMessage, { feature: "deliveryMode" });
+      // The mode the request asked for (SEP-3415: Unsupported identifies the feature and the value).
+      return new RpcError(codes.unsupported, err.coreMessage, { feature: "deliveryMode", ...(mode ? { value: mode } : {}) });
     case "subscription_limit":
       return new RpcError(codes.resourceExhausted, err.coreMessage, { limit: "subscriptions" });
     case "subscription_stopped":
       return new RpcError(codes.forbidden, err.coreMessage, { reason: "stopped" });
     case "bad_request":
     case "bad_arguments":
-      return new RpcError(INVALID_PARAMS, err.coreMessage);
+      return new RpcError(INVALID_PARAMS, err.coreMessage, err.coreHint ? { hint: err.coreHint } : undefined);
     case "unknown_session":
     case "other_client":
     case "unknown_conversation":

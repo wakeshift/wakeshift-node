@@ -70,6 +70,10 @@ crawlFinished.watch({ job }, async ({ signal }) => {
 
 It runs in this process (a restart or a serverless freeze ends it), at most 10 checks at once, and emits once even if a webhook got there first with the same `id`. To start it however the subscription was made, call it from the event's `onSubscribe: ({ args }) => crawlFinished.watch(args, check)`. `await wake.close()` stops every watch on shutdown.
 
+### Tools that wait
+
+A tool that waits for its work without Wakeshift keeps that wait unless `call.wakes` is true after `call.subscribe`. When the agent asks for a wait longer than its program lets one tool call run (`call.callLimit`: Claude Code 60 seconds, Codex 300), `call.shouldSkipWait(waitSeconds)` is true for a conversation Wakeshift wakes: return at once with a plain status, and keep the subscription. Don't promise the wake in your own text: Wakeshift's addition tells the agent.
+
 ### Unit tests
 
 ```ts
@@ -82,7 +86,19 @@ assert.equal(call.subscriptions[0].event, "crawl.finished")
 await withCall(wake, call, () => wrappedHandler()) // wake.currentCall() returns call inside
 ```
 
-To keep a real client off in tests whatever the environment says, construct it with `new Wakeshift({ key: "" })`.
+To keep a real client off in tests whatever the environment says, construct it with `new Wakeshift({ key: "" })`. The test client also serves MCP Events push: a client's `events/stream` to a server attached with it gets an event for each matching `emit`.
+
+### Push (`events/stream`)
+
+`attach` serves MCP Events push to clients that hold a stream open, such as opencode and Mastra, wherever Wakeshift offers it. Each stream stays open on your server while Wakeshift delivers to it, so your host must answer a request with a stream (SSE, or stdio):
+
+- **In the MCP SDK's JSON-response mode** (1.x `enableJsonResponse: true`, 2.x `responseMode: "json"`), `attach` doesn't offer push. Webhook and poll still work.
+- **Behind middleware that forces JSON responses**, turn it off: `wake.attach(server, { push: false })`.
+- **On a host that caps request duration**, `push: { maxStreamMs }` ends each stream before the cap, and the client reconnects without losing events. On Vercel, AWS Lambda and Cloud Run it's set for you (280 seconds, 14 minutes, 55 minutes).
+- **Behind a load balancer that drops idle connections**, `push: { maxHeartbeatMs }` asks for heartbeats at least that often. Wakeshift sends them every 10 to 45 seconds.
+- **Access is checked again while a stream is open.** Every 5 minutes, `attach` runs `identify` and the event's `authorize` again. If either refuses, the stream ends as a revoked subscription does, and a reconnect is refused. An error in either keeps the stream until the next check. If errors go on, the stream ends once its last successful check is 15 minutes old (three intervals, if longer), and the client reconnects with its cursor, where the checks run again; each failed check logs `push_recheck_failed`, and the end `push_recheck_stale`. A reconnect while they fail gets a retryable error (`-32603`, logged as `push_open_check_failed`), not Forbidden, so the client retries until they answer. `push: { reauthorizeMs }` changes the interval, between 1 and 50 minutes.
+
+**Codex's install offer in its own dialog.** Where Wakeshift turns it on for your app, a subscribing call from Codex can show the user an MCP elicitation form, in Codex's own dialog, with the steps to set up notifications; the user runs them, with no step by the agent. The SDK runs it only within fixed bounds, and only where your transport can carry a request to the client during the call: stdio, or streamable HTTP with sessions, on MCP SDK 2.x. Otherwise, and with `wake.attach(server, { clientRequests: false })`, results keep Wakeshift's usual text. Turn it off behind a proxy that won't hold a response for up to two minutes, or with instances that can't route the client's answer back to the one holding the call.
 
 Signing people in, webhooks, tools registered elsewhere (`wrap` and `wake.currentCall()`), testing, and who may subscribe: [wakeshift.ai/docs](https://wakeshift.ai/docs).
 
@@ -96,5 +112,6 @@ Signing people in, webhooks, tools registered elsewhere (`wrap` and `wake.curren
 | TypeScript | 5.8 or later; for CommonJS, `module: nodenext` |
 | Cloudflare Workers | with the `nodejs_compat` flag |
 | Mastra | `@mastra/mcp` 2.7 or later, through `@wakeshift/sdk/mastra` |
+| MCP Events | As accepted (SEP-3415): webhook, poll and push (`events/stream`) for clients that subscribe natively, served by `attach`. Push is offered where your transport can stream (not JSON-response mode); `attach(server, { push: false })` turns it off, and `push: { maxStreamMs, maxHeartbeatMs, reauthorizeMs }` (`PushOptions`) tunes its streams |
 | A runtime with no MCP SDK server (xmcp, hand-rolled JSON-RPC) | `@wakeshift/sdk/tools` |
 | Unit tests | `@wakeshift/sdk/testing` |

@@ -127,14 +127,26 @@ export class APIError extends WakeshiftError {
   readonly requestId?: string;
   /** @internal The core's own message, without the prefix: what the built-in tools tell the agent. */
   declare readonly coreMessage: string;
+  /** @internal What the core says the client can do instead (an unreachable MCP Events callback's hint), passed into the JSON-RPC error's data as it is. */
+  declare readonly coreHint?: Record<string, unknown>;
 
-  constructor(opts: { status: number | null; code: string; message: string; reason?: string; requestId?: string; cause?: unknown; text?: string }) {
+  constructor(opts: {
+    status: number | null;
+    code: string;
+    message: string;
+    reason?: string;
+    requestId?: string;
+    cause?: unknown;
+    text?: string;
+    hint?: Record<string, unknown>;
+  }) {
     super(opts.code, opts.text ?? `wakeshift: ${opts.code || "error"} (${opts.status}): ${opts.message}`, { cause: opts.cause });
     this.name = "APIError";
     this.status = opts.status;
     if (opts.reason) this.reason = opts.reason;
     if (opts.requestId) this.requestId = opts.requestId;
     Object.defineProperty(this, "coreMessage", { value: opts.message, enumerable: false });
+    if (opts.hint) Object.defineProperty(this, "coreHint", { value: opts.hint, enumerable: false });
   }
 }
 

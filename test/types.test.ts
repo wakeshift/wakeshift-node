@@ -88,7 +88,7 @@ test("registerTool's types: the host's handler with call appended", () => {
   attached.registerTool("seat2", { outputSchema: { table: z.string() }, subscribes: [] }, async () => "x");
   // As the MCP SDK's own registerTool: any CallToolResult (the MCP SDK checks structuredContent at run time).
   attached.registerTool("seat3", { outputSchema: { table: z.string() }, subscribes: [] }, async () => ({ content: [], structuredContent: { seat: 3 } }));
-  // A vendor's own result type, which 1.x's registerTool takes (Upload-Post's): optional structuredContent and isError.
+  // A vendor's own result type, which 1.x's registerTool takes: optional structuredContent and isError.
   type VendorResult = { content: { type: "text"; text: string }[]; structuredContent?: Record<string, unknown>; isError?: boolean };
   const vendorHandler = async (): Promise<VendorResult> => ({ content: [{ type: "text", text: "ok" }] });
   server.registerTool("vendor_host", { outputSchema: { table: z.string() } }, vendorHandler);

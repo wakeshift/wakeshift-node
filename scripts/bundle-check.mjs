@@ -17,7 +17,17 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const sdk = join(dirname(fileURLToPath(import.meta.url)), "..");
-const BUDGET = 200 * 1024; // bytes the SDK adds, minified
+// Bytes the SDK adds, minified. 216 KB since MCP Events push (events/stream,
+// about 13 KB, which attach serves even to an emit-only Worker), raised on
+// 2026-11-13. 220 KB since client requests (Codex's install form, about
+// 3 KB), raised on 2026-11-18.
+// 223 KB since SEP-3415's final text (2026-11-19): Mcp-Param headers
+// checked against x-mcp-header annotations, about 3.4 KB, which attach
+// checks even for an emit-only Worker's events (#1390). 226 KB since the
+// transport's header checks on events/* and push's edge cases (an error,
+// never an empty result, before active; no keep-alive comments; a dropped
+// response ends the relay), about 2.5 KB.
+const BUDGET = 226 * 1024;
 const ALLOWED_NODE = new Set(["node:crypto"]);
 
 rmSync(join(sdk, "build-bundle"), { recursive: true, force: true });

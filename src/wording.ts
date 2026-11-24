@@ -1,5 +1,5 @@
 // The compact tools/list text, in one place (test/subscribing-tools-list.json
-// compact_strings, from the compact tools/list bench of 2026-11-05). Every
+// compact_strings, which tested as well as the longer wording). Every
 // SDK serves the same strings; the built-in tools' wording (events.ts
 // EVENT_TOOL_TEXT) and Wakeshift's arguments (toolcall.ts) read them from
 // here.

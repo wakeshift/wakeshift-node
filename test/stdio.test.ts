@@ -13,7 +13,7 @@ const SERVER = fileURLToPath(new URL("./stdio-server.js", import.meta.url));
 const KEY = "wst_1116qJFWMMHFy3xDdLmvUeyc2S6FrWRhJP51HsvDYdz9fWXzSV";
 const META_2026 = {
   "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-  "io.modelcontextprotocol/clientInfo": { name: "openclaw", version: "2026.10.10" },
+  "io.modelcontextprotocol/clientInfo": { name: "acme-agent", version: "2026.10.10" },
   "io.modelcontextprotocol/clientCapabilities": {},
 };
 

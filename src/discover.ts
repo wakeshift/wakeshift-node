@@ -21,12 +21,13 @@
 // handler runs, so a server with sessions is unchanged: its clients fall
 // back to initialize, as they do today.
 //
-// On both, tools/list leaves out subscribe_events for a request that
-// declares the events extension in its own capabilities (2026-07-28 has no
-// initialize, so each request carries them).
+// On both, tools/list leaves out subscribe_events for a request from a
+// client that subscribes with MCP Events itself (spec.ts nativeClient): one
+// that declares the events extension in its own capabilities (2026-07-28
+// has no initialize, so each request carries them), or ChatGPT.
 
 import { optionalModules } from "./optional.js";
-import { EXTENSION_KEY, RESULT_TYPE, bridgedClient } from "./spec.js";
+import { RESULT_TYPE, nativeClient, pushClient } from "./spec.js";
 import { STATELESS_VERSION, is2026, v1Req, wrapAll, wrapMethod, type Handler, type Host, type Req } from "./host.js";
 
 export { STATELESS_VERSION };
@@ -65,17 +66,23 @@ export function takesTasks(meta: Record<string, unknown> | undefined, extra?: un
   return !!ext && typeof ext === "object" && !Array.isArray(ext) && TASKS_EXTENSION in (ext as object);
 }
 
-// declaresEvents: the request's client declares MCP Events, and isn't a
-// harness Wakeshift wakes itself (BRIDGED_CLIENTS: its name wins).
-function declaresEvents(meta: Record<string, unknown> | undefined, userAgent: string): boolean {
+// speaksEvents: the request's client subscribes with MCP Events itself, by
+// the one rule every SDK has (spec.ts nativeClient), from what the request
+// carries: a server made per request sees no initialize.
+// servesPush (asked only for a client push wakes) says whether push
+// would be listed for the request.
+async function speaksEvents(meta: Record<string, unknown> | undefined, userAgent: string, servesPush: () => Promise<boolean>): Promise<boolean> {
   const info = meta?.["io.modelcontextprotocol/clientInfo"] as { name?: unknown } | undefined;
-  if (bridgedClient(typeof info?.name === "string" ? info.name : "", userAgent)) return false;
-  const ext = (meta?.[CAPABILITIES_META] as { extensions?: unknown } | undefined)?.extensions;
-  return !!ext && typeof ext === "object" && EXTENSION_KEY in ext;
+  const name = typeof info?.name === "string" ? info.name : "";
+  return nativeClient(name, userAgent, meta, undefined, pushClient(name, userAgent) && (await servesPush()));
 }
 
-/** @internal Makes server answer 2026-07-28 requests (see the file's comment). */
-export function serveStateless(host: Host, opts: { bridgedOnly?: readonly string[] } = {}): void {
+/**
+ * @internal Makes server answer 2026-07-28 requests (see the file's
+ * comment). servesPush: whether push would be listed for a request, so a
+ * client push wakes is decided by what it declares.
+ */
+export function serveStateless(host: Host, opts: { bridgedOnly?: readonly string[]; servesPush?: (raw: unknown) => Promise<boolean> } = {}): void {
   const handlers = host.handlers();
   if (!handlers) return; // a future SDK without it: nothing to vary
   const hidden = new Set(opts.bridgedOnly ?? []);
@@ -93,7 +100,8 @@ export function serveStateless(host: Host, opts: { bridgedOnly?: readonly string
       const req = host.req(raw);
       if (!is2026(req) || !result || typeof result !== "object") return result;
       let out = result;
-      if (method === "tools/list" && hidden.size > 0 && declaresEvents(req.meta, req.header("user-agent") || "") && Array.isArray(out.tools)) {
+      const pushed = async () => (opts.servesPush ? opts.servesPush(raw) : false);
+      if (method === "tools/list" && hidden.size > 0 && Array.isArray(out.tools) && (await speaksEvents(req.meta, req.header("user-agent") || "", pushed))) {
         out = { ...out, tools: out.tools.filter((t: any) => !hidden.has(t?.name)) };
       }
       if (!v1) {

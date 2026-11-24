@@ -1,7 +1,7 @@
 // The parts of other MCP frameworks the docs' examples use, for
 // scripts/check-examples.mjs, which doesn't install them: written from each
-// framework's own types, only as far as the examples reach. sdk/compat runs
-// the real frameworks (docs/sdk-compat.md).
+// framework's own types, only as far as the examples reach. Wakeshift's
+// compatibility tests run the real frameworks.
 
 // Cloudflare Workers' runtime types (@cloudflare/workers-types).
 interface ExecutionContext {

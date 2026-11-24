@@ -1,4 +1,4 @@
-// Tools that subscribe (design §2.4): a vendor tool registered through the
+// Tools that subscribe: a vendor tool registered through the
 // attachment (attached.registerTool) or named in attach's wrap. Wakeshift
 // works at the protocol layer, never on the vendor's callback:
 //
@@ -31,11 +31,12 @@ import type { CallToolResult, HostContext } from "./mcp.js";
 import { getObjectShape, isSchema, isZ4Schema, normalizeObjectSchema, type AnySchema, type SchemaInput, type ShapeOutput, type ZodRawShapeCompat } from "./zod.js";
 import { stillWrapped, wrapMethod, type Handler, type Host } from "./host.js";
 import { UsageError, errorType, fixOf } from "./errors.js";
-import { EXTENSION_KEY, bridgedClient, dialectOf } from "./spec.js";
+import { EXTENSION_KEY, declaresEventsExtension, nativeClient, pushClient } from "./spec.js";
 import { takesTasks } from "./discover.js";
 import { COMPACT } from "./wording.js";
 import { UNNAMED_APP, refusedText, subscriberOf, unnamedNotifiesParts, withSubscribes, type Caller, type Refusal, type WakeEvent } from "./events.js";
 import { rememberVouchers } from "./voucherctx.js";
+import { CLIENT_REQUEST_BOUNDS, ELICIT_FORM, claimSession, offeredKinds, runForm, validateRequest, type ClientRequest } from "./clientrequests.js";
 import { logConfigError } from "./log.js";
 import { packCall, transportSessionOf, userAgentOf, type Call, type Duration, type Recognized, type Wakeshift } from "./wakeshift.js";
 
@@ -331,7 +332,7 @@ export interface ToolCallBase<C = unknown> {
   readonly tool: string;
   /**
    * The client subscribes to the app's events itself (MCP Events: ChatGPT,
-   * the house agents). call.subscribe then makes no conversation
+   * an app's own first-party agents). call.subscribe then makes no conversation
    * subscription, and the block tells it what to subscribe to.
    */
   readonly native: boolean;
@@ -341,6 +342,31 @@ export interface ToolCallBase<C = unknown> {
   readonly session: string | null;
   /** What Wakeshift recognized the agent's program as: null until a subscribe or resolveSession. */
   readonly recognized: Recognized | null;
+  /**
+   * Whether Wakeshift wakes this conversation for what the call subscribed:
+   * skip your own polling or waiting only when it's true; otherwise behave
+   * as without Wakeshift. Set by subscribe, true only once a wake is
+   * confirmed; false before, on a disabled client, after a subscribe that
+   * threw or came back unavailable, while the user's choice of how to be
+   * notified is pending, and where the agent's program can't be woken now.
+   */
+  readonly wakes: boolean;
+  /**
+   * How many seconds the agent's program lets one tool call take before it
+   * gives up on it, from what Wakeshift recognized the program as (Claude
+   * Code: 60, Codex: 300), or undefined when that isn't known. Set by
+   * subscribe; undefined before. It's the program's default: a user's own
+   * setting may raise it.
+   */
+  readonly callLimit: number | undefined;
+  /**
+   * Whether to skip a wait of seconds the agent asked for (a vendor's
+   * wait_seconds) and return at once: true only when wakes is true and the
+   * wait reaches callLimit, so the program would cut the call off before
+   * the wait ends. Keep the subscription either way. undefined (no wait
+   * asked for) is false.
+   */
+  shouldSkipWait(seconds: number | undefined): boolean;
   /** The call's request context, as your MCP SDK passes it to the tool's handler: 2.x's ctx, 1.x's extra. */
   readonly ctx: C;
   /**
@@ -380,6 +406,20 @@ export interface ToolCallSubscribe<E extends AnyEvent = AnyEvent> {
  * tool that declares none has no call.subscribe.
  */
 export type ToolCall<C = unknown, E extends AnyEvent = AnyEvent> = ToolCallBase<C> & ([E] extends [never] ? {} : ToolCallSubscribe<E>);
+
+/**
+ * @internal call.shouldSkipWait's rule (test/skip-wait.json): skip a wait
+ * the agent asked for only when Wakeshift wakes the conversation and the
+ * wait reaches the program's per-call limit.
+ */
+export function skipsWait(wakes: boolean, callLimit: number | undefined, seconds: number | undefined): boolean {
+  return wakes && callLimit !== undefined && typeof seconds === "number" && Number.isFinite(seconds) && seconds >= callLimit;
+}
+
+/** @internal A core's call_limit, or undefined for none or anything but a positive number. */
+export function callLimitOf(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
+}
 
 // ── Printing ────────────────────────────────────────────────────────────
 
@@ -511,6 +551,10 @@ export interface CallAddition {
   text?: string;
   trailer?: string;
   meta?: Record<string, unknown>;
+  /** A client request for the SDK to run (clientrequests.ts): its outcome's text takes text's place. */
+  requests?: unknown[];
+  /** Where text goes: after the app's content (the default), or before it (an outcome's placement). */
+  placement?: "before" | "after";
 }
 
 type Content = CallToolResult["content"][number];
@@ -553,7 +597,8 @@ export function mergeBlock(result: ToolResult, add: CallAddition): CallToolResul
   const text = (add.text ?? "").trim();
   const metaBeacon = !!out._meta && CONNECTOR_META_KEY in out._meta;
   dropTrailers(out.content);
-  if (text) out.content.push({ type: "text", text });
+  if (text && add.placement === "before") out.content.unshift({ type: "text", text });
+  else if (text) out.content.push({ type: "text", text });
   if (!metaBeacon && add.trailer) out.content.push({ type: "text", text: add.trailer });
   for (const [k, v] of Object.entries(add.meta ?? {})) {
     if (k === CONNECTOR_META_KEY && metaBeacon) continue;
@@ -611,10 +656,6 @@ function recognizedOf(a: Partial<Recognized> | undefined): Recognized {
   return { harness: a?.harness ?? null, via: a?.via ?? null, claimed: a?.claimed ?? null };
 }
 
-function hasKey(o: unknown, key: string): boolean {
-  return !!o && typeof o === "object" && !Array.isArray(o) && (o as Record<string, unknown>)[key] !== undefined;
-}
-
 function isRecord(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
@@ -649,6 +690,10 @@ export interface AttachContext {
   wait?: boolean;
   /** false: the server serves its own MCP Events, so no caller subscribes natively to Wakeshift's. */
   servesEvents?: boolean;
+  /** Whether push (events/stream) would be listed for this request, from the core's last answer: a client push wakes is then decided by what it declares. */
+  servesPush?(raw: unknown): boolean;
+  /** false: attach's clientRequests is off, so no call offers the core a client request (clientrequests.ts). */
+  clientRequests?: boolean;
 }
 
 interface CreatedSub {
@@ -667,34 +712,44 @@ interface NativeLine {
   arguments: unknown;
   // call.subscribe's options, for a tools-only event's line: the core
   // keeps them with the subscribe voucher and applies them when it's
-  // redeemed (docs/subscribe-vouchers.md §4.1).
+  // redeemed.
   once?: boolean;
   ttl?: number;
   replay?: number;
 }
 
+// lineOptions is call.subscribe's options a native line carries, for a
+// tools-only event's voucher.
+function lineOptions(options: Record<string, unknown>): Partial<NativeLine> {
+  const line: Partial<NativeLine> = {};
+  if (options.once === true) line.once = true;
+  if (typeof options.ttl === "number") line.ttl = options.ttl;
+  if (typeof options.replay === "number") line.replay = options.replay;
+  return line;
+}
+
+// hasEventsExtension is whether a session's initialize declared the MCP Events extension.
+function hasEventsExtension(extensions: unknown): boolean {
+  return !!extensions && typeof extensions === "object" && !Array.isArray(extensions) && EXTENSION_KEY in extensions;
+}
+
 /**
  * @internal Whether a call comes from a client that subscribes to the app's
- * events itself, on stateless servers too, in this order: the app's
- * override; ChatGPT's _meta["openai/session"]; a client name or User-Agent
- * of a known native client; never a harness Wakeshift wakes itself
- * (BRIDGED_CLIENTS: its name wins over capabilities); a client that declares
- * the MCP Events extension (initialize's capabilities, or _meta's).
+ * events itself, on stateless servers too: the app's override, else
+ * spec.ts nativeClient (the one rule in every SDK), for the client's name
+ * and User-Agent, the request's _meta and initialize's capabilities.
  */
-export function nativeOf(at: Pick<AttachContext, "host" | "clientOf" | "native" | "servesEvents">, raw: unknown, identified?: string): { native: boolean; conversation: string | null } {
+export function nativeOf(at: Pick<AttachContext, "host" | "clientOf" | "native" | "servesEvents" | "servesPush">, raw: unknown, identified?: string): { native: boolean; conversation: string | null } {
   if (!at.host.servesEvents || at.servesEvents === false) return { native: false, conversation: null };
   const req = at.host.req(raw);
   const meta = (req.meta ?? {}) as Record<string, unknown>;
   const conversation = typeof meta["openai/session"] === "string" && meta["openai/session"] ? (meta["openai/session"] as string) : null;
   if (at.native?.(raw)) return { native: true, conversation };
-  if (conversation) return { native: true, conversation };
-  if (dialectOf(at.clientOf(meta, identified), userAgentOf(req)) === "chatgpt") return { native: true, conversation: null };
-  if (bridgedClient(at.clientOf(meta, identified), userAgentOf(req))) return { native: false, conversation: null };
-  const caps = at.host.clientCapabilities();
-  if (hasKey(caps?.extensions, EXTENSION_KEY)) return { native: true, conversation: null };
-  const metaCaps = meta["io.modelcontextprotocol/clientCapabilities"] as Record<string, unknown> | undefined;
-  if (hasKey(metaCaps?.extensions, EXTENSION_KEY)) return { native: true, conversation: null };
-  return { native: false, conversation: null };
+  // ChatGPT's desktop app can't subscribe natively (Codex mode waits in the
+  // foreground; a regular chat is told it can't be woken), though it sends
+  // openai/session too: the rule says no before it reads that.
+  if (!nativeClient(at.clientOf(meta, identified), userAgentOf(req), meta, at.host.clientCapabilities()?.extensions, at.servesPush?.(raw) ?? false)) return { native: false, conversation: null };
+  return { native: true, conversation };
 }
 
 /** @internal One tools/call of a tool that subscribes: what its handler subscribed, for the block and the rollback. */
@@ -715,6 +770,29 @@ export class CallScope<C> {
   }
   /** The request context, as the MCP SDK passed it: it doesn't print. */
   declare readonly ctx: C;
+  // What the core said of the conversation on the call's latest subscribe (wakes).
+  #wakePath = false;
+  /**
+   * Whether Wakeshift wakes the conversation for what the call subscribed
+   * and still holds (ToolCallBase.wakes): the core's answer for a bridged
+   * call; for a native caller (a ChatGPT Work chat on the web, which
+   * subscribes itself with MCP Events and is woken by a run per event), a
+   * line the result offers it. ChatGPT's desktop app is never native.
+   */
+  get wakes(): boolean {
+    if (this.#subscribeFailed) return false;
+    return (this.#wakePath && this.live.size > 0) || this.nativeLines.length > 0;
+  }
+  #subscribeFailed = false;
+  #callLimit: number | undefined;
+  /** The program's per-call limit in seconds (ToolCallBase.callLimit), from the call's latest subscribe. */
+  get callLimit(): number | undefined {
+    return this.#callLimit;
+  }
+  /** ToolCallBase.shouldSkipWait. */
+  shouldSkipWait(seconds: number | undefined): boolean {
+    return skipsWait(this.wakes, this.#callLimit, seconds);
+  }
 
   ended = false;
   pending = "";
@@ -767,7 +845,19 @@ export class CallScope<C> {
     const n = nativeOf(at, ctx, this.identified);
     this.native = n.native;
     this.nativeConversation = n.conversation;
+    const req = at.host.req(ctx);
+    this.pushWoken = pushClient(at.clientOf(req.meta, this.identified), userAgentOf(req));
+    this.eventsExt = declaresEventsExtension(req.meta) || hasEventsExtension(at.host.clientCapabilities()?.extensions);
   }
+
+  // The client is one push wakes (opencode): its subscribes go to the
+  // core whatever the SDK decided, which answers native_line when it chose
+  // native push (Wakeshift's plugin doesn't listen for the conversation),
+  // and keeps the bridged path otherwise (the downgrade).
+  private readonly pushWoken: boolean;
+  // The request declares the MCP Events extension (its _meta's
+  // capabilities, or its session's initialize): sent as call.events_ext.
+  private readonly eventsExt: boolean;
 
   toJSON() {
     return shownCall(this);
@@ -781,6 +871,10 @@ export class CallScope<C> {
   wire(session = this.#session ?? this.#passed): Call {
     const req = this.at.host.req(this.ctx);
     const meta = req.meta;
+    // Only where this server serves push (the core reports it, so it knows
+    // the field; the transport streams; the app hasn't turned it off): a
+    // native push line elsewhere would point the client at a refused stream.
+    const eventsExt = this.eventsExt && (this.at.servesPush?.(this.ctx) ?? false);
     return packCall({
       meta,
       clientName: this.at.clientOf(meta, this.identified),
@@ -794,7 +888,9 @@ export class CallScope<C> {
       agentToken: this.agentToken,
       // A native caller's transport session binds an anonymous voucher; only
       // to a core that hands them out (an older one refuses fields it doesn't know).
-      transportSession: this.native && this.at.wake.vouchersKnown ? transportSessionOf(req) : undefined,
+      // A push-woken caller's native line can carry a voucher too.
+      transportSession: (this.native || (eventsExt && this.pushWoken)) && this.at.wake.vouchersKnown ? transportSessionOf(req) : undefined,
+      eventsExt,
     });
   }
 
@@ -851,25 +947,45 @@ export class CallScope<C> {
   }
 
   subscribe(event: AnyEvent, args: unknown, opts: SubscribeOptions = {}): Promise<Subscription> {
-    return this.request(async () => {
+    const run = this.request(async () => {
       this.checkEvent(event);
       this.checkDeclared(event);
       this.checkCaller();
       const known = event.parseArgs(args);
       const options = subscribeBody(opts);
-      if (this.native) return this.subscribeNative(event, known, options, opts.context);
+      if (this.native && !this.pushWoken) return this.subscribeNative(event, known, options, opts.context);
+      if (this.pushWoken && this.eventsExt && !this.at.wake.pushKnown) {
+        // Whether the core serves push decides events_ext and the SDK's verdict: asked first.
+        await this.at.wake.pushOffered();
+        this.native = nativeOf(this.at, this.ctx, this.identified).native;
+      }
       if (event.personal && !this.user) {
         throw new UsageError("bad_arguments", `${event.name} is personal: call.subscribe needs a user (attach's identify), who the subscription belongs to`);
       }
       const body: Record<string, unknown> = { call: this.wire(), name: event.name, arguments: known, defer_addition: true, ...options };
       if (this.pending) body.pending = this.pending;
-      const out = await this.at.wake.requestApp<{
+      // In the call: within callTimeouts.subscribeMs, never retried, and
+      // skipped while the breaker is open (wakeshift.ts inCall).
+      const out = await this.at.wake.inCall<{
         event_subscription: { id: string; user?: string; created: boolean };
         session: string;
         agent?: Partial<Recognized>;
         pending?: string;
-      }>("POST", "/event-subscriptions", body, { signal: this.signal });
+        native_line?: boolean;
+        wakes?: boolean;
+        call_limit?: number;
+      }>("subscribe", "POST", "/event-subscriptions", body, this.signal);
       if (out.pending) this.pending = out.pending;
+      // An older core doesn't say: not woken, so the tool keeps its own wait.
+      this.#wakePath = out.wakes === true;
+      if (out.native_line === true && this.pushWoken && body.call && (body.call as Call).events_ext) {
+        // The core chose native push for this caller: the block carries
+        // the native line (a tools-only event's with a voucher), and the
+        // bridged subscription stays as the fallback.
+        this.addNative(event.name, known, lineOptions(options));
+        if (!event.open) this.nativeContexts.set(liveKey(event.name, known), opts.context);
+      }
+      this.#callLimit = callLimitOf(out.call_limit);
       this.armed = true;
       this.#session = out.session;
       const rec = recognizedOf(out.agent);
@@ -886,11 +1002,16 @@ export class CallScope<C> {
       this.states.set(liveKey(event.name, known), es.created ? "created" : "renewed");
       return made(es.created ? "created" : "renewed", es.id, es.user ?? this.user ?? "", out.session, rec);
     });
+    // Any subscribe of the call that failed makes wakes false: the tool keeps its own wait.
+    run.catch(() => {
+      this.#subscribeFailed = true;
+    });
+    return run;
   }
 
   // subscribeNative is call.subscribe for a client that subscribes itself
   // (MCP Events): the block names the event for it to subscribe to, only
-  // if its follow-up would be allowed (design §3, SEC M5). Wakeshift isn't
+  // if its follow-up would be allowed (SEC M5). Wakeshift isn't
   // asked here.
   private async subscribeNative(event: AnyEvent, args: Record<string, unknown>, options: Record<string, unknown> = {}, context?: unknown): Promise<Subscription> {
     const unavailable = (reason: "client_unsupported" | "no_user" | "refused"): Subscription => {
@@ -901,14 +1022,10 @@ export class CallScope<C> {
     if (!event.open) {
       // A tools-only event: while the core hands out subscribe vouchers, the
       // line carries one, so the client subscribes with what the tool gave
-      // it, signed in or not (docs/subscribe-vouchers.md §7.1). Not for an
+      // it, signed in or not. Not for an
       // app acting for its agent, which the core gives none.
-      if (this.agentToken || !(await this.at.wake.vouchersOffered())) return unavailable("client_unsupported");
-      const line: Partial<NativeLine> = {};
-      if (options.once === true) line.once = true;
-      if (typeof options.ttl === "number") line.ttl = options.ttl;
-      if (typeof options.replay === "number") line.replay = options.replay;
-      this.addNative(event.name, args, line);
+      if (this.agentToken || !(await this.at.wake.vouchersOffered("subscribe"))) return unavailable("client_unsupported");
+      this.addNative(event.name, args, lineOptions(options));
       this.nativeContexts.set(liveKey(event.name, args), context);
       this.states.set(liveKey(event.name, args), "native");
       return { state: "native", user: this.user ?? "", recognized: recognizedOf(undefined) };
@@ -929,12 +1046,16 @@ export class CallScope<C> {
       this.checkEvent(event);
       this.checkCaller();
       const known = event.parseArgs(args);
-      if (this.native) return this.endNative(event.name, known);
-      const out = await this.at.wake.requestApp<{ ended?: boolean; addition?: CallAddition }>(
+      if (this.native && !this.pushWoken) return this.endNative(event.name, known);
+      // A native line the core asked for goes with the subscription.
+      this.nativeLines = this.nativeLines.filter((l) => !(l.name === event.name && sameJSON(l.arguments, known)));
+      this.nativeContexts.delete(liveKey(event.name, known));
+      const out = await this.at.wake.inCall<{ ended?: boolean; addition?: CallAddition }>(
+        "subscribe",
         "POST",
         "/event-subscriptions/unsubscribe",
         { call: this.wire(), name: event.name, arguments: known },
-        { signal: this.signal },
+        this.signal,
       );
       // addition: the call passed no session key, so it ended nothing; the
       // block says to call again with it.
@@ -956,7 +1077,7 @@ export class CallScope<C> {
       // anything else it would only start a new one.
       const named = !!wire.conversation || namesConversation(wire.meta) || !!metaString(wire.meta, "threadId");
       if (!wire.session && !(named && (wire.user || wire.agent_token))) return null;
-      const out = await this.at.wake.requestApp<{ session: string; pending: string; agent?: Partial<Recognized> }>("POST", "/calls/session", { call: wire }, { signal: this.signal });
+      const out = await this.at.wake.inCall<{ session: string; pending: string; agent?: Partial<Recognized> }>("subscribe", "POST", "/calls/session", { call: wire }, this.signal);
       this.pending = out.pending;
       this.#session = out.session;
       this.recognized = recognizedOf(out.agent);
@@ -970,13 +1091,17 @@ export class CallScope<C> {
     this.nativeLines = this.nativeLines.filter((l) => !(l.name === name && sameJSON(l.arguments, args)));
     this.nativeContexts.delete(liveKey(name, args));
     if (!this.user) return false;
-    const out = await this.at.wake.requestApp<{ subscriptions?: { id: string; event: string; arguments: unknown; destination: string }[] }>("POST", "/event-subscriptions/list", {
-      user: this.user,
-    });
+    const out = await this.at.wake.inCall<{ subscriptions?: { id: string; event: string; arguments: unknown; destination: string }[] }>(
+      "subscribe",
+      "POST",
+      "/event-subscriptions/list",
+      { user: this.user },
+      this.signal,
+    );
     let ended = false;
     for (const s of out.subscriptions ?? []) {
       if (s.event !== name || s.destination !== "webhook" || !sameJSON(s.arguments, args)) continue;
-      const r = await this.at.wake.requestApp<{ ended?: boolean }>("POST", "/event-subscriptions/end", { user: this.user, id: s.id });
+      const r = await this.at.wake.inCall<{ ended?: boolean }>("subscribe", "POST", "/event-subscriptions/end", { user: this.user, id: s.id }, this.signal);
       ended = ended || !!r.ended;
     }
     return ended;
@@ -1016,7 +1141,8 @@ export class CallScope<C> {
     for (const w of this.watches.splice(0)) w.stop();
     for (const c of this.created) {
       try {
-        await this.at.wake.requestApp("POST", "/event-subscriptions/unsubscribe", { call: this.wire(c.session), name: c.name, arguments: c.arguments, reason: "rolled_back", pending: c.pending });
+        // Within callTimeouts.blockMs, like the addition: the result waits for it.
+        await this.at.wake.inCall("block", "POST", "/event-subscriptions/unsubscribe", { call: this.wire(c.session), name: c.name, arguments: c.arguments, reason: "rolled_back", pending: c.pending });
       } catch {
         this.at.wake.log.log("rollback_failed", `ending a failed call's subscription failed (${this.tool}, ${c.name})`, { tool: this.tool, event: c.name });
       }
@@ -1038,16 +1164,85 @@ export class CallScope<C> {
     return { ...(add ?? {}), text };
   }
 
+  /**
+   * @internal Runs the client request the core's addition carries
+   * (clientrequests.ts), within the SDK's own bounds, and gives the addition
+   * with the outcome's text in place of the core's; reports the outcome.
+   * Never throws: a request it can't run leaves the addition as the core
+   * gave it (today's text), without the request.
+   */
+  async runRequest(add: CallAddition): Promise<CallAddition> {
+    const plain: CallAddition = { text: add.text, trailer: add.trailer, meta: add.meta };
+    const raw = add.requests?.[0];
+    const app = (await this.at.wake.appName()) || this.at.wake.appId || "";
+    // Only a kind this call offered (a core that sends one anyway is
+    // refused), within the bounds, and once per session per window.
+    const req = this.at.host.req(this.ctx);
+    const bad = !this.offeredKinds.includes(ELICIT_FORM) ? "not_offered" : validateRequest(raw, app) || (claimSession(this.at.host, this.ctx, req) ? "" : "rate");
+    const token = typeof (raw as { token?: unknown } | undefined)?.token === "string" ? (raw as { token: string }).token : "";
+    if (bad) {
+      refusedRequest(this.at.wake, bad);
+      if (token) await this.reportOutcome(token, "unsupported");
+      return plain;
+    }
+    const r = raw as ClientRequest;
+    const ran = await runForm(this.ctx, req, r, app);
+    await this.reportOutcome(r.token, ran.outcome);
+    const text = [this.notes.join(" "), ran.result.text.trim()].filter(Boolean).join("\n\n");
+    if (ran.result.beacon === "keep") return { text, trailer: add.trailer, meta: add.meta, placement: ran.result.placement };
+    const meta = { ...(add.meta ?? {}) };
+    delete meta[CONNECTOR_META_KEY];
+    return { text, meta, placement: ran.result.placement };
+  }
+
+  // reportOutcome tells the core a request's outcome, waiting at most
+  // reportWaitMs (so the next subscribing call sees it) and never failing
+  // the call's result.
+  private async reportOutcome(token: string, outcome: string): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, CLIENT_REQUEST_BOUNDS.reportWaitMs);
+      timer.unref?.();
+    });
+    const sent = this.at.wake
+      .requestApp("POST", "/requests/outcome", { token, outcome }, { timeoutMs: CLIENT_REQUEST_BOUNDS.reportWaitMs, maxRetries: 1 })
+      .then(() => undefined)
+      .catch((err: unknown) => this.at.wake.log.log("client_request_report_failed", `Couldn't report a client request's outcome to Wakeshift (${errorType(err)})`, { error_type: errorType(err) }));
+    await Promise.race([sent, late]);
+    clearTimeout(timer);
+  }
+
+  // The kinds of client request this call offered the core (clientrequests.ts).
+  private offeredKinds: string[] = [];
+
   private async fetchAddition(): Promise<CallAddition | null> {
-    // The manifest's answer first, so a native call's wire knows whether the core hands out vouchers.
-    if (this.native) await this.at.wake.vouchersOffered();
-    const wire = this.wire();
-    if (!this.pending && this.nativeLines.length === 0 && !wire.session && !wire.conversation && !namesConversation(wire.meta)) return null;
-    const body: Record<string, unknown> = { call: wire };
-    if (this.pending) body.pending = this.pending;
-    if (this.nativeLines.length > 0) body.native = this.nativeLines;
+    const named = this.wire();
+    if (!this.pending && this.nativeLines.length === 0 && !named.session && !named.conversation && !namesConversation(named.meta)) return null;
+    // A native call's wire needs the manifest's answer (whether the core
+    // hands out vouchers). A native call makes no subscribe request, so on a
+    // fresh process its addition is the first to wait for the manifest: that
+    // wait gets the subscribe budget, as a bridged call's subscribe does,
+    // and the addition then its own block budget (at most subscribeMs +
+    // blockMs in all, as for a bridged call). Not while the breaker is open:
+    // the addition is skipped at once.
+    if (this.native && !this.at.wake.breaker.open) await this.at.wake.vouchersOffered("subscribe");
+    const body = async () => {
+      const call: Record<string, unknown> = { ...this.wire() };
+      // The kinds of client request this call can run (clientrequests.ts),
+      // only for a call that subscribed: the core describes one only for a
+      // subscribing call's first ask.
+      if (this.pending) {
+        this.offeredKinds = offeredKinds(this.at.host, this.ctx, this.at.host.req(this.ctx), this.at.clientRequests === false);
+        if (this.offeredKinds.length > 0) call.client_requests = this.offeredKinds;
+      }
+      const b: Record<string, unknown> = { call };
+      if (this.pending) b.pending = this.pending;
+      if (this.nativeLines.length > 0) b.native = this.nativeLines;
+      return b;
+    };
     try {
-      const add = await this.at.wake.requestApp<CallAddition>("POST", "/calls/addition", body);
+      // Within callTimeouts.blockMs in all, never retried, skipped while the breaker is open.
+      const add = await this.at.wake.inCall<CallAddition>("block", "POST", "/calls/addition", body);
       // The vouchers handed out for the call's tools-only lines: each
       // remembered (by its hash) with its subscribe's context.
       if (this.nativeContexts.size > 0) {
@@ -1077,7 +1272,14 @@ export class DisabledCall<C> {
   readonly nativeConversation: string | null = null;
   readonly session: string | null = null;
   readonly recognized: Recognized | null = null;
+  readonly wakes = false;
+  readonly callLimit: number | undefined = undefined;
   declare readonly ctx: C;
+
+  /** Always false: nothing wakes the conversation. */
+  shouldSkipWait(_seconds: number | undefined): boolean {
+    return false;
+  }
 
   constructor(
     private readonly wake: Wakeshift,
@@ -1324,11 +1526,12 @@ export class ToolLayer<C = unknown> {
     let add: CallAddition | null = null;
     try {
       add = await scope.addition();
+      if (add?.requests?.length) add = await scope.runRequest(add);
       scope.announce();
     } catch (err) {
       if (!scope.armed && scope.created.length === 0 && scope.nativeLines.length > 0) {
         // Only native lines, so nothing to roll back: the vendor's result
-        // goes out as it would without Wakeshift (docs/subscribe-vouchers.md §7.2).
+        // goes out as it would without Wakeshift.
         this.at.wake.log.log("native_unavailable", `Wakeshift's addition to a result of ${scope.tool} failed, so it carries no line for the MCP Events client`, {
           tool: scope.tool,
           event: scope.nativeLines[0]!.name,
@@ -1605,4 +1808,11 @@ export function checkSubscribes(wake: Wakeshift, tool: string, list: unknown): r
     }
   }
   return [...list];
+}
+
+// refusedRequest logs that the core sent a client request past the SDK's
+// bounds, or one the call didn't offer (clientrequests.ts): the call keeps
+// today's text. Once per reason (log.ts).
+function refusedRequest(wake: Wakeshift, reason: string): void {
+  wake.log.log("client_request_refused", `Wakeshift sent a client request past this SDK's bounds (${reason}), so the call's result keeps Wakeshift's usual text`, { reason });
 }

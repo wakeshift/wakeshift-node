@@ -11,6 +11,7 @@ import { parseKey, signAssertion, type AppKey, isTestKey } from "./key.js";
 import { RETRY_PAUSES_MS, retryRefused } from "./retry.js";
 import { LOG_LEVELS, Log, STDERR_LOGGER, logConfigError, type LogLevel, type Logger } from "./log.js";
 import { takesTasks } from "./discover.js";
+import { Breaker, callBreaker, type Outcome } from "./breaker.js";
 
 const INSPECT = Symbol.for("nodejs.util.inspect.custom");
 
@@ -60,13 +61,46 @@ export interface WakeshiftOptions {
   timeoutMs?: number;
   /** How many times a request the load balancer refused is sent again. Default 2. */
   maxRetries?: number;
+  /**
+   * The budgets for the requests a tool that subscribes makes inside its
+   * call, in milliseconds: subscribeMs for call.subscribe, unsubscribe and
+   * resolveSession (default 5000), blockMs for the result's addition and a
+   * failed call's rollback (default 1000). They're never retried; timeoutMs
+   * and maxRetries don't apply to them.
+   */
+  callTimeouts?: CallTimeouts;
   /** Where the SDK logs. Default: stderr, for every level (never stdout, which a stdio MCP server keeps for JSON-RPC). */
   logger?: Logger;
   /** Lines at this level and above are logged. Default "info". */
   logLevel?: LogLevel;
 }
 
-const OPTIONS = new Set(["key", "required", "core", "fetch", "timeoutMs", "maxRetries", "logger", "logLevel"]);
+const OPTIONS = new Set(["key", "required", "core", "fetch", "timeoutMs", "maxRetries", "callTimeouts", "logger", "logLevel"]);
+
+/** The budgets for the requests made inside a tool call (the callTimeouts option), in milliseconds. */
+export interface CallTimeouts {
+  /** call.subscribe, call.unsubscribe and call.resolveSession. Default 5000. */
+  subscribeMs?: number;
+  /** The result's addition, and the rollback of a call that failed. Default 1000. */
+  blockMs?: number;
+}
+
+// checkCallTimeouts reads the callTimeouts option.
+function checkCallTimeouts(v: unknown): Required<CallTimeouts> {
+  const out = { subscribeMs: 5_000, blockMs: 1_000 };
+  if (v === undefined) return out;
+  if (v === null || typeof v !== "object" || Array.isArray(v)) throw new UsageError("config", "callTimeouts is { subscribeMs?, blockMs? }");
+  for (const k of Object.keys(v)) {
+    if (k !== "subscribeMs" && k !== "blockMs") throw new UsageError("config", `callTimeouts has no field ${k}: its fields are subscribeMs and blockMs`);
+  }
+  for (const k of ["subscribeMs", "blockMs"] as const) {
+    const n = (v as CallTimeouts)[k];
+    if (n === undefined) continue;
+    if (!(typeof n === "number" && Number.isFinite(n) && n > 0)) throw new UsageError("config", `callTimeouts.${k} is a number of milliseconds over 0`);
+    out[k] = n;
+  }
+  return out;
+}
 
 // envOf reads the environment where there is one (not every runtime has process).
 function envOf(name: string): string | undefined {
@@ -98,14 +132,17 @@ export interface AppInfo {
   key: { id: string; name: string };
 }
 
+/** @internal The core's feature: it hands out subscribe vouchers for tools-only events to native callers. */
+export const SUBSCRIBE_VOUCHERS = "subscribe_vouchers";
+
+/** @internal The core's feature: it serves push (events/stream) upstream (WAKESHIFT_MCP_EVENTS_PUSH). */
+export const PUSH_FEATURE = "push";
+
 /**
  * @internal A tool call as Wakeshift takes it: who called, from which
  * client, in which conversation. A tool that subscribes (attached.registerTool,
  * or named in wrap) and attach's own tools pack it.
  */
-/** @internal The core's feature: it hands out subscribe vouchers for tools-only events to native callers. */
-export const SUBSCRIBE_VOUCHERS = "subscribe_vouchers";
-
 export interface Call {
   /** The app's own ID for the person (optional). */
   user?: string;
@@ -129,6 +166,8 @@ export interface Call {
   agent_token?: string;
   /** For a native caller: the SHA-256 (hex) of the request's Mcp-Session-Id, when it has one. An anonymous subscribe voucher is bound to it. */
   transport_session?: string;
+  /** The request declares the MCP Events extension (its _meta's capabilities, or its session's initialize): sent only to a core that serves push, which may then answer a subscribe with native_line. */
+  events_ext?: boolean;
 }
 
 const AGENT_TOKEN = new WeakMap<object, { token: string; expires: number }>();
@@ -379,6 +418,7 @@ export function packCall(c: {
   tasks?: boolean;
   agentToken?: string;
   transportSession?: string;
+  eventsExt?: boolean;
 }): Call {
   const out: Call = { client: c.clientName ?? "" };
   if (c.user) out.user = c.user;
@@ -391,6 +431,7 @@ export function packCall(c: {
   if (c.tasks) out.tasks = true;
   if (c.agentToken) out.agent_token = c.agentToken;
   if (c.transportSession) out.transport_session = c.transportSession;
+  if (c.eventsExt) out.events_ext = true;
   return out;
 }
 
@@ -443,6 +484,10 @@ export class Wakeshift {
   private readonly timeoutMs: number;
   /** @internal How many times a request is sent again, by default. */
   readonly maxRetries: number;
+  // The budgets for requests made inside a tool call (callTimeouts).
+  private readonly callTimeouts: Required<CallTimeouts>;
+  /** @internal The breaker for requests made inside a tool call (breaker.ts). */
+  readonly breaker = new Breaker();
 
   /**
    * A client for the app whose key is opts.key, else WAKESHIFT_KEY. Without
@@ -461,6 +506,7 @@ export class Wakeshift {
     this.log = new Log(logger, opts.logLevel ?? "info");
     if (opts.timeoutMs !== undefined && !(typeof opts.timeoutMs === "number" && opts.timeoutMs > 0)) throw new UsageError("config", "timeoutMs is a number of milliseconds over 0");
     if (opts.maxRetries !== undefined && !(Number.isInteger(opts.maxRetries) && opts.maxRetries >= 0)) throw new UsageError("config", "maxRetries is a whole number, 0 or more");
+    this.callTimeouts = checkCallTimeouts(opts.callTimeouts);
     if (opts.required !== undefined && typeof opts.required !== "boolean") throw new UsageError("config", "required is true or false");
     if (opts.fetch !== undefined && typeof opts.fetch !== "function") throw new UsageError("config", "fetch is a function");
     if (opts.core !== undefined && typeof opts.core !== "string") throw new UsageError("config", "the core is an https:// URL");
@@ -676,7 +722,18 @@ export class Wakeshift {
       body[k] = v;
     }
     if (!body.events) return; // nothing to add (attach refuses with no events, but never send an empty list)
-    const out = await this.request<{ changed?: unknown; features?: unknown }>("POST", "/manifest/merge", body);
+    let out: { changed?: unknown; features?: unknown };
+    try {
+      out = await this.request<{ changed?: unknown; features?: unknown }>("POST", "/manifest/merge", body);
+    } catch (err) {
+      // Refused for the app's event definitions (a 4xx but a refused key,
+      // which key_refused covers): Wakeshift's own message about them, and
+      // its code; never a body otherwise.
+      if (err instanceof APIError && err.status !== null && err.status >= 400 && err.status < 500 && err.status !== 401 && err.status !== 403) {
+        this.log.log("manifest_refused", `Wakeshift refused this app's events: ${err.coreMessage}`, { reason: err.code });
+      }
+      throw err;
+    }
     this.sends++;
     this.noteChanges(out.changed);
     this.noteFeatures(out.features);
@@ -690,16 +747,26 @@ export class Wakeshift {
   }
 
   /**
-   * @internal Whether the core hands out subscribe vouchers
-   * (docs/subscribe-vouchers.md): its manifest answer reports
+   * @internal Whether the core hands out subscribe vouchers:
+   * its manifest answer reports
    * subscribe_vouchers. Sends the manifest first if it hasn't been; a
-   * failed send is no.
+   * failed send is no, and so is one still going after the in-call budget
+   * named (inCall), if any.
    */
-  async vouchersOffered(): Promise<boolean> {
+  async vouchersOffered(within?: "subscribe" | "block"): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await this.ensureEvents();
+      const sent = this.ensureEvents().then(() => true);
+      if (within === undefined) await sent;
+      else {
+        const ms = within === "subscribe" ? this.callTimeouts.subscribeMs : this.callTimeouts.blockMs;
+        const late = new Promise<false>((resolve) => (timer = setTimeout(() => resolve(false), ms)));
+        if (!(await Promise.race([sent, late]))) return false;
+      }
     } catch {
       return false;
+    } finally {
+      clearTimeout(timer);
     }
     return this.features.has(SUBSCRIBE_VOUCHERS);
   }
@@ -711,6 +778,29 @@ export class Wakeshift {
    */
   get vouchersKnown(): boolean {
     return this.features.has(SUBSCRIBE_VOUCHERS);
+  }
+
+  /**
+   * @internal Whether the core serves push (events/stream): its manifest
+   * answer reports push. Sends the manifest first if it hasn't been; a
+   * failed send is no.
+   */
+  async pushOffered(): Promise<boolean> {
+    try {
+      await this.ensureEvents();
+    } catch {
+      return false;
+    }
+    return this.features.has(PUSH_FEATURE);
+  }
+
+  /**
+   * @internal Whether the core's last manifest answer reported push, without
+   * asking: a call's events_ext goes only to a core that reported it (an
+   * older one refuses fields it doesn't know).
+   */
+  get pushKnown(): boolean {
+    return this.features.has(PUSH_FEATURE);
   }
 
   // noteChanges logs each event the manifest just closed: from any to tools,
@@ -906,6 +996,37 @@ export class Wakeshift {
   }
 
   /**
+   * @internal Opens a streaming POST to the app API (events/stream), after
+   * the manifest: one attempt, no retries, and a timeout only until the
+   * response's headers arrive; its body is read for as long as the core
+   * keeps it open, until signal ends it. Returns the response whatever its
+   * status; throws an APIConnectionError when there was none, or signal's
+   * reason once it's aborted.
+   */
+  async openStream(path: string, body: unknown, signal: AbortSignal): Promise<Response> {
+    await this.ensureEvents();
+    if (!KEYS.has(this)) throw new UsageError("disabled", "Wakeshift is off (no app key), so this call has nothing to ask it");
+    if (signal.aborted) throw signal.reason;
+    const fetchFn = this.fetchOpt ?? (((...a: Parameters<typeof fetch>) => globalThis.fetch(...a)) as typeof fetch);
+    const timeoutCtl = new AbortController();
+    const timer = setTimeout(() => timeoutCtl.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")), this.timeoutMs);
+    try {
+      return await fetchFn(this.core + "/api/apps/v1" + path, {
+        method: "POST",
+        headers: { Authorization: "Bearer " + this.assertion(), "Content-Type": "application/json", Accept: "application/x-ndjson" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.any([signal, timeoutCtl.signal]),
+      });
+    } catch (err) {
+      if (signal.aborted) throw signal.reason;
+      if (timeoutCtl.signal.aborted) throw this.timedOut(err);
+      throw this.unreachable(err);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
    * @internal A POST about one of the app's events (a publish URL, a
    * status): if Wakeshift doesn't know the event yet (a fresh process,
    * before anything attached), this process sends its manifest, merged,
@@ -977,6 +1098,57 @@ export class Wakeshift {
     await this.actAsFresh(workspace, agent, opts);
   }
 
+  /**
+   * @internal A request made inside a tool call (budget: which of
+   * callTimeouts), through requestApp: never retried, and done within the
+   * budget, any manifest send it waits for included, or it fails with
+   * timeout. While the breaker is open it isn't sent: it fails at once with
+   * unreachable, and core_unavailable is logged. signal: the MCP request's.
+   * body may be a function, run within the budget first (it may wait for
+   * the manifest's answer itself).
+   */
+  async inCall<T>(budget: "subscribe" | "block", method: string, path: string, body: unknown | (() => Promise<unknown>), signal?: AbortSignal): Promise<T> {
+    const admitted = this.breaker.admit();
+    const pause = Math.round(callBreaker.coolDownMs / 1000);
+    if (admitted === "skip") {
+      this.log.log("core_unavailable", `Wakeshift failed ${callBreaker.failures} times in a row inside tool calls, so tool calls skip it for ${pause} seconds`);
+      throw this.unreachable(new Error(`skipped: ${callBreaker.failures} requests in a row failed inside tool calls, so they pause for ${pause} seconds`));
+    }
+    const ms = budget === "subscribe" ? this.callTimeouts.subscribeMs : this.callTimeouts.blockMs;
+    // The deadline ends the request itself too (its signal's reason is the
+    // timeout), so nothing is sent or created after the call gave up; the
+    // race covers a manifest send the request waits for first.
+    const ctl = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const err = this.timedOut(undefined);
+        ctl.abort(err);
+        reject(err);
+      }, ms);
+    });
+    const ended = signal ? AbortSignal.any([signal, ctl.signal]) : ctl.signal;
+    let outcome: Outcome = "failed";
+    try {
+      const send = async () => {
+        const b = typeof body === "function" ? await (body as () => Promise<unknown>)() : body;
+        return this.requestApp<T>(method, path, b, { timeoutMs: ms, maxRetries: 0, signal: ended });
+      };
+      const out = await Promise.race([send(), deadline]);
+      outcome = "ok";
+      return out;
+    } catch (err) {
+      if (signal?.aborted) outcome = "neither";
+      else if (err instanceof APIConnectionError) outcome = "failed";
+      else if (err instanceof APIError) outcome = err.status !== null && err.status >= 500 ? "failed" : "ok";
+      else outcome = "neither"; // not about the core: a local check
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      this.breaker.done(admitted, outcome);
+    }
+  }
+
   private async request<T>(method: string, path: string, body?: unknown, opts: RequestOptions = {}): Promise<T> {
     if (!KEYS.has(this)) throw new UsageError("disabled", "Wakeshift is off (no app key), so this call has nothing to ask it");
     if (opts.signal?.aborted) throw opts.signal.reason;
@@ -1033,7 +1205,9 @@ export class Wakeshift {
       const message = str(e.message) || text.slice(0, 200) || resp.statusText;
       if (resp.status === 409 && code === "id_reused") throw new IdReusedError({ message, requestId: str(e.request_id) || requestId });
       if (resp.status === 401) this.log.log("key_refused", `Wakeshift refused this app's key (${resp.status})`);
-      throw new APIError({ status: resp.status, code, message, reason: str(e.reason) || undefined, requestId: str(e.request_id) || requestId });
+      // hint: what the client can do instead, where the core says (an object, passed on as it is).
+      const hint = e.hint !== null && typeof e.hint === "object" && !Array.isArray(e.hint) ? (e.hint as Record<string, unknown>) : undefined;
+      throw new APIError({ status: resp.status, code, message, reason: str(e.reason) || undefined, requestId: str(e.request_id) || requestId, hint });
     }
     // A 2xx that isn't Wakeshift's JSON: a proxy's page, or a wrong core.
     if (json === null || typeof json !== "object" || Array.isArray(json)) {

@@ -7,7 +7,7 @@
 // attach wraps those handlers in place: Wakeshift's own tools, MCP Events and
 // the wait tool on the same map; Wakeshift's arguments and the subscribes
 // sentence on the tools its wrap option names; their calls stripped of
-// Wakeshift's arguments, found by attached.call() (or wake.currentCall()),
+// Wakeshift's arguments, found by wake.currentCall(),
 // and answered with Wakeshift's block. Python's test_lowlevel.py is the model.
 
 import { test } from "node:test";

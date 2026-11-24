@@ -1,4 +1,4 @@
-// Emit and publish URLs (design §2.6, §2.7, §8 PR 8): createPublishUrl and
+// Emit and publish URLs: createPublishUrl and
 // status send the manifest when the core doesn't know the event yet, then
 // ask once more (#62); a retried emit carries one id on every attempt, so it
 // wakes once; every async method takes { signal, timeoutMs, maxRetries }; the
@@ -68,7 +68,7 @@ test("a publish URL's printers elide its token; .url has it", async () => {
   assert.match(JSON.stringify(url), /\/p\/\[redacted\]/);
 });
 
-test("a retried emit wakes once: its connection dropped, it's sent again with the same id, of its own (design §2.6)", async () => {
+test("a retried emit wakes once: its connection dropped, it's sent again with the same id, of its own", async () => {
   const a = app((path, _body, n) => (path === "/events/emit" && n === 1 ? "drop" : json(200, { matched: 1, duplicate: n > 1 })));
   const out = await a.build.emit({ repo: "web" }, { status: "ok" });
   const emits = a.calls.filter((c) => c.path === "/events/emit").map((c) => c.body);

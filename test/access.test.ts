@@ -1,4 +1,4 @@
-// Who may subscribe (design §3, §8 PR 6): an event that declares neither
+// Who may subscribe: an event that declares neither
 // personal, authorize nor public is subscribed to only through the app's
 // own tools: subscribe_events and native MCP Events subscribe and poll
 // refuse it, without asking Wakeshift (mcp-events-wire.json next). A tool
@@ -89,7 +89,7 @@ test("native subscribes and polls the SDK refuses without asking Wakeshift, in e
           assert.ok(e instanceof McpError, `${c.name} (${dialect}): ${String(e)}`);
           assert.equal(e.code, c.error.code[dialect], `${c.name} (${dialect})`);
           assert.equal(e.message.replace(/^MCP error -?\d+: /, ""), c.error.message, `${c.name} (${dialect})`);
-          assert.equal((e as { data?: unknown }).data ?? null, c.error.data, `${c.name} (${dialect})`);
+          assert.deepEqual((e as { data?: unknown }).data ?? null, c.error.data, `${c.name} (${dialect})`);
           return true;
         },
       );
@@ -315,7 +315,7 @@ test("shared fixture: the default text, case for case (default-text.json)", () =
   });
 });
 
-test("a server that serves its own MCP Events keeps them: Wakeshift serves none and logs events_capability_kept (#70, Appwrite)", async () => {
+test("a server that serves its own MCP Events keeps them: Wakeshift serves none and logs events_capability_kept (#70)", async () => {
   const a = app();
   const server = new McpServer({ name: "x", version: "1" });
   const theirs = { events: [{ name: "doc.created", description: "A document was created", delivery: ["webhook"], inputSchema: { type: "object" } }] };

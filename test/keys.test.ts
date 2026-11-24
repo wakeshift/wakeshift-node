@@ -1,7 +1,6 @@
 // App keys, both formats, against the shared golden
 // file Go writes (internal/appkey), and what a key that doesn't name its
-// app changes for the client: the default core, appId and app(), and Sign
-// in with Wakeshift.
+// app changes for the client: the default core, appId and app().
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -100,8 +99,8 @@ interface Sent {
   body?: string;
 }
 
-// fakeCore answers GET /api/apps/v1/app with app, /oauth/token with
-// tokens, and records what it was sent.
+// fakeCore answers GET /api/apps/v1/app with app, and records what it was
+// sent.
 function fakeCore(app: () => [number, unknown]) {
   const sent: Sent[] = [];
   const fetchFn = (async (url: string, init: RequestInit) => {
@@ -111,7 +110,6 @@ function fakeCore(app: () => [number, unknown]) {
     let status = 200;
     let json: unknown = {};
     if (path === "/api/apps/v1/app") [status, json] = app();
-    else if (path === "/oauth/token") json = { access_token: "at", refresh_token: "rt", expires_in: 900, wakeshift_user: "u-1" };
     else if (path === "/api/apps/v1/users/forget") json = { forgotten: false };
     else status = 404;
     return new Response(JSON.stringify(json), { status, headers: { "Content-Type": "application/json" } });

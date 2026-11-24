@@ -21,6 +21,7 @@ import { WAKE_ARGS_JSON, withWakeArgsJson } from "../src/toolcall.js";
 import * as z3 from "zod/v3";
 import { speaksEvents, toolChoice } from "../src/events.js";
 import { nativeOf } from "../src/toolcall.js";
+import { chatgptDesktop, chatgptDesktopChat } from "../src/spec.js";
 import { TOOL_ANNOTATIONS } from "../src/tasks.js";
 
 const seed = Buffer.alloc(32, 9).toString("base64url");
@@ -304,7 +305,8 @@ test("dialectOf: ChatGPT by name, or by User-Agent, through Codex too", () => {
   assert.equal(dialectOf("", "openai-mcp/1.0.0 (Codex)"), "chatgpt");
   assert.equal(dialectOf("", "openai-mcp/1.0.0"), "chatgpt");
   assert.equal(dialectOf("openai-mcp", ""), "chatgpt");
-  assert.equal(dialectOf("", "codex-mcp-client/0.166.0"), "draft");
+  assert.equal(dialectOf("", "codex-mcp-client/0.166.0"), "spec");
+  assert.equal(dialectOf("acme", "", { "openai/session": "c1" }), "chatgpt");
 });
 
 test("speaksEvents: the extension, or ChatGPT; not the older top-level key", () => {
@@ -589,8 +591,9 @@ test("attach: draft clients get the draft's codes", async () => {
   assert.equal(cb.code, -32027);
   assert.deepEqual(cb.data, { reason: "challenge" });
   assert.equal((await err("events/unsubscribe", { name: "chat.message", arguments: { channel: "eng" }, delivery })).code, -32023);
-  assert.equal((await err("events/stream", {})).code, -32026);
-  assert.equal((await err("events/poll", {})).code, -32023); // no such event
+  assert.equal((await err("events/stream", { name: "chat.message", arguments: { channel: "eng" } })).code, -32026);
+  assert.equal((await err("events/poll", { name: "no.such.event", arguments: {} })).code, -32023); // no such event
+  assert.equal((await err("events/poll", {})).code, -32602); // no name: InvalidParams
   await client.close();
 });
 
@@ -951,7 +954,7 @@ test("the MCP Events wire format is every SDK's (test/mcp-events-wire.json)", as
 const as2026 = (caps: any = {}) => ({
   _meta: {
     "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-    "io.modelcontextprotocol/clientInfo": { name: "openclaw", version: "2026.10.10" },
+    "io.modelcontextprotocol/clientInfo": { name: "acme-agent", version: "2026.10.10" },
     "io.modelcontextprotocol/clientCapabilities": caps,
   },
 });
@@ -1050,7 +1053,7 @@ for (const when of ["before", "after"] as const) {
   });
 }
 
-test("attach: the events capability is advertised with any event, tools-only ones included (subscribe vouchers: docs/subscribe-vouchers.md §4.3); none without events", async () => {
+test("attach: the events capability is advertised with any event, tools-only ones included (for subscribe vouchers); none without events", async () => {
   for (const kind of ["none", "tools-only", "open"] as const) {
     const { wake } = fakeCore();
     if (kind !== "none") wake.defineEvent("crawl.finished", { description: "A crawl finished", args: z.object({ job: z.string() }), payload: z.object({ pages: z.number() }) });
@@ -1104,4 +1107,48 @@ test("nativeOf: a harness Wakeshift wakes itself is never native, whatever it de
   assert.equal(nativeOf(at("", "claude-code/2.1.316 (sdk-cli)", true) as any, {}).native, false, "a stateless server: the User-Agent");
   assert.equal(nativeOf(at("codex-mcp-client") as any, {}).native, false);
   assert.equal(nativeOf(at("openai-mcp") as any, {}).native, true, "ChatGPT stays native");
+});
+
+test("nativeOf: ChatGPT's desktop app isn't native; a Work chat on the web is", () => {
+  // The capabilities each sent on tools/call, as observed.
+  const desktopCaps = { experimental: { "openai/visibility": { enabled: true } }, elicitation: { form: {}, url: {} }, extensions: { "io.modelcontextprotocol/ui": { mimeTypes: ["text/html;profile=mcp-app", "text/html+skybridge"] }, "openai/elicitation": { form: {}, userVerification: {} }, "openai/form": {} } };
+  const webCaps = { experimental: { "openai/visibility": { enabled: true } }, extensions: { "io.modelcontextprotocol/ui": { mimeTypes: ["text/html;profile=mcp-app"] }, "openai/elicitation": { userVerification: {} } } };
+  const call = (client: string, ua: string, meta: Record<string, unknown>) => ({
+    host: {
+      servesEvents: true,
+      req: () => ({ meta, header: (n: string) => (n.toLowerCase() === "user-agent" ? ua : "") }),
+      clientCapabilities: () => undefined,
+    },
+    clientOf: () => client,
+    native: undefined,
+    servesEvents: undefined,
+  });
+  const caps = "io.modelcontextprotocol/clientCapabilities";
+  const codex = (c: unknown, extra: Record<string, unknown> = {}) =>
+    call("openai-mcp (Codex)", "openai-mcp/1.0.0 (Codex)", { "openai/session": "chat-1", sessionId: "s-1", windowId: "s-1:0", [caps]: c, ...extra });
+  assert.deepEqual(nativeOf(codex(desktopCaps) as any, {}), { native: false, conversation: null }, "the desktop app (Codex mode)");
+  assert.deepEqual(nativeOf(codex(webCaps, { traceparent: "00-x" }) as any, {}), { native: true, conversation: "chat-1" }, "a Work chat on the web");
+  // The desktop app's regular chat, as observed.
+  const regular = call("openai-mcp", "openai-mcp/1.0.0", {
+    "openai/session": "chat-r",
+    "openai/userAgent": "Codex Desktop/26.1103.60933 (Mac OS; arm64)",
+    "openai/locale": "en-US",
+    timezone: "UTC",
+    timezone_offset_minutes: 0,
+    [caps]: { experimental: { "openai/visibility": { enabled: true } }, extensions: { "io.modelcontextprotocol/ui": { mimeTypes: ["text/html;profile=mcp-app"] } } },
+  });
+  assert.deepEqual(nativeOf(regular as any, {}), { native: false, conversation: null }, "the desktop app's regular chat: it can't subscribe natively");
+  assert.equal(chatgptDesktopChat("openai-mcp", { "openai/userAgent": "Mozilla/5.0" }), false, "another userAgent");
+  assert.equal(chatgptDesktopChat("openai-mcp", { "openai/session": "x" }), false, "the web's chats send none");
+  assert.equal(chatgptDesktopChat("openai-mcp (Codex)", { "openai/userAgent": "Codex Desktop/26.1103.60933 (Mac OS; arm64)" }), false, "Codex mode's name");
+  // Both the skybridge mime type and openai/form; anything less is ChatGPT.
+  const noForm = structuredClone(desktopCaps) as any;
+  delete noForm.extensions["openai/form"];
+  const noSkybridge = structuredClone(desktopCaps) as any;
+  noSkybridge.extensions["io.modelcontextprotocol/ui"].mimeTypes = ["text/html;profile=mcp-app"];
+  assert.equal(chatgptDesktop("openai-mcp (Codex)", { [caps]: noForm }), false);
+  assert.equal(chatgptDesktop("openai-mcp (Codex)", { [caps]: noSkybridge }), false);
+  assert.equal(chatgptDesktop("openai-mcp (Codex)", {}), false, "no capabilities to go by");
+  assert.equal(chatgptDesktop("openai-mcp (Codex)", { [caps]: "x" }), false, "malformed");
+  assert.equal(chatgptDesktop("openai-mcp", { [caps]: desktopCaps }), false, "ChatGPT's own client name");
 });

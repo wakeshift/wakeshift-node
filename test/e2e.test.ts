@@ -4,7 +4,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { MCP, McpServer, headerOf, rawRpc } from "./mcp.js";
 import { Client } from "./mcp.js";
 import { InMemoryTransport } from "./mcp.js";
@@ -19,6 +21,21 @@ import { createMcpHandler as createMcpHandlerV2, McpServer as McpServerV2 } from
 import { hasCode as isCode } from "../src/errors.js";
 import { Wakeshift, type AgentScope, type Manifest, type Subscription } from "../src/index.js";
 import { quiet, warningsInto } from "./logs.js";
+
+// Since November 2026 the Monitor's command reads the conversation's link
+// from a file the agent writes with its file tool (the result's link step),
+// never from the command: monitorCmd writes it as the agent would, in a
+// HOME of the tests' own, and the commands run with that HOME.
+const LINK_HOME = mkdtempSync(join(tmpdir(), "wakeshift-links-"));
+const LINK_STEP = /If you haven't written this conversation's link to the file ~\/\.wakeshift\/links\/([0-9a-f]{16}) yet, first write it .*? its whole content this one line: (\S+) \./g;
+function monitorCmd(said: string): RegExpMatchArray | null {
+  for (const [, key, link] of said.matchAll(LINK_STEP)) {
+    mkdirSync(join(LINK_HOME, ".wakeshift", "links"), { recursive: true });
+    writeFileSync(join(LINK_HOME, ".wakeshift", "links", key!), link + "\n");
+  }
+  return said.match(/with this command: (f=\$HOME\/\.wakeshift\/links\/[0-9a-f]{16}; [^\n]*?c=; p=\$PPID; .*?; done; fi) \./);
+}
+
 
 const harness = process.env.WAKESHIFT_SDK_HARNESS;
 
@@ -64,7 +81,7 @@ class Inbox {
 // wait in a loop) in sh, as Monitor runs it: one JSON line per event.
 async function readLines(cmd: string, signal: AbortSignal): Promise<Inbox> {
   const inbox = new Inbox();
-  const sh = spawn("sh", ["-c", cmd], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  const sh = spawn("sh", ["-c", cmd], { detached: true, stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, HOME: LINK_HOME } });
   signal.addEventListener("abort", () => {
     try {
       process.kill(-sh.pid!, "SIGKILL"); // its curl too
@@ -177,7 +194,7 @@ async function statelessApp(t: { after(fn: () => void): void }, wake: Wakeshift,
 // once a request comes in) emits at startup, before any agent has
 // connected. The emit's unknown_event sends the manifest (a merge), and the
 // emit goes again and succeeds.
-test("an emit at startup, before any request, against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async () => {
+test("an emit at startup, before any request, against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (scripts/e2e.sh)" }, async () => {
   const { core, key } = JSON.parse(readFileSync(harness!, "utf8")) as { core: string; key: string };
   const sent: string[] = [];
   const recorded = (async (url: string | URL | Request, init?: RequestInit) => {
@@ -208,7 +225,7 @@ test("an emit at startup, before any request, against a real core", { skip: !har
   assert.equal(sent[3], "POST /events/emit 200");
 });
 
-test("the SDK against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async (t) => {
+test("the SDK against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (scripts/e2e.sh)" }, async (t) => {
   const { core, key } = JSON.parse(readFileSync(harness!, "utf8")) as { core: string; key: string };
   const wake = new Wakeshift({ key, core });
   const build = ciBuild(wake);
@@ -241,7 +258,7 @@ test("the SDK against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNE
     // A tool that subscribes to nothing: the wrapper adds nothing to its
     // result.
     attached.registerTool(
-      "list_builds",
+      "list_jobs",
       { inputSchema: { repo: z.string() }, subscribes: [] },
       async ({ repo }) => ({ content: [{ type: "text" as const, text: `No builds on ${repo} today.` }] })
     );
@@ -275,7 +292,7 @@ test("the SDK against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNE
   const said = text(watchedClaude);
   assert.ok(said.startsWith("Watching CI on alpha.\n\n"), said);
   assert.ok(said.includes(`session_key="${claudeSub.session}"`), said);
-  const monitor = said.match(/with this command: (u='https?:\/\/[^']+\/v1\/stream\/wait\?[^']+'; c=; p=\$PPID; .*?; done) \./);
+  const monitor = monitorCmd(said);
   assert.ok(monitor, said);
   const claudeLines = await readLines(monitor[1], stop.signal);
   // Once its Monitor is running, subscribing again says so, and renews the
@@ -359,7 +376,7 @@ test("the SDK against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNE
   assert.equal((await build.emit({ repo: "alpha" }, { branch: "dev", text: "held for cursor" })).matched, 2);
   await claudeLines.expect("held for cursor");
   // The next result of the app's tools is the app's alone.
-  const plain = (await cursor.callTool({ name: "list_builds", arguments: { repo: "alpha", session_key: cursorSub.session } })) as CallToolResult;
+  const plain = (await cursor.callTool({ name: "list_jobs", arguments: { repo: "alpha", session_key: cursorSub.session } })) as CallToolResult;
   assert.equal(plain.content.length, 1);
   assert.equal((plain.content[0] as any).text, "No builds on alpha today.");
 
@@ -427,7 +444,7 @@ test("the SDK against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNE
 
 // The same app's key in the current format (wst_ and 50 characters): it
 // names no app, so app() asks the core, and calls work as with the old one.
-test("a current-format key against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async (t) => {
+test("a current-format key against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (scripts/e2e.sh)" }, async (t) => {
   const { core, key, new_key } = JSON.parse(readFileSync(harness!, "utf8")) as { core: string; key: string; new_key: string };
   assert.ok(new_key, "the harness has no new_key");
   const wake = new Wakeshift({ key: new_key, core, logger: quiet });
@@ -452,7 +469,7 @@ test("a current-format key against a real core", { skip: !harness && "set WAKESH
 // (here, a bearer token per user), its wrapped tool's calls carry the user,
 // Wakeshift keeps the user's conversation in the workspace it keeps for
 // them, and an agent added there has a grant until the user is forgotten.
-test("users' workspaces against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async (t) => {
+test("users' workspaces against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (scripts/e2e.sh)" }, async (t) => {
   const { core, key } = JSON.parse(readFileSync(harness!, "utf8")) as { core: string; key: string };
   const wake = new Wakeshift({ key, core });
   const build = ciBuild(wake);
@@ -542,7 +559,7 @@ async function receiver() {
   return { url, secret: "whsec_" + secret.toString("base64"), got, close: () => srv.close() };
 }
 
-test("events against a real core: defined, served, emitted, bridged and native", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async (t) => {
+test("events against a real core: defined, served, emitted, bridged and native", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (scripts/e2e.sh)" }, async (t) => {
   const { core, key } = JSON.parse(readFileSync(harness!, "utf8")) as { core: string; key: string };
   const wake = new Wakeshift({ key, core });
   const build = wake.defineEvent("ci.build", {
@@ -578,7 +595,7 @@ test("events against a real core: defined, served, emitted, bridged and native",
     await Promise.all(clients.map((c) => c.close()));
   });
   const monitorOf = (r: CallToolResult) => {
-    const m = text(r).match(/with this command: (u='https?:\/\/[^']+\/v1\/stream\/wait\?[^']+'; c=; p=\$PPID; .*?; done) \./);
+    const m = monitorCmd(text(r));
     assert.ok(m, text(r));
     return m[1];
   };
@@ -680,7 +697,7 @@ test("events against a real core: defined, served, emitted, bridged and native",
 // then the short form; a failed call is rolled back; a native caller is
 // told what to subscribe to; and the app reaches the conversations it
 // stored with one multi-recipient emit.
-test("wrapped tools against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async (t) => {
+test("wrapped tools against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (scripts/e2e.sh)" }, async (t) => {
   const { core, key } = JSON.parse(readFileSync(harness!, "utf8")) as { core: string; key: string };
   const wake = new Wakeshift({ key, core });
   const turn = wake.defineEvent("game.turn", {
@@ -795,7 +812,7 @@ test("wrapped tools against a real core", { skip: !harness && "set WAKESHIFT_SDK
 // unsubscribe_events by id act on the calling conversation, found by its
 // session_key; a call that subscribes and unsubscribes gets no block; and
 // onSubscribe runs once for the subscription the tool created.
-test("a server without identify: the conversation's own subscriptions, against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async (t) => {
+test("a server without identify: the conversation's own subscriptions, against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (scripts/e2e.sh)" }, async (t) => {
   const { core, key } = JSON.parse(readFileSync(harness!, "utf8")) as { core: string; key: string };
   const wake = new Wakeshift({ key, core, logger: quiet });
   t.after(() => wake.close());
@@ -884,7 +901,7 @@ test("a server without identify: the conversation's own subscriptions, against a
 // @modelcontextprotocol/server before 2.3.0, tasks/get on this revision
 // never reaches attach (the MCP SDK answers -32601 itself), so this test
 // pins the peer range's floor: CI runs it against the floor too.
-test("polling and the wait task against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async () => {
+test("polling and the wait task against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (scripts/e2e.sh)" }, async () => {
   const { core, key } = JSON.parse(readFileSync(harness!, "utf8")) as { core: string; key: string };
   const wake = new Wakeshift({ key, core });
   const build = ciBuild(wake);
@@ -965,18 +982,21 @@ test("polling and the wait task against a real core", { skip: !harness && "set W
     );
     return server;
   });
-  const rpcOff = (method: string, params: Record<string, unknown>): Promise<any> =>
+  // Real Claude Code names each tool call (claudecode/toolUseId), which the
+  // plugin's beacon is bound to; a call without it gets only the Monitor.
+  const rpcOff = (method: string, params: Record<string, unknown>, meta: Record<string, unknown> = {}): Promise<any> =>
     sendOff(method, {
       ...params,
       _meta: {
         "io.modelcontextprotocol/protocolVersion": "2026-07-28",
         "io.modelcontextprotocol/clientInfo": { name: "claude-code", version: "1.0" },
         "io.modelcontextprotocol/clientCapabilities": tasks,
+        ...meta,
       },
     });
   const offList = await rpcOff("tools/list", {});
   assert.ok(offList.result && !offList.result.tools.some((x: any) => x.name === "wakeshift_wait"), JSON.stringify(offList));
-  const offWatched = await rpcOff("tools/call", { name: "watch", arguments: { repo: "untasked" } });
+  const offWatched = await rpcOff("tools/call", { name: "watch", arguments: { repo: "untasked" } }, { "claudecode/toolUseId": "toolu_e2e_untasked" });
   assert.ok(offWatched.result, JSON.stringify(offWatched));
   const offSaid = text(offWatched.result);
   assert.ok(!offSaid.includes("wakeshift_wait"), offSaid);
@@ -984,14 +1004,14 @@ test("polling and the wait task against a real core", { skip: !harness && "set W
   assert.match(offSaid, /Notify me in every session/, offSaid);
 });
 
-// A ChatGPT-shaped client against a real core with subscribe vouchers
-// (docs/subscribe-vouchers.md §11.3): clientInfo openai-mcp on protocol
+// A ChatGPT-shaped client against a real core with subscribe vouchers:
+// clientInfo openai-mcp on protocol
 // 2026-07-28, no Mcp-Session-Id, _meta["openai/session"] on tool calls, a
-// webhook on 127.0.0.1. A tool subscribes it to a tools-only event; an emit
+// signed-in user, a webhook on 127.0.0.1. A tool subscribes it to a tools-only event; an emit
 // lands before the "person" asks; a scripted "model" copies the voucher
 // from the result into events/subscribe. Skipped on a core that doesn't
 // report subscribe_vouchers.
-test("a ChatGPT-shaped client redeems a subscribe voucher against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (make sdk-e2e)" }, async (t) => {
+test("a ChatGPT-shaped client redeems a subscribe voucher against a real core", { skip: !harness && "set WAKESHIFT_SDK_HARNESS (scripts/e2e.sh)" }, async (t) => {
   const { core, key } = JSON.parse(readFileSync(harness!, "utf8")) as { core: string; key: string };
   const wake = new Wakeshift({ key, core, logger: quiet });
   const subscribed: { user?: string; via: string; tool?: string; args: unknown }[] = [];
@@ -1004,7 +1024,9 @@ test("a ChatGPT-shaped client redeems a subscribe voucher against a real core", 
   });
   const send = await rawRpc(() => {
     const server = new McpServer({ name: "crawler", version: "1.0" });
-    const attached = wake.attach(server);
+    // Signed in (OAuth): an anonymous caller without a transport session
+    // (ChatGPT's) gets no voucher, since one bound to nothing is a bearer.
+    const attached = wake.attach(server, { identify: () => ({ user: "gpt-user" }) });
     attached.registerTool("start_crawl", { inputSchema: { job: z.string() }, subscribes: [crawl] }, async ({ job }, _ctx, call) => {
       await call.subscribe(crawl, { job });
       return `Crawl ${job} started.`;
@@ -1087,7 +1109,7 @@ test("a ChatGPT-shaped client redeems a subscribe voucher against a real core", 
   assert.equal(spent.error?.code, -32012, JSON.stringify(spent));
   assert.doesNotMatch(JSON.stringify(spent), /wsv_/);
 
-  assert.deepEqual(subscribed, [{ user: undefined, via: "tool", tool: "start_crawl", args: { job } }]);
+  assert.deepEqual(subscribed, [{ user: "gpt-user", via: "tool", tool: "start_crawl", args: { job } }]);
   const ended = await rpc("events/unsubscribe", { name: "crawl.finished", arguments: { job, wakeshift_voucher: voucher }, delivery }, "chat-1");
   assert.ok(ended.result, JSON.stringify(ended));
   assert.equal((await crawl.emit({ job }, { pages: 4 })).matched, 0);

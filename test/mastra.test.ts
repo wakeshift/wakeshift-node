@@ -3,8 +3,8 @@
 // (@modelcontextprotocol/server 2.x) per request, from createServerInstance,
 // with its own tools/list and tools/call (a Mastra tool's execute gets
 // { mcp: { extra: { ...ctx } } }) and, optionally, its own MCP Events. The
-// real MCPServer runs in sdk/compat (ts-mastra), pinned and on its newest
-// release.
+// real MCPServer runs in Wakeshift's compatibility tests, pinned and on its
+// newest release.
 
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
@@ -99,7 +99,7 @@ function chatApp(wake: Wakeshift) {
 function serve(server: MCPServer) {
   const handler = createMcpHandler(() => server.createServerInstance(), { onerror: () => {} });
   let id = 0;
-  return async (method: string, params: Record<string, any>, opts: { caps?: Record<string, unknown>; user?: string; client?: string } = {}) => {
+  return async (method: string, params: Record<string, any>, opts: { caps?: Record<string, unknown>; user?: string; client?: string; mcpName?: string } = {}) => {
     const headers: Record<string, string> = {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
@@ -109,6 +109,7 @@ function serve(server: MCPServer) {
     };
     if (typeof params.name === "string") headers["mcp-name"] = params.name;
     if (typeof params.taskId === "string") headers["mcp-name"] = params.taskId;
+    if (opts.mcpName !== undefined) headers["mcp-name"] = opts.mcpName;
     const meta = { [VERSION]: "2026-07-28", [INFO]: { name: opts.client ?? "claude-code", version: "2.1.314" }, [CAPS]: opts.caps ?? {} };
     const body = { jsonrpc: "2.0", id: ++id, method, params: { ...params, _meta: { ...meta, ...(params._meta ?? {}) } } };
     const res = await handler.fetch(new Request("http://mcp.test/mcp", { method: "POST", headers, body: JSON.stringify(body) }), {
@@ -116,7 +117,7 @@ function serve(server: MCPServer) {
     });
     const text = await res.text();
     const json = text.trim().startsWith("{") ? JSON.parse(text) : JSON.parse(text.split("\n").find((l) => l.startsWith("data: "))!.slice(6));
-    return json as { result?: any; error?: { code: number; message: string } };
+    return { ...json, status: res.status } as { result?: any; error?: { code: number; message: string }; status: number };
   };
 }
 
@@ -249,6 +250,16 @@ test("mastra: Wakeshift's MCP Events and Mastra's own share events/*", async () 
   assert.equal(ours.error, undefined, JSON.stringify(ours.error));
   assert.equal(ours.result.cursor, "wk1");
   assert.equal(reqs.filter((r) => r.path === "/events/poll").length, 1);
+});
+
+test("mastra: a mismatched Mcp-Name is refused with HTTP 400, on Wakeshift's events and Mastra's own", async () => {
+  const { rpc, reqs } = watchApp({}, true);
+  for (const name of ["chat.message", "build.done"]) {
+    const res = await rpc("events/poll", { name, arguments: {} }, { user: "ada", mcpName: "chat.other" });
+    assert.equal(res.status, 400, name);
+    assert.equal(res.error?.code, -32020, name);
+  }
+  assert.equal(reqs.filter((r) => r.path === "/events/poll").length, 0);
 });
 
 test("mastra: a wrapped tool run outside an MCP call can't subscribe", async () => {

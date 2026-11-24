@@ -8,7 +8,7 @@
 // `core` isn't required: the SDK reads WAKESHIFT_CORE itself, which is
 // what an example would pass.
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, copyFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, copyFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -45,22 +45,30 @@ function fromMarkdown(file) {
   }
 }
 // WAKESHIFT_EXAMPLES_README_ONLY=1 checks only this README: the published
-// copy of the SDK (opensource/export.sh) has no site or console.
+// copy of the SDK has no site or console. The server's public tree has
+// site/docs and the console but not the product pages, /AGENTS.md or the
+// landing page, so what's absent there is skipped (and said so).
 const readmeOnly = process.env.WAKESHIFT_EXAMPLES_README_ONLY === "1";
+const present = (rel) => {
+  if (existsSync(join(repo, rel))) return true;
+  console.log(`check-examples: no ${rel} here, skipped`);
+  return false;
+};
 fromMarkdown(join(sdk, "README.md"));
 if (!readmeOnly) {
   for (const dir of ["site/docs", "site/pages"]) {
+    if (dir !== "site/docs" && !present(dir)) continue;
     const docs = join(repo, dir);
     for (const f of readdirSync(docs).filter((f) => f.endsWith(".md")).sort()) fromMarkdown(join(docs, f));
   }
   // /AGENTS.md, the instructions for coding agents the site serves.
-  fromMarkdown(join(repo, "site/llms/agents.md"));
+  if (present("site/llms/agents.md")) fromMarkdown(join(repo, "site/llms/agents.md"));
 }
 
 // The landing page's TypeScript sample: the <pre> in its tab, without its
 // highlighting. (site/landing_examples_test.go checks the Go one, and
 // sdk/python/tests/test_docs.py the Python one.)
-if (!readmeOnly) {
+if (!readmeOnly && present("site/templates/landing.html")) {
   const html = readFileSync(join(repo, "site/templates/landing.html"), "utf8");
   const m = html.match(/<div class="panel"[^>]*id="c-ts"[^>]*>\s*<pre>([\s\S]*?)<\/pre>/);
   if (!m) throw new Error("landing.html: no TypeScript sample");

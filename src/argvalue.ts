@@ -1,4 +1,4 @@
-// encodeArgValue / decodeArgValue (test/arg-values.json, design §2.13):
+// encodeArgValue / decodeArgValue (test/arg-values.json):
 // routing argument values are a-z 0-9 . _ - and at most 100 characters,
 // and the core never rewrites one, so lowercasing a case-sensitive ID would
 // make two IDs one. encodeArgValue encodes any well-formed string

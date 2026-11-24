@@ -226,7 +226,7 @@ test("a call packs only what's there: strings, trimmed claims, no empty fields",
   assert.deepEqual(toolCallOf(undefined, "x", undefined, { session_key: 7, harness: "", conversation_id: "  " }, "list_subscriptions", false), { client: "x", tool: "list_subscriptions" });
 });
 
-test("Wakeshift's arguments: session_key, harness and conversation_id, optional strings, each told in at most 61 characters (design §2.12)", () => {
+test("Wakeshift's arguments: session_key, harness and conversation_id, optional strings, each told in at most 61 characters", () => {
   assert.deepEqual([SESSION_ARG, HARNESS_ARG, CONVERSATION_ARG], ["session_key", "harness", "conversation_id"]);
   assert.deepEqual(Object.keys(WAKE_ARGS_JSON), [SESSION_ARG, HARNESS_ARG, CONVERSATION_ARG]);
   const d = (k: keyof typeof WAKE_ARGS_JSON) => WAKE_ARGS_JSON[k].description ?? "";
@@ -346,7 +346,7 @@ test("the package has no guest sign-in: apps sign their own users in", () => {
   const exported = sdk as Record<string, unknown>;
   assert.equal(exported.GuestAuth, undefined);
   assert.equal(exported.guestOf, undefined);
-  assert.equal((sdk as Record<string, unknown>).harnessAgent, undefined, "house code: apps/holdem keeps its own copy");
+  assert.equal((sdk as Record<string, unknown>).harnessAgent, undefined, "house code: the games keep their own copy");
 });
 
 test("0.4.0: one way to subscribe from a tool; topics, groups and the per-tool calls are gone", () => {

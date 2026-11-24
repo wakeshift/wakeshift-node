@@ -48,6 +48,10 @@ declare global {
   function startCrawl(url: string, job: string): void;
   const handler: ReturnType<typeof import("@modelcontextprotocol/server").createMcpHandler>;
   function onCrawlFinished(job: string, pages: number): Promise<void>;
+  // A tool's own wait for the crawl, as it runs without Wakeshift (call.wakes).
+  function waitForCrawl(job: string, waitSeconds?: number): Promise<string>;
+  // The wait the agent asked for (a vendor's wait_seconds; call.shouldSkipWait).
+  const waitSeconds: number | undefined;
   // The handle attach returned, and the app's own sign-in.
   const attached: SDK.Attachment<McpServerClass>;
   function userOf(extra: unknown): string | undefined;
@@ -71,7 +75,7 @@ declare global {
   // The app's own code that hands a publish URL to the service that sends the webhooks.
   function registerWebhook(url: string, id: string): Promise<void>;
 
-  // The product pages' (site/pages) apps: a crawl that finishes later, a
+  // The product pages' apps: a crawl that finishes later, a
   // deploy, and an email whose reply comes from a person.
   function startCrawl(url: string): Promise<string>;
   // The low-level page's: a job started under a key the app made first, and a session only its owner may watch.

@@ -1,7 +1,7 @@
-// The quickstart's TypeScript tab runs: its server module and step 3's
+// The quickstart's TypeScript tab runs: its server module and step 4's
 // stand-in crawl, as one module, with the key set (the testing module's
 // offline client in place of `new Wakeshift()`), served over HTTP as step
-// 3's main.ts serves it. A start_crawl call must subscribe once, with arguments the core
+// 4's main.ts serves it. A start_crawl call must subscribe once, with arguments the core
 // accepts. scripts/check-examples.mjs type-checks the same blocks; this
 // runs them. Skipped in the published copy of the SDK, which has no site.
 
@@ -25,7 +25,7 @@ const ARG_VALUE = /^[a-z0-9._-]{1,100}$/;
 test("the quickstart's TypeScript tab subscribes with arguments the core accepts", { skip: !existsSync(page) && "no site docs here" }, async () => {
   const md = readFileSync(page, "utf8");
   const blocks = [...md.matchAll(/^```ts tab:TypeScript\n([\s\S]*?)^```/gm)].map((m) => m[1]);
-  assert.equal(blocks.length, 2, "the quickstart has two TypeScript blocks: the code, and step 3");
+  assert.equal(blocks.length, 2, "the quickstart has two TypeScript blocks: the code, and step 4");
   const replace = (src: string, from: string, to: string) => {
     assert.ok(src.includes(from), `the quickstart's TypeScript tab no longer has ${JSON.stringify(from)}, which this test replaces to run it`);
     return src.replace(from, to);
@@ -33,10 +33,10 @@ test("the quickstart's TypeScript tab subscribes with arguments the core accepts
   let code = replace(blocks[0], `import { Wakeshift } from "@wakeshift/sdk"`, `import { createTestClient } from ${JSON.stringify(testing.href)}`);
   code = replace(code, "new Wakeshift()", "createTestClient()");
   assert.ok(!/\.listen\(/.test(blocks[0]), "the server module starts no listener, so tests can import it");
-  // Step 3: the stand-in crawl joins server.ts; main.ts's listener is left out, its import of server.ts with it.
-  let step3 = replace(blocks[1], "createServer(toNodeHandler(createMcpHandler(makeServer))).listen(3000)", "");
-  step3 = replace(step3, `import { makeServer } from "./server.ts"`, "");
-  code += "\n" + step3 + "\n";
+  // Step 4: the stand-in crawl joins server.ts; main.ts's listener is left out, its import of server.ts with it.
+  let step4 = replace(blocks[1], "createServer(toNodeHandler(createMcpHandler(makeServer))).listen(3000)", "");
+  step4 = replace(step4, `import { makeServer } from "./server.ts"`, "");
+  code += "\n" + step4 + "\n";
   // Node's own type stripping (22.13 and later): the tab uses only erasable TypeScript.
   const js = (nodeModule as unknown as { stripTypeScriptTypes(code: string): string }).stripTypeScriptTypes(code);
   // Inside the package, so the module's imports resolve from its node_modules.

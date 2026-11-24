@@ -1,4 +1,4 @@
-// Subscribe vouchers (docs/subscribe-vouchers.md §4.3, §4.4, §7): a tool
+// Subscribe vouchers: a tool
 // subscribing a native client (ChatGPT) to a tools-only event gives it a
 // native line, whose voucher the core renders; the client writes it back
 // as wakeshift_voucher, which the SDK takes out of the arguments and sends
@@ -103,7 +103,8 @@ test("events/subscribe with a voucher: taken out of the arguments, sent as vouch
       assert.deepEqual(noResultType(got), noResultType(c.result), name);
       const sent = a.calls.find((q) => q.path === "/events/subscribe")!.body;
       const { call, dialect: d, ...body } = sent;
-      assert.equal(d, dialect, name);
+      // The client table names the dialect sent: a client it doesn't list speaks the spec (its codes are the draft's).
+      assert.equal(d, dialect === "draft" ? "spec" : dialect, name);
       assert.deepEqual(body, c.core_request, name);
       assert.equal(call.user ?? null, c.call_user, name);
       await settle();
@@ -139,7 +140,7 @@ test("refused without asking Wakeshift: a voucher poll, no voucher, no feature, 
         assert.ok(e instanceof McpError, `${name}: ${String(e)}`);
         assert.equal(e.code, c.error.code[dialect], name);
         assert.equal(e.message.replace(/^MCP error -?\d+: /, ""), c.error.message, name);
-        assert.equal((e as { data?: unknown }).data ?? null, c.error.data, name);
+        assert.deepEqual((e as { data?: unknown }).data ?? null, c.error.data, name);
         return true;
       });
       assert.deepEqual(
@@ -171,6 +172,28 @@ test("Wakeshift's refusals of a voucher: bad_voucher is the dialect's forbidden,
       await settle();
       assert.deepEqual(a.subscribed, [], `${name}: onSubscribe`);
       noVoucherLogged(a, name);
+    }
+  }
+});
+
+test("Wakeshift's refusals of a webhook subscribe: the core's message as it is, its hint as data.hint beside reason, in every dialect (mcp-events-wire.json core_errors)", async () => {
+  for (const c of fixture("mcp-events-wire.json").core_errors.cases) {
+    for (const [dialect, clientName] of DIALECTS) {
+      const name = `${c.name} (${dialect})`;
+      const a = app({ core: { "/events/subscribe": () => ({ status: c.core_status, json: c.core_body }) } });
+      const server = new McpServer({ name: "x", version: "1" });
+      a.wake.attach(server, { identify: () => ({ user: c.user }) });
+      const client = await connect(server, clientName);
+      await assert.rejects(client.request({ method: c.method, params: c.params } as any, z.any() as any), (e: unknown) => {
+        assert.ok(e instanceof McpError, `${name}: ${String(e)}`);
+        assert.equal(e.code, c.error.code[dialect], name);
+        assert.equal(e.message.replace(/^MCP error -?\d+: /, ""), c.error.message, name);
+        assert.deepEqual((e as { data?: unknown }).data ?? null, c.error.data, name);
+        assert.ok(!/\b(again|retry)\b/i.test(e.message), `${name}: the refusal asks for a retry: ${e.message}`);
+        return true;
+      });
+      await settle();
+      assert.deepEqual(a.subscribed, [], `${name}: onSubscribe`);
     }
   }
 });
@@ -253,7 +276,7 @@ test("a bridged caller never gets a voucher line: call.subscribe subscribes its 
   assert.equal(a.calls.find((q) => q.path === "/calls/addition")?.body.native, undefined);
 });
 
-test("a native-only call whose addition fails returns the vendor's result unchanged and logs native_unavailable (§7.2)", async () => {
+test("a native-only call whose addition fails returns the vendor's result unchanged and logs native_unavailable", async () => {
   const a = app({ core: { "/calls/addition": () => ({ status: 500, json: { error: { code: "internal", message: "try again" } } }) } });
   const server = new McpServer({ name: "x", version: "1" });
   const attached = a.wake.attach(server);

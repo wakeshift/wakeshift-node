@@ -1,5 +1,5 @@
 // Construction, the disabled client and logging (disabled-client.json,
-// warnings.json; design §2.1, §2.11): what each input gives, that
+// warnings.json): what each input gives, that
 // construction makes no request, and what each method does without a key.
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -191,6 +191,40 @@ test("rate-limited failures: the first logs with count 1; the first after five m
   );
   assert.equal(log.lines[0]!.level, "error");
   status = 200;
+});
+
+test("warnings.json situations manifest_refused: the core refusing the automatic manifest send logs manifest_refused once, with its code and message; an explicit publishManifest doesn't", async () => {
+  const situation = warnings.situations.cases.find((c: any) => c.op === "manifest_refused");
+  const coreMessage = 'events "a" and "b": topics can make the same topic';
+  const fetchFn = (async (url: string | URL | Request) => {
+    const path = String(url).replace("https://core.test/api/apps/v1", "");
+    if (path === "/manifest/merge" || path === "/manifest") {
+      return new Response(JSON.stringify({ error: { code: "bad_request", message: coreMessage } }), { status: 400, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ matched: 1 }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+  const log = captureLog();
+  const wake = new Wakeshift({ key: KEY, core: "https://core.test", fetch: fetchFn, logger: log.logger });
+  let now = 1_000_000;
+  wake.log.now = () => now;
+  const chat = wake.defineEvent("chat.message", { description: "A message", args: { channel: z.string() }, payload: z.object({ text: z.string() }), public: true });
+  const { McpServer } = await import("@modelcontextprotocol/sdk/server/mcp.js");
+  wake.attach(new McpServer({ name: "t", version: "1" }), {});
+  for (let i = 0; i < 3; i++) {
+    now += 10_000;
+    await assert.rejects(chat.emit({ channel: "eng" }, { text: "hi" }), (e: unknown) => isWakeshiftError(e, "bad_request"));
+  }
+  const lines = log.lines.filter((l) => l.level !== "debug");
+  assert.deepEqual(
+    lines.map((l) => l.fields),
+    situation.logs,
+  );
+  assert.equal(lines[0]!.level, "error");
+  assert.ok(lines[0]!.message.includes(coreMessage), lines[0]!.message);
+  // The app's own publish throws to it, and says nothing.
+  now += 600_000;
+  await assert.rejects(wake.publishManifest({}), (e: unknown) => isWakeshiftError(e, "bad_request"));
+  assert.equal(log.lines.filter((l) => l.level !== "debug").length, 1);
 });
 
 test("the disabled client's emit runs the same checks: a personal event needs to", async () => {

@@ -1,5 +1,5 @@
-// MCP Tasks as a wake path (docs/harnesses.md, "Claude Code: MCP tasks as a
-// wake path"): for a client that takes MCP tasks, on protocol 2026-07-28
+// MCP Tasks as a wake path (docs/harnesses.md, "Claude Code", MCP tasks):
+// for a client that takes MCP tasks, on protocol 2026-07-28
 // (discover.ts), attach with wait: true serves Wakeshift's wait tool,
 // wakeshift_wait (off by default: AttachOptions.wait). Its
 // call is answered with a task that completes when the conversation's next
@@ -71,7 +71,7 @@ export const WAIT_TOOL_DEFINITION = {
   inputSchema: {
     type: "object",
     properties: {
-      // The wait tool wasn't part of the compact tools/list bench: it keeps
+      // The wait tool wasn't part of the compact wording's testing: it keeps
       // the wording test/mcp-tasks-wire.json pins.
       session_key: {
         type: "string",

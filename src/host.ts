@@ -145,6 +145,12 @@ export interface Req {
   headers(): Record<string, string>;
   authInfo: AuthInfo | undefined;
   signal: AbortSignal | undefined;
+  /** The request's JSON-RPC ID, as the client sent it (1.x extra.requestId, 2.x ctx.mcpReq.id). */
+  id?: string | number;
+  /** Sends a notification related to the request (1.x extra.sendNotification, 2.x ctx.mcpReq.notify): on HTTP, on its own response. */
+  notify?: (n: { method: string; params?: Record<string, unknown> }) => Promise<void>;
+  /** The request came over HTTP (it has HTTP request info), not stdio or an in-memory transport. */
+  http?: boolean;
 }
 
 /** @internal A registered tool as the wrapper reads it. */
@@ -370,15 +376,37 @@ function isReq(raw: unknown): raw is Req {
  */
 export function v1Req(raw: unknown): Req {
   if (isReq(raw)) return raw;
-  const e = (raw ?? {}) as { _meta?: Record<string, unknown>; requestInfo?: { headers?: Record<string, string | string[] | undefined> }; authInfo?: AuthInfo; signal?: AbortSignal };
-  return { meta: e._meta, header: (name) => headerOf(e.requestInfo?.headers, name), headers: () => headerRecord(e.requestInfo?.headers), authInfo: e.authInfo, signal: e.signal };
+  const e = (raw ?? {}) as {
+    _meta?: Record<string, unknown>;
+    requestInfo?: { headers?: Record<string, string | string[] | undefined> };
+    authInfo?: AuthInfo;
+    signal?: AbortSignal;
+    requestId?: string | number;
+    sendNotification?: (n: { method: string; params?: Record<string, unknown> }) => Promise<void>;
+  };
+  return {
+    meta: e._meta,
+    header: (name) => headerOf(e.requestInfo?.headers, name),
+    headers: () => headerRecord(e.requestInfo?.headers),
+    authInfo: e.authInfo,
+    signal: e.signal,
+    id: e.requestId,
+    notify: typeof e.sendNotification === "function" ? (n) => e.sendNotification!(n) : undefined,
+    http: !!e.requestInfo,
+  };
 }
 
 /** @internal A request's context read the 2.x way (ctx), putting the envelope's keys back into _meta. */
 export function v2Req(raw: unknown): Req {
   if (isReq(raw)) return raw;
   const c = (raw ?? {}) as {
-    mcpReq?: { _meta?: Record<string, unknown>; envelope?: Record<string, unknown>; signal?: AbortSignal };
+    mcpReq?: {
+      _meta?: Record<string, unknown>;
+      envelope?: Record<string, unknown>;
+      signal?: AbortSignal;
+      id?: string | number;
+      notify?: (n: { method: string; params?: Record<string, unknown> }) => Promise<void>;
+    };
     http?: { authInfo?: AuthInfo; req?: { headers?: { get(name: string): string | null } } };
     // A 1.x-shaped context (a test's, or one passed through by hand) reads too.
     _meta?: Record<string, unknown>;
@@ -400,6 +428,9 @@ export function v2Req(raw: unknown): Req {
     },
     authInfo: c.http?.authInfo,
     signal: c.mcpReq.signal,
+    id: c.mcpReq.id,
+    notify: typeof c.mcpReq.notify === "function" ? (n) => c.mcpReq!.notify!(n) : undefined,
+    http: !!c.http?.req,
   };
 }
 

@@ -14,9 +14,9 @@
 // server's request handlers (host.ts's lowServerHost): attach's own tools,
 // MCP Events, the wait tool and the 2026-07-28 tools/list changes; and the
 // tools wrapped with attached.events get Wakeshift's block in their results.
-// serve() checks @mastra/mcp's version and that the seam is there, and the
-// compatibility suite (sdk/compat, ts-mastra) runs it against Mastra's
-// newest release nightly, so a Mastra release that moves it shows up there.
+// serve() checks @mastra/mcp's version and that the seam is there, and
+// Wakeshift's compatibility tests run it against Mastra's newest release,
+// so a Mastra release that moves it shows up there.
 //
 // Mastra's own MCP Events (MCPServer's events option) keep working beside
 // Wakeshift's: events/list lists both, and every other events/* request

@@ -1,4 +1,4 @@
-// attach at the protocol layer, hardened (design §2.3, §8 PR 4): handlers
+// attach at the protocol layer, hardened: handlers
 // set again after attach are wrapped again (CR H2); a second attach and an
 // McpServer's inner server are refused (CR M1, M3); a vendor tool named like
 // a built-in loses to it, logged (CR L1); a tool in wrap whose own schema
@@ -159,7 +159,7 @@ for (const sdk of ["1.x", "2.x"] as const) {
     const a = app();
     const seen: Record<string, unknown>[] = [];
     const actor = (n: string): Tool => ({ name: `run_${n}`, description: `Run ${n}.`, inputSchema: { type: "object", properties: { channel: { type: "string" } } } });
-    const tools = [actor("scraper"), { name: "plain", description: "Plain.", inputSchema: { type: "object", properties: {} } }];
+    const tools = [actor("task"), { name: "plain", description: "Plain.", inputSchema: { type: "object", properties: {} } }];
     const low = lowServer(sdk, tools, async (name, args) => {
       seen.push(args);
       if (name.startsWith("run_")) await a.wake.currentCall().subscribe(a.message, { channel: String(args.channel) });
@@ -171,7 +171,7 @@ for (const sdk of ["1.x", "2.x"] as const) {
     // A tool added after attach, named at run time.
     tools.push(actor("crawler"));
     const listed = (await client.listTools()).tools;
-    for (const n of ["run_scraper", "run_crawler"]) {
+    for (const n of ["run_task", "run_crawler"]) {
       const t = listed.find((x) => x.name === n)!;
       assert.ok("session_key" in (t.inputSchema.properties as object), `${n} takes Wakeshift's arguments`);
       assert.match(t.description!, /notifies you in this conversation/);

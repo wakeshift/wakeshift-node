@@ -1,4 +1,4 @@
-// Secrets and argument values (design §2.13, §4, §8 PR 9): redactSecrets
+// Secrets and argument values: redactSecrets
 // (secret-pattern.json), encodeArgValue and decodeArgValue
 // (arg-values.json), and the canary leak test: a canary caller token (as
 // Authorization: Bearer and in authInfo), a canary session key and the test
@@ -80,7 +80,7 @@ const CANARIES = [
   [...SEED].join(","),
 ];
 
-test("no canary reaches a log, stdout, stderr, a result, an error or any printer (design §4)", async () => {
+test("no canary reaches a log, stdout, stderr, a result, an error or any printer", async () => {
   const seen: string[] = [];
   const keep = (...xs: unknown[]) => void seen.push(format(...xs));
   // Everything printed to the console (stdout and stderr) while the

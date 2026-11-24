@@ -28,7 +28,7 @@ const golden = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.ur
   responses: (Answer & { want: { status: number; code: string; message: string; reason?: string; text: string } })[];
   bad_response: { code: string; message: string; cases: Answer[] };
   unreachable: { status: number; code: string; message_prefix: string; message_suffix: string };
-  rpc: { name: string; error: { code: string; message: string; reason?: string } | null; want: { code: Record<Dialect, number>; message: string; data: Record<string, string> | null } }[];
+  rpc: { name: string; mode?: string; error: { code: string; message: string; reason?: string } | null; want: { code: Record<Dialect, number>; message: string; data: Record<string, string> | null } }[];
   codes: { code: string; class: { before_sending: string | null; from_core: string | null }; fix: string; anchor: string }[];
   messages: { timeout: string; example: string };
   client_checks: { cases: { op: string; code: string }[] };
@@ -138,7 +138,7 @@ test("the JSON-RPC error each becomes for an MCP Events client (errors.json)", (
         ? new APIConnectionError({ code: "unreachable", message: c.error.message })
         : new APIError({ status: 400, code: c.error.code, message: c.error.message, reason: c.error.reason });
     for (const dialect of ["draft", "chatgpt"] as const) {
-      const e = rpcErrorOf(err, codesFor(dialect));
+      const e = rpcErrorOf(err, codesFor(dialect), "", c.mode);
       const message = e.message.replace(`MCP error ${e.code}: `, "");
       assert.deepEqual({ code: e.code, message, data: e.data ?? null }, { ...c.want, code: c.want.code[dialect] }, `${c.name} (${dialect})`);
     }

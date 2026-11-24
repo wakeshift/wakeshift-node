@@ -1,4 +1,4 @@
-// The public surface equals design §5 (test/SURFACE.md): the root's values
+// The public surface equals the SDK's designed list: the root's values
 // and types, and each subpath's, by name. Anything else public is a finding.
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -11,6 +11,7 @@ import * as testing from "../src/testing.js";
 const VALUES = ["APIConnectionError", "APIError", "BUILTIN_TOOL_NAMES", "IdReusedError", "UsageError", "Wakeshift", "WakeshiftError", "decodeArgValue", "encodeArgValue", "isWakeshiftError", "redactSecrets"];
 const TYPES = [
   "WakeshiftOptions",
+  "CallTimeouts",
   "Logger",
   "LogLevel",
   "RequestOptions",
@@ -30,6 +31,7 @@ const TYPES = [
   "Attachment",
   "AttachOptions",
   "BuiltinTools",
+  "PushOptions",
   "RegisterToolConfig",
   "Identity",
   "Subscriber",
@@ -52,7 +54,7 @@ const TYPES = [
   // Advanced (the "apps that act for their users' agents" page).
   "Manifest",
   "AgentScope",
-  // Beyond §5: the types those name, which a caller needs to write them out.
+  // Beyond the designed list: the types those name, which a caller needs to write them out.
   "LogFields",
   // Round 3: every type a public signature names (attach's server, registerTool's handler, call.subscribe).
   "RegisterToolHandler",
@@ -82,7 +84,7 @@ function exportedNames(file: string): string[] {
   return names.sort();
 }
 
-test("the root exports exactly design §5's values and types", () => {
+test("the root exports exactly the designed values and types", () => {
   assert.deepEqual(Object.keys(root).sort(), [...VALUES].sort());
   assert.deepEqual(exportedNames("index.ts"), [...VALUES, ...TYPES].sort());
 });
@@ -113,7 +115,7 @@ test("the package: sideEffects false, a default condition and ./package.json on 
   assert.equal(pkg.peerDependencies["@modelcontextprotocol/sdk"], ">=1.0.0 <2");
 });
 
-// Names this release removed (design §2, "Deleted") stay out of the SDK's
+// Names this release removed stay out of the SDK's
 // comments, doc comments and messages, which the published .d.ts and
 // errors carry. Mastra's tool helpers (attached.inputs, attached.events on
 // attachMastra's attachment) stay until the fast follow, so lines that name

@@ -1,4 +1,4 @@
-// Tools that subscribe (design §2.4, §8 PR 5a): registered through the
+// Tools that subscribe: registered through the
 // attachment or named in wrap, they give the same tools/list and the same
 // call (subscribing-tools-list.json). Wakeshift works at the protocol
 // layer, so a vendor's middleware, a Proxy around registerTool or the
@@ -145,7 +145,7 @@ test("a disabled client serves the vendor's tools exactly as written (subscribin
   }
 });
 
-// A vendor's logging middleware around every tool callback (BrowserStack's
+// A vendor's logging middleware around every tool callback (a common
 // shape): it re-wraps the callback and logs the arguments it gets.
 function withLoggingMiddleware(server: McpServer, seen: unknown[]): void {
   const register = server.registerTool.bind(server) as (...a: any[]) => any;
